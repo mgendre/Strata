@@ -929,6 +929,20 @@ def conversation_slots(engine) -> int | None:
     return slots if isinstance(slots, int) else None
 
 
+LONG_READ = 8192
+
+
+def long_read_speed(hist: list) -> float | None:
+    """Prompt tokens read per second over the requests that read LONG_READ tokens or more; None before the first."""
+    tokens = ms = 0.0
+    for r in hist:
+        n, t = r.get("prompt_read") or 0, r.get("prompt_ms") or 0.0
+        if n >= LONG_READ and t > 0:
+            tokens += n
+            ms += t
+    return tokens / (ms / 1000) if ms > 0 else None
+
+
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, disk: dict | None = None,
                             device: dict | None = None, history: list | None = None) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
@@ -944,10 +958,11 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, 
             "last_reused": last.get("reused") if last else None,
             "last_prompt": last.get("prompt_tokens") if last else None}
     if disk is not None and info.get("conversation_cache_disk", 1):
-        read = totals.get("prompt_tokens", 0) - totals.get("reused", 0)
         view["disk"] = {**disk, "device": device, "history": history or [],
-                        # the prompt speed measured so far, for the time a copy saved (tokens it gave back / speed)
-                        "prompt_tok_s": read / (totals["prompt_ms"] / 1000) if totals.get("prompt_ms") and read > 0 else None}
+                        # what reading a long prompt again costs, for the time a copy saved (tokens it gave back /
+                        # speed): reads of LONG_READ tokens or more only - short reads are mostly a request's fixed
+                        # cost and would make the saving look about twice as large
+                        "prompt_tok_s": long_read_speed(hist)}
     return view
 
 

@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from serve.server import (CacheHistory, ConvCacheLog, ConvDiskStatus, conversation_cache_view, conversation_disk_dir,
-                          disk_written_since_boot)
+                          disk_written_since_boot, long_read_speed)
 
 
 class Engine:
@@ -81,13 +81,21 @@ class ConvDiskServer(unittest.TestCase):
         k = CacheHistory.KEEP + 4
         self.assertEqual(v[-1], [1000 + 60 * k, k, 2 * k, 3 * k, 4 * k, 5 * k])
 
+    def test_the_saving_uses_long_reads_only(self):
+        hist = [{"prompt_read": 30000, "prompt_ms": 15000.0}, {"prompt_read": 10000, "prompt_ms": 5000.0},
+                {"prompt_read": 40, "prompt_ms": 355.0}, {"prompt_read": None, "prompt_ms": None}]
+        self.assertEqual(long_read_speed(hist), 2000.0)
+        self.assertIsNone(long_read_speed([{"prompt_read": 500, "prompt_ms": 900.0}]))   # nothing long yet
+        self.assertIsNone(long_read_speed([]))
+
     def test_the_view(self):
         info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3, "conversation_cache_disk": 1}
         totals = {"reused": 100, "prompt_tokens": 2100, "prompt_ms": 1000}
         parked = ConvCacheLog().state
         disk = {"disk": {"entries": 1, "bytes": 5, "budget": 10}, "entries": []}
-        v = conversation_cache_view(info, [], totals, parked, disk, {"device": "nvme1n1", "written": 7}, [[1, 2, 3, 4, 5, 6]])
-        self.assertEqual(v["disk"]["prompt_tok_s"], 2000.0)
+        hist = [{"prompt_read": 20000, "prompt_ms": 10000.0}, {"prompt_read": 40, "prompt_ms": 350.0}]
+        v = conversation_cache_view(info, hist, totals, parked, disk, {"device": "nvme1n1", "written": 7}, [[1, 2, 3, 4, 5, 6]])
+        self.assertEqual(v["disk"]["prompt_tok_s"], 2000.0)   # the long read only, not the short one
         self.assertEqual((v["disk"]["device"]["device"], v["disk"]["history"]), ("nvme1n1", [[1, 2, 3, 4, 5, 6]]))
         self.assertNotIn("disk", conversation_cache_view(info, [], totals, parked))
         off = dict(info, conversation_cache_disk=0)              # the engine said its disk levels are off

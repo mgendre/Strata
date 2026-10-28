@@ -205,6 +205,10 @@
           <div class="cc-chart-head"><span class="cc-chart-title">Conversations on disk</span>
             <span class="muted small" id="cc-dsk-sum"></span></div>
           <div class="cc-table-wrap"><table class="cc-table" id="cc-disk-table"></table></div>
+          <p class="muted small cc-note">Returns: times the conversation came back from disk (a return from RAM is not one).
+            Tokens served: all its returns together. Time saved: those tokens at the speed of a long prompt read.
+            Written: every save of the conversation so far; more than its size when it was saved at several steps, less
+            when it shares blocks (a system prompt) with another conversation.</p>
         </div>
         <p class="muted small cc-note" id="cc-note"></p>
       </div>
