@@ -33,6 +33,16 @@ class ConvDiskServer(unittest.TestCase):
             st = ConvCacheLog().poll(str(log), 0)
             self.assertEqual((st["restores"], st["restores_disk"], st["last_source"]), (0, 1, "disk"))
 
+    def test_conversations_that_left_ram(self):
+        lines = ("strata serve: conversation cache: left RAM (budget full): 59529 tokens, on disk 3100 behind\n"
+                 "strata serve: conversation cache: left RAM (slots full): 9000 tokens, not on disk (below the first save step)\n"
+                 "strata serve: conversation cache: left RAM (RAM low): 41000 tokens, on disk 900 behind\n")
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(lines, encoding="utf-8")
+            st = ConvCacheLog().poll(str(log), 0)
+            self.assertEqual((st["left_ram"], st["left_on_disk"], st["left_not_saved"]), (3, 2, 1))
+
     def test_the_folder_comes_from_the_engine_arguments(self):
         self.assertEqual(conversation_disk_dir(Engine(["--conversation-cache-disk", "/data/cc"])), "/data/cc")
         self.assertEqual(conversation_disk_dir(Engine(["--conversation-cache-disk", "cc"])), "/srv/strata/cc")

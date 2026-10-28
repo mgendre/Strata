@@ -10607,12 +10607,27 @@ int main(int argc, char** argv) {
             disk_save(dids, dimgs, image.cvec, state, strata::core::conversation_image_sources(image),
                       score_now(image.score, image.score_at), why);
         };
-        if (disk.enabled() && o.conversation_cache_disk_topup_tokens > 0)
+        // a conversation leaves RAM: whether its copy on disk has it (and how far behind it is), for the log and the
+        // monitor ("left RAM (why): N tokens, on disk M behind" or "..., not on disk (...)"), then the optional top-up
+        auto disk_note_eviction = [&](strata::core::SavedConversation& image, const char* why) {
+            const ConvCheckpoint& state = strata::core::conversation_disk_state(image.live, image.checkpoints, kDiskNear);
+            const int64_t n = (int64_t) state.ids.size();
+            const std::vector<int32_t> dids(image.live.ids.begin(), image.live.ids.begin() + (std::ptrdiff_t) n);
+            const int64_t saved = disk.saved_tokens(dids, below(image.live.imgs, n), image.cvec);
+            if (saved > 0)
+                std::fprintf(stderr, "strata serve: conversation cache: left RAM (%s): %zu tokens, on disk %lld behind\n",
+                             why, image.live.ids.size(), (long long) ((int64_t) image.live.ids.size() - saved));
+            else
+                std::fprintf(stderr, "strata serve: conversation cache: left RAM (%s): %zu tokens, not on disk (%s)\n",
+                             why, image.live.ids.size(),
+                             n < o.conversation_cache_disk_first_tokens ? "below the first save step" : "no copy");
+            if (o.conversation_cache_disk_topup_tokens > 0) disk_topup_image(image, "top-up");
+        };
+        if (disk.enabled())
             conversations.on_evict([&](strata::core::SavedConversation& image, const char* why) {
                 try {
-                    disk_topup_image(image, !std::strcmp(why, "slots") ? "top-up: oldest in RAM, slots full"
-                                          : !std::strcmp(why, "budget") ? "top-up: oldest in RAM, budget full"
-                                          : "top-up: oldest in RAM, RAM low");
+                    disk_note_eviction(image, !std::strcmp(why, "slots") ? "slots full"
+                                            : !std::strcmp(why, "budget") ? "budget full" : "RAM low");
                 } catch (const std::exception& ex) {
                     std::fprintf(stderr, "strata serve: conversation cache: disk write failed (%s)\n", ex.what());
                 }

@@ -397,7 +397,10 @@ function renderConvCache(c) {
   facts($("cc-facts"), [
     ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
     ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
-    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
+    // with --conversation-cache-disk a conversation that leaves RAM is usually on disk already: said apart
+    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}` +
+      (c.disk && c.left_ram ? ` · left RAM ${fmt(c.left_ram)} (${fmt(c.left_on_disk)} on disk, ${fmt(c.left_not_saved)} not saved)`
+                            : c.evictions ? ` · ${fmt(c.evictions)} evicted` : "") : null],
     ["Last switch", c.enabled ? event : null],
   ]);
   renderConvDisk(c);

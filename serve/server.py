@@ -778,8 +778,10 @@ class ConvCacheLog:
     def reset(self):
         # restores: from RAM; restores_disk: from --conversation-cache-disk ("restored N tokens from disk");
         # tokens_ram: the tokens the RAM restores gave back
+        # left_*: --conversation-cache-disk's "left RAM (why): N tokens, on disk M behind | not on disk (...)"
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "restores_disk": 0,
-                      "tokens_ram": 0, "last_event": None, "last_tokens": None, "last_at": None, "last_source": None}
+                      "tokens_ram": 0, "left_ram": 0, "left_on_disk": 0, "left_not_saved": 0,
+                      "last_event": None, "last_tokens": None, "last_at": None, "last_source": None}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
@@ -827,6 +829,11 @@ class ConvCacheLog:
                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
                     st["last_source"] = "disk" if disk else ("ram" if m.group(1) == "restored" else None)
                 continue
+            m = LEFT_RAM.search(line)
+            if m:
+                self.state["left_ram"] += 1
+                self.state["left_on_disk" if m.group(1) == "on disk" else "left_not_saved"] += 1
+                continue
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
@@ -834,6 +841,7 @@ class ConvCacheLog:
 
 
 DISK_RESTORE = re.compile(r"restored \d+ tokens from disk\b")
+LEFT_RAM = re.compile(r"conversation cache: left RAM \([^)]*\): \d+ tokens, (on disk|not on disk)")
 
 
 def conversation_disk_dir(engine) -> str | None:
