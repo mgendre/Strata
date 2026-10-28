@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -187,6 +188,10 @@ struct SavedConversation {
     std::shared_ptr<void> pending;
     // STRATA_CKPT_ASYNC: the same for the background copy that fills `live.gdn` (the park's running state)
     std::shared_ptr<void> live_pending;
+    // --conversation-cache-disk: the conversation's usage score (its returns, halved every half-life:
+    // conversation_score_at) stamped at `score_at` (unix seconds), which decides its disk level when it leaves RAM
+    double score = 0;
+    int64_t score_at = 0;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -395,7 +400,7 @@ public:
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
-            if (!evict_oldest()) return false;
+            if (!evict_oldest(entries_.size() >= slots_ ? "slots" : "budget")) return false;
         }
         return true;
     }
@@ -406,10 +411,12 @@ public:
     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
-    bool evict_oldest() {
+    // `why` says what pushed it out, for the on_evict hook.
+    bool evict_oldest(const char* why = "RAM") {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            if (on_evict_) on_evict_(entries_[i], why);
             bytes_ -= entries_[i].bytes();
             erase(i);
             ++evictions_;
@@ -431,6 +438,9 @@ public:
 
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
     size_t slots() const { return slots_; }
+    // --conversation-cache-disk: called with each conversation evict_oldest pushes out, before it is dropped (the
+    // disk level keeps it).  Unset (the default): dropped as before.  It must not throw.
+    void on_evict(std::function<void(SavedConversation&, const char*)> f) { on_evict_ = std::move(f); }
 
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
@@ -510,6 +520,7 @@ private:
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
+    std::function<void(SavedConversation&, const char*)> on_evict_;
 };
 
 } // namespace strata::core

@@ -171,13 +171,41 @@
 
       <div class="st-card cc-card" id="cc-card">
         <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
-        <div class="cc-bars" id="cc-bars" hidden>
-          <div><div class="bar-row"><span>Parked conversations</span><span class="muted" id="cc-slots-text">&ndash;</span></div>
-            <div class="st-progress"><div class="st-progress__bar" id="cc-slots-bar" style="width:0%"></div></div></div>
-          <div><div class="bar-row"><span>Their memory (RAM)</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
-            <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
+        <!-- left: the bars and facts; right (with --conversation-cache-disk): the disk graphs; below: the copies on disk -->
+        <div class="cc-split">
+          <div class="cc-left">
+            <div class="cc-bars" id="cc-bars" hidden>
+              <div><div class="bar-row"><span>Parked conversations</span><span class="muted" id="cc-slots-text">&ndash;</span></div>
+                <div class="st-progress"><div class="st-progress__bar" id="cc-slots-bar" style="width:0%"></div></div></div>
+              <div><div class="bar-row"><span>Their memory (RAM)</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
+                <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
+            </div>
+            <div class="cc-bars cc-disk-only">
+              <div><div class="bar-row"><span>Conversations on disk</span><span class="muted" id="cc-dsk-text">&ndash;</span></div>
+                <div class="st-progress"><div class="st-progress__bar" id="cc-dsk-bar" style="width:0%"></div></div></div>
+            </div>
+            <p class="cc-warn small" id="cc-disk-warn" role="status" hidden></p>
+            <dl class="facts" id="cc-facts"></dl>
+            <dl class="facts cc-disk-only" id="cc-disk-facts"></dl>
+          </div>
+          <div class="cc-chart cc-disk-only" id="cc-chart">
+            <div class="cc-chart-head"><span class="cc-chart-title">Given back per hour (prompt tokens)</span>
+              <span class="cc-legend" id="cc-legend"></span></div>
+            <div class="cc-plot" id="cc-usage-plot"><svg class="cc-svg" id="cc-usage" role="img"
+              aria-label="Prompt tokens restored each hour over the last 24 hours, from RAM and from disk"></svg></div>
+            <div class="cc-chart-head"><span class="cc-chart-title">Disk writes per hour (GB)</span></div>
+            <div class="cc-plot" id="cc-writes-plot"><svg class="cc-svg cc-svg--short" id="cc-writes" role="img"
+              aria-label="Gigabytes written to the disk each hour over the last 24 hours"></svg></div>
+            <div class="cc-tip" id="cc-tip" hidden></div>
+            <details class="cc-details"><summary class="small">Show the last 24 h as a table</summary>
+              <div class="cc-table-wrap"><table class="cc-table" id="cc-hist-table"></table></div></details>
+          </div>
         </div>
-        <dl class="facts" id="cc-facts"></dl>
+        <div class="cc-list cc-disk-only">
+          <div class="cc-chart-head"><span class="cc-chart-title">Conversations on disk</span>
+            <span class="muted small" id="cc-dsk-sum"></span></div>
+          <div class="cc-table-wrap"><table class="cc-table" id="cc-disk-table"></table></div>
+        </div>
         <p class="muted small cc-note" id="cc-note"></p>
       </div>
 
