@@ -823,13 +823,13 @@ struct Options {
     /// 0 = every checkpoint, as before.
     int64_t conversation_cache_park_checkpoints = 0;
     /// --serve --conversation-cache-disk DIR: the conversation cache's long-term level on disk (conversation_disk.hpp),
-    /// --conversation-cache-disk-mib in all, kept across restarts of the same build and model.  A conversation is saved
+    /// --conversation-cache-disk-mib in all (32 GiB by default), kept across restarts of the same build and model.  A conversation is saved
     /// right after a reply once it reaches --conversation-cache-disk-first-tokens and again every
     /// --conversation-cache-disk-step-tokens further on.  --conversation-cache-disk-topup-tokens N (0 = off): when RAM
     /// pushes out (or cannot hold) a conversation N or more tokens past its copy, that gap is saved too.  Above
     /// --conversation-cache-disk-day-gib written in a day the monitor warns (nothing stops).  "" = off.
     std::string conversation_cache_disk;
-    int64_t conversation_cache_disk_mib = 51200;
+    int64_t conversation_cache_disk_mib = 32768;
     int64_t conversation_cache_disk_first_tokens = 32768, conversation_cache_disk_step_tokens = 16384;
     int64_t conversation_cache_disk_topup_tokens = 0;
     int64_t conversation_cache_disk_day_gib = 200;

@@ -24,6 +24,65 @@
 
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
+## Strata Experimental (this fork)
+
+This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). The branch `strata-experimental` is Strata
+plus the changes below; `main` follows upstream. Every new option is off by default: without them, Strata behaves as
+upstream does.
+
+**The goal.** Agent tools (OpenCode, Claude Code, subagents) switch between several long conversations. Strata keeps
+a few of them in RAM. When RAM is full, the oldest one is dropped, and its next turn reads the whole prompt again: tens
+of seconds for a long conversation. This fork keeps those conversations on disk, makes each one smaller in RAM, and
+shows what both do in the Monitor, while keeping writes to the SSD low.
+
+### What is new
+
+| Change | Options (default) |
+| --- | --- |
+| **Conversation cache on disk.** Long conversations are saved on an SSD and come back from there instead of being read again. | `--conversation-cache-disk DIR` (off), `--conversation-cache-disk-mib` (32768), `--conversation-cache-disk-first-tokens` (32768), `--conversation-cache-disk-step-tokens` (16384), `--conversation-cache-disk-topup-tokens` (0: off), `--conversation-cache-disk-day-gib` (200: a warning only) |
+| **Smaller parked conversations in RAM.** A parked conversation keeps its last N checkpoints and its first one (the end of the system prompt) instead of all of them. Each checkpoint is about 118 MB on Qwen3.8-Flash-Next. | `--conversation-cache-park-checkpoints N` (0: all) |
+| **Clearer log.** One line for each save to disk, each restore from disk, and each conversation that leaves RAM, with whether it is on disk. | always, with the disk cache |
+| **Second GPU line.** With `--peer-device`, one line per request says where the experts ran: the main GPU's cache, the second GPU, over PCIe, or on the CPU. | always, with `--peer-device` |
+| **Monitor.** The Conversation cache card shows the RAM and disk bars, where restored conversations came from, the prompt tokens given back per hour (RAM and disk), the disk writes per hour and today, and one row per conversation on disk. A Disk write card sits next to Disk read. | always |
+
+### How the disk cache works
+
+- A conversation is saved right after a reply, once it reaches 32K tokens, and again every 16K tokens more. The answer
+  is already sent: nobody waits for the save.
+- Only what is new is written. The conversation is stored in blocks of 4K tokens named by their content, so a block
+  already on disk is never written again. Each save adds the new blocks and one snapshot of the model's state.
+- When RAM drops a conversation, nothing is written: its copy is on disk already.
+- When the conversation comes back, its copy goes from the disk to the GPU, and only the tokens since the last save are
+  read again.
+- The copies are kept across restarts of the same engine build and model. Another build starts with an empty cache.
+- When the cache is full, the conversation that came back least often leaves first, then the oldest.
+- To spare the SSD, files are written in large pieces and never rewritten, and nothing is flushed only for safety: a
+  file cut short by a crash fails its check and is deleted.
+
+To turn it on, add to the run config's `args` (the folder should be on an SSD):
+
+```json
+"--conversation-cache-disk", "/path/to/conversation-cache",
+"--conversation-cache-disk-mib", "32768",
+"--conversation-cache-park-checkpoints", "3"
+```
+
+### Measured
+
+On one Linux PC with a PCIe 4 NVMe SSD, Qwen3.8-Flash-Next IQ3\_S, test conversations of 14K to 20K tokens:
+
+- A save after a reply took about 0.3 s.
+- A restore from disk took 0.2 to 0.26 s. The request then took 0.7 to 1.2 s, instead of about 7 s to read the prompt
+  again.
+- A conversation that grew by 6K tokens wrote 232 MiB and reused 178 MiB that was already on disk.
+- After a restore, every conversation still knew a code given at its very start. Five answers matched a fresh read
+  token for token.
+- A parked conversation with 9 checkpoints took 807 MB with `--conversation-cache-park-checkpoints 3`, instead of about
+  1.4 GB.
+
+Not measured yet: days of real use, AMD (HIP), Intel (SYCL), Mac (Metal) and Windows. With a layer split across two
+GPUs (`--layer-split`) the disk cache stays off.
+
 ## Models
 
 We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.

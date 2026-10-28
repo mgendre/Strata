@@ -54,7 +54,7 @@ double conversation_score_at(double score, int64_t at, int64_t now, double half_
 
 struct ConversationDiskOptions {
     std::string dir;
-    uint64_t budget_bytes = 50ull << 30;
+    uint64_t budget_bytes = 32ull << 30;
     int64_t min_tokens = 32768;                ///< shorter conversations are not stored
     int64_t refresh_tokens = 1;                ///< a copy fewer tokens behind than this is kept as it is
     int64_t block_tokens = 4096;
