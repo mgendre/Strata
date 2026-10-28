@@ -131,6 +131,41 @@ main { flex: 1; min-height: 0; display: flex; }
 .cc-bars[hidden] { display: none; }
 .cc-note { margin: 0; }
 .cc-note:empty { display: none; }
+/* --conversation-cache-disk: the disk levels, the usage graph (RAM / swap / big: categorical slots 1-3, validated in
+   both themes) and the writes per hour (slot 7) */
+.cc-disk { display: flex; flex-direction: column; gap: var(--st-s-3);
+  --cc-ram: #2a78d6; --cc-swap: #eb6834; --cc-big: #1baf7a; --cc-writes: #6250d6;
+  --cc-grid: var(--st-line-soft); --cc-axis: var(--st-line); }
+[data-theme="dark"] .cc-disk { --cc-ram: #3987e5; --cc-swap: #d95926; --cc-big: #199e70; --cc-writes: #9085e9; }
+.cc-disk[hidden] { display: none; }
+.cc-warn { margin: 0; display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: var(--st-r-sm);
+  background: var(--st-warn-tint); color: var(--st-warn-text); }
+.cc-warn[hidden] { display: none; }
+.cc-chart { position: relative; display: flex; flex-direction: column; gap: var(--st-s-2); }
+.cc-chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--st-s-3); flex-wrap: wrap; }
+.cc-chart-title { font-size: var(--st-fs-sm); font-weight: 600; color: var(--st-ink-soft); }
+.cc-legend { display: flex; gap: var(--st-s-3); font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.cc-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.cc-legend i { display: inline-block; width: 14px; height: 2px; border-radius: 1px; }
+.cc-plot { position: relative; }
+.cc-svg { display: block; width: 100%; height: 160px; overflow: visible; }
+.cc-svg--short { height: 96px; }
+.cc-svg text { font-size: 11px; fill: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
+.cc-tip { position: absolute; z-index: 2; pointer-events: none; background: var(--st-surface); border: 1px solid var(--st-line);
+  border-radius: var(--st-r-sm); box-shadow: var(--st-sh-card); padding: 6px 8px; font-size: var(--st-fs-xs);
+  color: var(--st-ink-muted); min-width: 120px; }
+.cc-tip[hidden] { display: none; }
+.cc-tip b { color: var(--st-ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.cc-tip div { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.cc-tip i { display: inline-block; width: 10px; height: 2px; border-radius: 1px; }
+.cc-details summary { cursor: pointer; color: var(--st-ink-muted); }
+.cc-table-wrap { overflow-x: auto; }
+.cc-table { width: 100%; border-collapse: collapse; font-size: var(--st-fs-xs); font-variant-numeric: tabular-nums; }
+.cc-table th { text-align: left; font-weight: 500; color: var(--st-ink-muted); padding: 4px 8px 4px 0; border-bottom: 1px solid var(--st-line); }
+.cc-table td { padding: 4px 8px 4px 0; color: var(--st-ink-soft); border-bottom: 1px solid var(--st-line-soft); white-space: nowrap; }
+.cc-table td.num, .cc-table th.num { text-align: right; }
+.cc-level { display: inline-flex; align-items: center; gap: 5px; }
+.cc-level i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
 .mcp-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
 .cfg-form { display: grid; grid-template-columns: minmax(min(180px, 100%), max-content) minmax(0, 1fr); gap: var(--st-s-3) var(--st-s-4);
             align-items: center; }

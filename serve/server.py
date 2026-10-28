@@ -772,14 +772,21 @@ class ConvCacheLog:
 
     def __init__(self):
         self.key, self.pos = None, 0
+        self.lock = threading.Lock()                    # the monitor and the usage sampler both read on
         self.reset()
 
     def reset(self):
-        self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+        # restores: from RAM; restores_disk: from --conversation-cache-disk ("restored N tokens from disk (swap|big)");
+        # tokens_ram: the tokens the RAM restores gave back
+        self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "restores_disk": 0,
+                      "tokens_ram": 0, "last_event": None, "last_tokens": None, "last_at": None, "last_source": None}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
+        with self.lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
         if not path or start is None:
             return dict(self.state)
         if self.key != (path, start):                   # another start of the engine: its cache starts empty
@@ -809,13 +816,93 @@ class ConvCacheLog:
                 if m.group(5) is not None:
                     st["evictions"] = int(m.group(5))
                 if m.group(1) != "skipped":
-                    st["parks" if m.group(1) == "parked" else "restores"] += 1
+                    disk = DISK_RESTORE.search(line) if m.group(1) == "restored" else None
+                    if m.group(1) == "parked":
+                        st["parks"] += 1
+                    elif disk:
+                        st["restores_disk"] += 1
+                    else:
+                        st["restores"] += 1
+                        st["tokens_ram"] += int(m.group(2))
                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
+                    st["last_source"] = disk.group(1) if disk else ("ram" if m.group(1) == "restored" else None)
                 continue
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
         return dict(self.state)
+
+
+DISK_RESTORE = re.compile(r"restored \d+ tokens from disk \((swap|big)\)")
+
+
+def conversation_disk_dir(engine) -> str | None:
+    """--conversation-cache-disk DIR from the engine's arguments (its status.json is there), or None."""
+    spawn = getattr(engine, "spawn", None)
+    args = spawn[1] if spawn and len(spawn) > 2 and isinstance(spawn[1], (list, tuple)) else []
+    if "--conversation-cache-disk" in args[:-1]:
+        folder = str(args[args.index("--conversation-cache-disk") + 1])
+        cwd = spawn[2] if isinstance(spawn[2], str) else None   # (the engine's working folder: a relative path is from there)
+        return folder if os.path.isabs(folder) or not cwd else os.path.join(cwd, folder)
+    return None
+
+
+class ConvDiskStatus:
+    """--conversation-cache-disk: the engine's <dir>/status.json (its levels, counters and one row per copy), read
+    again when it changes, and what the disk under it has written since the PC started (/sys/block/*/stat)."""
+
+    def __init__(self):
+        self.path, self.mtime, self.data = None, None, None
+
+    def read(self, folder: str | None) -> dict | None:
+        if not folder:
+            return None
+        path = os.path.join(folder, "status.json")
+        try:
+            mtime = os.stat(path).st_mtime_ns
+            if path != self.path or mtime != self.mtime:
+                with open(path, encoding="utf-8") as f:
+                    self.data = json.load(f)
+                self.path, self.mtime = path, mtime
+        except (OSError, ValueError):
+            return self.data if path == self.path else None
+        return self.data
+
+
+def disk_written_since_boot(folder: str | None) -> dict | None:
+    """The disk that holds `folder`: its name and the bytes written to it since the PC started (all programs), from
+    /sys/block/<disk>/stat (sectors of 512 bytes, field 7).  None off Linux or when it cannot be read."""
+    if not folder:
+        return None
+    try:
+        dev = os.stat(folder).st_dev
+        node = os.path.realpath(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}")
+        if os.path.exists(os.path.join(node, "partition")):   # a partition: count its whole disk
+            node = os.path.dirname(node)
+        with open(os.path.join(node, "stat"), encoding="ascii") as f:
+            fields = f.read().split()
+        return {"device": os.path.basename(node), "written": int(fields[6]) * 512}
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+class CacheHistory:
+    """The conversation cache's usage over the last day for the Monitor's graph: one sample a minute of the bytes
+    parked in RAM, in the disk's swap and big levels, and the bytes written to the disk so far (all time)."""
+    EVERY_S, KEEP = 60.0, 24 * 60
+
+    def __init__(self):
+        self.samples = collections.deque(maxlen=self.KEEP)
+        self.lock = threading.Lock()
+
+    def add(self, ram: int, swap: int, big: int, written: int, now: float | None = None):
+        with self.lock:
+            self.samples.append([round(now if now is not None else time.time()), int(ram), int(swap), int(big),
+                                 int(written)])
+
+    def view(self) -> list:
+        with self.lock:
+            return [list(x) for x in self.samples]
 
 
 def conversation_slots(engine) -> int | None:
@@ -831,17 +918,26 @@ def conversation_slots(engine) -> int | None:
     return slots if isinstance(slots, int) else None
 
 
-def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
+def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, disk: dict | None = None,
+                            device: dict | None = None, history: list | None = None) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
-    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
+    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back.
+    With --conversation-cache-disk: its levels, counters and copies (`disk`, the engine's status.json), the disk's
+    writes since boot (`device`) and the usage samples of the last day (`history`)."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
-    return {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
+    view = {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
             "slots": info.get("conversation_cache_slots"), **parked,
             "requests": len(hist), "requests_reused": sum(1 for r in hist if (r.get("reused") or 0) > 0),
             "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
             "last_reused": last.get("reused") if last else None,
             "last_prompt": last.get("prompt_tokens") if last else None}
+    if disk is not None and info.get("conversation_cache_disk", 1):
+        read = totals.get("prompt_tokens", 0) - totals.get("reused", 0)
+        view["disk"] = {**disk, "device": device, "history": history or [],
+                        # the prompt speed measured so far, for the time a copy saved (tokens it gave back / speed)
+                        "prompt_tok_s": read / (totals["prompt_ms"] / 1000) if totals.get("prompt_ms") and read > 0 else None}
+    return view
 
 
 _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
@@ -3967,6 +4063,8 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        self.conv_disk = ConvDiskStatus()               # --conversation-cache-disk: the engine's status.json
+        self.cache_history = CacheHistory()             # ... and the usage samples of the last day (start_cache_history)
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -4358,6 +4456,27 @@ class Service:
             return "down"
         finally:
             self.fifo.release()
+
+    def start_cache_history(self):
+        """--conversation-cache-disk: one usage sample a minute (RAM, swap, big, bytes written) for the Monitor's
+        graph, whether the page is open or not."""
+        folder = conversation_disk_dir(self.engine)
+        if not folder:
+            return
+
+        def loop():
+            status = ConvDiskStatus()
+            while True:
+                try:
+                    parked = self.conv_log.poll(getattr(self.engine, "log_path", None),
+                                                getattr(self.engine, "log_start", None))
+                    disk = status.read(folder) or {}
+                    self.cache_history.add(parked.get("bytes", 0), (disk.get("swap") or {}).get("bytes", 0),
+                                           (disk.get("big") or {}).get("bytes", 0), disk.get("written_all_time", 0))
+                except Exception as e:                 # tried again in a minute; the thread keeps running
+                    print(f"[strata] conversation cache: usage sample: {e}", flush=True)
+                time.sleep(CacheHistory.EVERY_S)
+        threading.Thread(target=loop, daemon=True).start()
 
     def start_vision_idle(self):
         v = self.vision
@@ -4774,8 +4893,12 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        folder = conversation_disk_dir(self.engine)
+        disk = self.conv_disk.read(folder)
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "conversation_cache": conversation_cache_view(engine, hist, totals, parked, disk,
+                                                              disk_written_since_boot(folder) if disk else None,
+                                                              self.cache_history.view() if disk else None),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -9169,6 +9292,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
     svc.start_idle_unload()
     svc.start_vision_idle()
+    svc.start_cache_history()
     here = "[::1]" if a.host == "::" else "127.0.0.1" if a.host in ("0.0.0.0", "") else f"[{a.host}]" if ":" in a.host else a.host
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"

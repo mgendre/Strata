@@ -178,6 +178,31 @@
             <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
         </div>
         <dl class="facts" id="cc-facts"></dl>
+        <div class="cc-disk" id="cc-disk" hidden>
+          <div class="cc-bars">
+            <div><div class="bar-row"><span>Disk swap (short term)</span><span class="muted" id="cc-swap-text">&ndash;</span></div>
+              <div class="st-progress"><div class="st-progress__bar" id="cc-swap-bar" style="width:0%"></div></div></div>
+            <div><div class="bar-row"><span>Disk big (long term)</span><span class="muted" id="cc-big-text">&ndash;</span></div>
+              <div class="st-progress"><div class="st-progress__bar" id="cc-big-bar" style="width:0%"></div></div></div>
+          </div>
+          <p class="cc-warn small" id="cc-disk-warn" role="status" hidden></p>
+          <dl class="facts" id="cc-disk-facts"></dl>
+          <div class="cc-chart">
+            <div class="cc-chart-head"><span class="cc-chart-title">Cache size, last 24 h (GB)</span>
+              <span class="cc-legend" id="cc-legend"></span></div>
+            <div class="cc-plot" id="cc-usage-plot"><svg class="cc-svg" id="cc-usage" role="img"
+              aria-label="Conversation cache size in RAM, disk swap and disk big over the last 24 hours"></svg></div>
+            <div class="cc-chart-head"><span class="cc-chart-title">Disk writes per hour (GB)</span></div>
+            <div class="cc-plot" id="cc-writes-plot"><svg class="cc-svg cc-svg--short" id="cc-writes" role="img"
+              aria-label="Gigabytes written to the disk each hour over the last 24 hours"></svg></div>
+            <div class="cc-tip" id="cc-tip" hidden></div>
+            <details class="cc-details"><summary class="small">Show the last 24 h as a table</summary>
+              <div class="cc-table-wrap"><table class="cc-table" id="cc-hist-table"></table></div></details>
+          </div>
+          <div class="cc-chart-head"><span class="cc-chart-title">Conversations on disk</span>
+            <span class="muted small" id="cc-big-sum"></span></div>
+          <div class="cc-table-wrap"><table class="cc-table" id="cc-disk-table"></table></div>
+        </div>
         <p class="muted small cc-note" id="cc-note"></p>
       </div>
 
