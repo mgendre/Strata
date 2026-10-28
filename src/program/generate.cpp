@@ -816,6 +816,12 @@ struct Options {
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
     int64_t conversation_cache_park_gain = 0;
+    /// --serve: a parked conversation keeps only its N deepest checkpoints, its root (the shortest: the end of the system
+    /// prompt a new subagent starts from) and any pinned shared prefix.  Each one is a running state (~118 MB on
+    /// Qwen3.8-Flash-Next), so with --prompt-cache 12 a parked 60K-token conversation is ~1 GB of K/V and ~1.4 GB of
+    /// checkpoints; most returns continue from its end or its last turn.  The live conversation's chain is untouched.
+    /// 0 = every checkpoint, as before.
+    int64_t conversation_cache_park_checkpoints = 0;
     /// --serve --conversation-cache-disk DIR: the conversation cache's long-term level on disk (conversation_disk.hpp),
     /// --conversation-cache-disk-mib in all, kept across restarts of the same build and model.  A conversation is saved
     /// right after a reply once it reaches --conversation-cache-disk-first-tokens and again every
@@ -3193,7 +3199,8 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-disk") o.conversation_cache_disk = next("--conversation-cache-disk");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
-                 a == "--conversation-cache-park-gain" || a == "--conversation-cache-disk-mib" ||
+                 a == "--conversation-cache-park-gain" || a == "--conversation-cache-park-checkpoints" ||
+                 a == "--conversation-cache-disk-mib" ||
                  a == "--conversation-cache-disk-first-tokens" || a == "--conversation-cache-disk-step-tokens" ||
                  a == "--conversation-cache-disk-topup-tokens" || a == "--conversation-cache-disk-day-gib" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
@@ -3201,7 +3208,8 @@ int main(int argc, char** argv) {
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
-                                   a == "--conversation-cache-park-gain" || a == "--conversation-cache-disk-first-tokens" ||
+                                   a == "--conversation-cache-park-gain" || a == "--conversation-cache-park-checkpoints" ||
+                                   a == "--conversation-cache-disk-first-tokens" ||
                                    a == "--conversation-cache-disk-step-tokens" || a == "--conversation-cache-disk-topup-tokens")
                                       ? INT32_MAX
                                       : a == "--conversation-cache-disk-day-gib" ? INT64_MAX / (1ll << 30)
@@ -3214,6 +3222,7 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
+            else if (a == "--conversation-cache-park-checkpoints") o.conversation_cache_park_checkpoints = number;
             else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
             else if (a == "--conversation-cache-disk-first-tokens") o.conversation_cache_disk_first_tokens = number;
             else if (a == "--conversation-cache-disk-step-tokens") o.conversation_cache_disk_step_tokens = std::max<int64_t>(1, number);
@@ -10687,6 +10696,35 @@ int main(int argc, char** argv) {
             const strata::core::QsaState* draft0 = src.draft0;   // no --mtp: no draft K/V (snapshots accept null)
             auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return k + 1 == n_st ? src.draft_last : nullptr; };
             std::vector<ConvCheckpoint>& checks = src.checks;
+            // --conversation-cache-park-checkpoints N: the parked copy keeps the N deepest checkpoints, the root (the
+            // shortest) and any pinned shared prefix; the others are set aside for the capture (moved, not copied) and put back in their places
+            // however the park ends (after MergeBack below has put a split's parts back), so the live chain is untouched
+            struct HoldBack {
+                std::vector<ConvCheckpoint>& checks;
+                std::vector<std::pair<size_t, ConvCheckpoint>> out;   // (place in the chain, checkpoint), in chain order
+                ~HoldBack() {
+                    for (auto& [i, c] : out)
+                        checks.insert(checks.begin() + (std::ptrdiff_t) std::min(i, checks.size()), std::move(c));
+                }
+            } hold_back{checks, {}};
+            if (o.conversation_cache_park_checkpoints > 0 && (int64_t) checks.size() > o.conversation_cache_park_checkpoints) {
+                std::vector<size_t> deepest(checks.size());
+                for (size_t i = 0; i < deepest.size(); ++i) deepest[i] = i;
+                std::stable_sort(deepest.begin(), deepest.end(),
+                                 [&](size_t a, size_t b) { return checks[a].ids.size() > checks[b].ids.size(); });
+                std::vector<bool> keep(checks.size(), false);
+                for (size_t k = 0; k < deepest.size(); ++k)
+                    keep[deepest[k]] = (int64_t) k < o.conversation_cache_park_checkpoints || checks[deepest[k]].pinned;
+                keep[deepest.back()] = true;   // the root
+                std::vector<ConvCheckpoint> kept;
+                kept.reserve(checks.size());
+                hold_back.out.reserve(checks.size());
+                for (size_t i = 0; i < checks.size(); ++i) {
+                    if (keep[i]) kept.push_back(std::move(checks[i]));
+                    else hold_back.out.emplace_back(i, std::move(checks[i]));
+                }
+                checks = std::move(kept);
+            }
             strata::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
             struct MergeBack {
