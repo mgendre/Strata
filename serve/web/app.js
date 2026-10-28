@@ -591,10 +591,7 @@ function renderConvDisk(c) {
   ccDiskToday = d ? d.written_today : null;
   if (!d) $("cc-disk-warn").hidden = true;
   if (!d) return;
-  const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
   const now = d.time || Date.now() / 1000;
-  $("cc-dsk-text").textContent = `${fmt(d.disk.entries)} · ${gb(d.disk.bytes)} / ${gb(d.disk.budget, 0)} GB`;
-  $("cc-dsk-bar").style.width = pct(d.disk.bytes, d.disk.budget);
   const s = d.since_start || {};
   const ram = c.tokens_ram || 0, dsk = s.tokens || 0, all = ram + dsk;
   const share = (n) => `${fmt(all ? (100 * n) / all : 0)}%`;
