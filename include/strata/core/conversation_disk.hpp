@@ -6,7 +6,8 @@
 // When the folder is over its budget the copy with the lowest keep value leaves first: its usage score (every return,
 // from RAM or disk) plus one point for its last use, both halving every `half_life_s` (conversation_disk_keep) - the
 // oldest copy with the worst score goes, and a copy just saved, which had no time to come back, is not the first one.
-// The copies are kept across restarts of the same engine build and model.
+// The copies are kept across restarts and rebuilds of the same engine version and disk format, with the same model and
+// the settings that change what the saved bytes mean.
 //
 // A copy is the conversation's token ids, ONE running state (the deepest checkpoint near its end, else the live state:
 // conversation_disk_state) and the K/V up to that point, in blocks of `block_tokens` tokens named by a hash of their
@@ -68,7 +69,7 @@ struct ConversationDiskOptions {
 };
 
 /// What the files are bound to: the model inputs and the settings that change what the saved bytes mean (the session
-/// files' identity), this engine binary, and the K/V layout (layer count and part sizes).
+/// files' identity), the engine version with the disk format (`build`), and the K/V layout (layer count and part sizes).
 struct ConversationDiskIdentity {
     uint64_t model = 0, config = 0, build = 0, layout = 0;
     bool operator==(const ConversationDiskIdentity&) const = default;

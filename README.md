@@ -54,7 +54,8 @@ shows what both do in the Monitor, while keeping writes to the SSD low.
 - When RAM drops a conversation, nothing is written: its copy is on disk already.
 - When the conversation comes back, its copy goes from the disk to the GPU, and only the tokens since the last save are
   read again.
-- The copies are kept across restarts of the same engine build and model. Another build starts with an empty cache.
+- The copies are kept across restarts and rebuilds of the same engine version, with the same model and settings.
+  Another version, model or setting that changes the saved data starts with an empty cache.
 - When the cache is full, the conversation that came back least often leaves first, then the oldest.
 - To spare the SSD, files are written in large pieces and never rewritten, and nothing is flushed only for safety: a
   file cut short by a crash fails its check and is deleted.
