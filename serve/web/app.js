@@ -568,20 +568,22 @@ function renderDiskTable(d) {
     td.textContent = `None yet: a conversation is saved here after a reply once it reaches ${fmt(d.min_tokens)} tokens.`;
     return;
   }
-  const cols = [["Conversation", false], ["Tokens", true], ["Size", true], ["Returns", true], ["Score", true],
+  const cols = [["Conversation", false], ["Tokens", true], ["Size", true], ["Returns", true], ["Keep", true],
                 ["Tokens served", true], ["Time saved", true], ["Written", true], ["Last used", false]];
   const head = table.insertRow();
   for (const [text, num] of cols) { const th = document.createElement("th"); th.textContent = text; if (num) th.className = "num"; head.appendChild(th); }
-  for (const e of rows) {
+  rows.forEach((e, k) => {   // the engine sends them kept longest first: the last row leaves next when room is needed
     const row = table.insertRow();
-    const cells = [`#${e.id.slice(-6)}`, fmt(e.tokens), tb(e.bytes), fmt(e.returns), fmt(e.score, 1), fmt(e.served_tokens),
-                   speed && e.served_tokens ? dur(e.served_tokens / speed) : "–", tb(e.written), since(e.last_used)];
+    const next = k === rows.length - 1 && rows.length > 1;
+    const cells = [`#${e.id.slice(-6)}`, fmt(e.tokens), tb(e.bytes), fmt(e.returns), fmt(e.keep ?? e.score, 2),
+                   fmt(e.served_tokens), speed && e.served_tokens ? dur(e.served_tokens / speed) : "–", tb(e.written),
+                   since(e.last_used) + (next ? " · leaves next" : "")];
     cells.forEach((text, i) => {
       const td = row.insertCell();
       if (cols[i][1]) td.className = "num";
       td.textContent = text;
     });
-  }
+  });
 }
 function renderConvDisk(c) {
   const d = c.disk && c.disk.disk && c.disk.since_start ? c.disk : null;   // (a status.json of another engine version: hidden)

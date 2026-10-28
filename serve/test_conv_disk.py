@@ -88,6 +88,25 @@ class ConvDiskServer(unittest.TestCase):
         self.assertIsNone(long_read_speed([{"prompt_read": 500, "prompt_ms": 900.0}]))   # nothing long yet
         self.assertIsNone(long_read_speed([]))
 
+    def test_history_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "history.json")
+            h = CacheHistory()
+            for i in range(5):
+                h.add(10 * i, 20 * i, 30 * i, i, i, now=100000 + 60 * i)
+            h.save(path)
+            again = CacheHistory()
+            again.load(path, now=100000 + 60 * 4)
+            self.assertEqual(again.view(), h.view())
+            later = CacheHistory()                            # a day and more later: nothing is that recent
+            later.load(path, now=100000 + 86400 + 600)
+            self.assertEqual(later.view(), [])
+            Path(path).write_text("[[1, 2", encoding="utf-8")   # damaged: ignored
+            broken = CacheHistory()
+            broken.load(path)
+            self.assertEqual(broken.view(), [])
+            CacheHistory().load(os.path.join(d, "missing.json"))   # missing: ignored
+
     def test_the_view(self):
         info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3, "conversation_cache_disk": 1}
         totals = {"reused": 100, "prompt_tokens": 2100, "prompt_ms": 1000}

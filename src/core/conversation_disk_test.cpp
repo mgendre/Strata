@@ -214,6 +214,36 @@ int main(int argc, char** argv) {
         check(mh && d2.load(mh, s2, cv, t2.sinks, st, error) && t2.holds(41), "a copy loads after a restart");
     }
 
+    // the oldest copy with the worst score leaves first; a copy just saved is not the first to go
+    {
+        int64_t clock = 1000000;
+        ConversationDiskOptions probe = options((root / "probe").string());
+        ConversationDisk dp;
+        Conv p0 = conv(80, 100);
+        check(dp.open(probe, id, 2, sizes, note, error) && dp.save(write_of(p0), st, error), "keep: measure one copy");
+        const uint64_t one = dp.usage().bytes;
+        ConversationDiskOptions o = options((root / "keep").string());
+        o.clock = [&clock] { return clock; };
+        o.budget_bytes = 3 * one + 10;                     // room for three copies of this size
+        ConversationDisk d;
+        Conv used = conv(81, 100), idle = conv(82, 100), fresh = conv(83, 100), newest = conv(84, 100), last = conv(85, 100);
+        check(d.open(o, id, 2, sizes, note, error), "keep: open");
+        check(d.save(write_of(used, 1.0), st, error) && d.save(write_of(idle), st, error), "day 0: one that came back once, one never");
+        clock += 3 * 86400;
+        check(d.save(write_of(fresh), st, error) && d.usage().entries == 3, "day 3: a fresh copy (score 0), three on disk");
+        // keep values on day 3: used 1/8 + 1/8, idle 0 + 1/8, fresh 0 + 1
+        check(d.save(write_of(newest), st, error) && d.usage().entries == 3 && !d.best(extend(idle.ids, 1), {}, true) &&
+              d.best(extend(used.ids, 1), {}, true) && d.best(extend(fresh.ids, 1), {}, true),
+              "a fourth pushes out the old copy that never came back, not the fresh one");
+        check(d.save(write_of(last), st, error) && !d.best(extend(used.ids, 1), {}, true) &&
+              d.best(extend(fresh.ids, 1), {}, true) && d.best(extend(newest.ids, 1), {}, true),
+              "then the old one that came back once (its score faded), still not the fresh one");
+        check(std::abs(conversation_disk_keep(1.0, 0, 0, 3 * 86400, 86400.0) - 0.25) < 1e-9 &&
+              std::abs(conversation_disk_keep(0.0, 0, 3 * 86400, 3 * 86400, 86400.0) - 1.0) < 1e-9, "keep values");
+        const std::string json = d.status_json();
+        check(json.find("\"keep\":") != std::string::npos, "status.json rows carry the keep value");
+    }
+
     // a damaged block: the load fails and the copy is not offered again
     {
         ConversationDisk d3;

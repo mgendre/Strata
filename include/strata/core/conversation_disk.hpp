@@ -3,9 +3,10 @@
 // The engine saves a conversation here as it grows - right after a reply, once it reaches the first step (32K tokens by
 // default) and again at every further step (16K) - so a conversation that RAM pushes out or cannot hold is on disk
 // already, at most one step behind; on its return the copy streams back to the GPU and only the gap is read again.
-// When the folder is over its budget the copy with the lowest usage score leaves first (a score counts every return,
-// from RAM or disk, and halves every `half_life_s`; one never seen again has none), the least recently used among
-// equals.  The copies are kept across restarts of the same engine build and model.
+// When the folder is over its budget the copy with the lowest keep value leaves first: its usage score (every return,
+// from RAM or disk) plus one point for its last use, both halving every `half_life_s` (conversation_disk_keep) - the
+// oldest copy with the worst score goes, and a copy just saved, which had no time to come back, is not the first one.
+// The copies are kept across restarts of the same engine build and model.
 //
 // A copy is the conversation's token ids, ONE running state (the deepest checkpoint near its end, else the live state:
 // conversation_disk_state) and the K/V up to that point, in blocks of `block_tokens` tokens named by a hash of their
@@ -51,6 +52,9 @@ const ConversationCheckpoint& conversation_disk_state(const ConversationCheckpoi
 
 /// A usage score `score` stamped at `at` (unix seconds), seen at `now`: halved every `half_life_s`.
 double conversation_score_at(double score, int64_t at, int64_t now, double half_life_s);
+/// The keep value of a disk copy: its score at `now` plus one point for its last use at `last_used`, both halving every
+/// `half_life_s`.  The lowest leaves first.
+double conversation_disk_keep(double score, int64_t score_at, int64_t last_used, int64_t now, double half_life_s);
 
 struct ConversationDiskOptions {
     std::string dir;
@@ -60,6 +64,7 @@ struct ConversationDiskOptions {
     int64_t block_tokens = 4096;
     double half_life_s = 86400.0;
     uint64_t day_guide_bytes = 200ull << 30;   ///< written per day above which the monitor warns (nothing stops)
+    std::function<int64_t()> clock;            ///< unix seconds (tests); unset: the system clock
 };
 
 /// What the files are bound to: the model inputs and the settings that change what the saved bytes mean (the session

@@ -915,6 +915,32 @@ class CacheHistory:
         with self.lock:
             return [list(x) for x in self.samples]
 
+    def load(self, path: str, now: float | None = None):
+        """The samples of the last day that an earlier run of the server saved (save), so a restart does not empty the
+        graph.  A missing or damaged file is ignored."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                rows = json.load(f)
+        except (OSError, ValueError):
+            return
+        cut = (now if now is not None else time.time()) - self.KEEP * self.EVERY_S
+        with self.lock:
+            self.samples.clear()
+            for r in rows if isinstance(rows, list) else []:
+                if isinstance(r, list) and len(r) == 6 and all(isinstance(v, (int, float)) for v in r) and r[0] >= cut:
+                    self.samples.append([int(v) for v in r])
+
+    def save(self, path: str):
+        """Writes the samples beside the engine's status.json (~60 KB, once a minute), under a temporary name first."""
+        tmp = f"{path}.tmp-{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.view(), f, separators=(",", ":"))
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+
 
 def conversation_slots(engine) -> int | None:
     """How many conversations the engine's cache holds: its --conversation-cache-slots argument, which is known
@@ -4490,6 +4516,9 @@ class Service:
         if not folder:
             return
 
+        saved = os.path.join(folder, "history.json")   # (a restart of the server keeps the last day's graph)
+        self.cache_history.load(saved)
+
         def loop():
             status = ConvDiskStatus()
             while True:
@@ -4501,6 +4530,7 @@ class Service:
                     self.cache_history.add(parked.get("tokens_ram", 0), since.get("tokens", 0),
                                            disk.get("written_all_time", 0), parked.get("restores", 0),
                                            since.get("restores", 0))
+                    self.cache_history.save(saved)
                 except Exception as e:                 # tried again in a minute; the thread keeps running
                     print(f"[strata] conversation cache: usage sample: {e}", flush=True)
                 time.sleep(CacheHistory.EVERY_S)
