@@ -16026,6 +16026,9 @@ int main(int argc, char** argv) {
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
+            // multi-GPU: the peer GPU's share of this request's decode (its line below the hit rate)
+            const int64_t peer_entries0 = drive.d.peer_entries, peer_swaps0 = peer.swaps();
+            const double peer_wait0 = peer.ms_wait;
             pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses);   // the prompt's windows are not the decode's
             if (cancelled) finish = nf_hit ? "nonfinite" : "cancel";
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
@@ -17438,6 +17441,21 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
+            }
+            // multi-GPU (--peer-device): the line above counts the peer GPU's experts with the PCIe ones; here they are
+            // apart, with what the peer cost the CPU pool - the time it spun in PeerExperts::finish after its own share
+            // was done, waiting for the peer's rows (each layer of a window waits for them)
+            if (peer.valid() && req_look + req_offload > 0) {
+                const int64_t req_peer = drive.d.peer_entries - peer_entries0;
+                const double all = (double) (req_look + req_offload), wait = peer.ms_wait - peer_wait0;
+                std::fprintf(stderr, "strata serve: peer GPU: of %lld routed experts, %.1f%% on the main GPU's cache, %.1f%% "
+                                     "on the peer GPU, %.1f%% over PCIe, %.1f%% on the CPU; the CPU pool waited %.0f ms for "
+                                     "the peer GPU (%.2f ms per decode window), %lld experts swapped into it\n",
+                             (long long) (req_look + req_offload), 100.0 * (double) req_hits / all,
+                             100.0 * (double) req_peer / all, 100.0 * (double) (req_offload - req_peer) / all,
+                             100.0 * (double) (req_look - req_hits) / all, wait,
+                             dec_windows > 0 ? wait / (double) dec_windows : 0.0,
+                             (long long) (peer.swaps() - peer_swaps0));
             }
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "

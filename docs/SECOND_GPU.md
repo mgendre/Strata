@@ -102,6 +102,14 @@ With a peer, the prompt path keeps the MMQ path (the fused int8 prompt path is n
 is manual (`--peer-reserve-mib`, `--peer-slots`). With the same expert set split across the two cards, generated tokens are
 byte-identical to the single-GPU run under the exactness gate.
 
+With a peer, the server log has one more line after each request's hit rate. It says where the routed experts of the decode
+were computed (the main GPU's cache, the peer GPU, over PCIe, on the CPU), how long the CPU pool waited for the peer GPU after
+its own share was done, and how many experts were swapped into the peer:
+
+```text
+strata serve: peer GPU: of N routed experts, A% on the main GPU's cache, B% on the peer GPU, C% over PCIe, D% on the CPU; the CPU pool waited W ms for the peer GPU (w ms per decode window), S experts swapped into it
+```
+
 ## The resident RAM mode with the helper caches
 
 `--resident-experts` (the low-RAM mode) works with the helper caches. The experts a helper holds are left out of the RAM copy,
