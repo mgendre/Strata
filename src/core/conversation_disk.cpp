@@ -197,13 +197,17 @@ double conversation_score_at(double score, int64_t at, int64_t now, double half_
     return score * std::exp2(-(double) (now - at) / half_life_s);
 }
 
+double conversation_disk_keep(double score, int64_t score_at, int64_t last_used, int64_t now, double half_life_s) {
+    return conversation_score_at(score, score_at, now, half_life_s) + conversation_score_at(1.0, last_used, now, half_life_s);
+}
+
 uint64_t ConversationDisk::Entry::bytes() const {
     uint64_t n = state_bytes;
     for (uint64_t b : block_bytes) n += b;
     return n;
 }
 
-int64_t ConversationDisk::now() const { return (int64_t) std::time(nullptr); }
+int64_t ConversationDisk::now() const { return opt_.clock ? opt_.clock() : (int64_t) std::time(nullptr); }
 
 std::string ConversationDisk::path(const char* sub, const std::string& name) const {
     return (fs::path(opt_.dir) / sub / name).string();
@@ -504,16 +508,16 @@ void ConversationDisk::remove(size_t index) {
 }
 
 void ConversationDisk::fit(uint64_t keep_id) {
-    // over the budget: the lowest usage score goes (a copy never seen again has none), the least recently used among
-    // equals; the copy just stored or used last of all
+    // over the budget: the lowest keep value goes (conversation_disk_keep: the oldest copy with the worst score), the
+    // least recently used among equals; the copy just stored or used last of all
     const int64_t t = now();
     while (usage().bytes > opt_.budget_bytes && !entries_.empty()) {
         size_t v = 0;
         auto worse = [&](const Entry& a, const Entry& b) {   // a leaves before b
             if ((a.id == keep_id) != (b.id == keep_id)) return b.id == keep_id;
-            const double sa = conversation_score_at(a.score, a.score_at, t, opt_.half_life_s);
-            const double sb = conversation_score_at(b.score, b.score_at, t, opt_.half_life_s);
-            return sa != sb ? sa < sb : a.last_used < b.last_used;
+            const double ka = conversation_disk_keep(a.score, a.score_at, a.last_used, t, opt_.half_life_s);
+            const double kb = conversation_disk_keep(b.score, b.score_at, b.last_used, t, opt_.half_life_s);
+            return ka != kb ? ka < kb : a.last_used < b.last_used;
         };
         for (size_t i = 1; i < entries_.size(); ++i)
             if (worse(entries_[i], entries_[v])) v = i;
@@ -874,18 +878,19 @@ std::string ConversationDisk::status_json() const {
     std::vector<const Entry*> rows;
     for (const Entry& e : entries_) rows.push_back(&e);
     const int64_t t = now();
-    std::sort(rows.begin(), rows.end(), [&](const Entry* x, const Entry* y) {
-        const double sx = conversation_score_at(x->score, x->score_at, t, opt_.half_life_s);
-        const double sy = conversation_score_at(y->score, y->score_at, t, opt_.half_life_s);
-        return sx != sy ? sx > sy : x->last_used > y->last_used;
+    std::sort(rows.begin(), rows.end(), [&](const Entry* x, const Entry* y) {   // kept longest first: the last row leaves next
+        const double kx = conversation_disk_keep(x->score, x->score_at, x->last_used, t, opt_.half_life_s);
+        const double ky = conversation_disk_keep(y->score, y->score_at, y->last_used, t, opt_.half_life_s);
+        return kx != ky ? kx > ky : x->last_used > y->last_used;
     });
     for (size_t i = 0; i < rows.size(); ++i) {
         const Entry& e = *rows[i];
         std::snprintf(b, sizeof b,
-                      "%s{\"id\":\"%s\",\"tokens\":%zu,\"bytes\":%llu,\"returns\":%llu,\"score\":%.3f,"
+                      "%s{\"id\":\"%s\",\"tokens\":%zu,\"bytes\":%llu,\"returns\":%llu,\"score\":%.3f,\"keep\":%.3f,"
                       "\"served_tokens\":%llu,\"written\":%llu,\"created\":%lld,\"last_used\":%lld}",
                       i ? "," : "", hex(e.id).c_str(), e.meta.ids.size(), (unsigned long long) e.bytes(),
                       (unsigned long long) e.returns, conversation_score_at(e.score, e.score_at, t, opt_.half_life_s),
+                      conversation_disk_keep(e.score, e.score_at, e.last_used, t, opt_.half_life_s),
                       (unsigned long long) e.served_tokens, (unsigned long long) e.written, (long long) e.created,
                       (long long) e.last_used);
         s += b;
