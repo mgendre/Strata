@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
@@ -46,6 +47,22 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, 
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
                             int64_t upto, bool include_index, std::string& error);
+// --conversation-cache-disk: the same sizes for any `upto`, whatever the state holds now (no copy is made from them).
+bool conversation_kv_layout_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                                  std::array<uint64_t, 5>& sizes, std::string& error);
+// --conversation-cache-disk: one layer's K/V written back from disk (where its authoritative bytes live, device or host
+// pool), `finish` refreshes its residency.  The state must stay alive and unmoved while the sink is used.
+bool conversation_kv_sink(SessionKvSink& sink, const QsaState& state, const ModelGeometry& g, int64_t upto,
+                          bool include_index, std::string& error);
+// The session's K/V layers for the disk copies: its own QSA layers, then the draft layer (`draft`, may be null).
+// Sources and sinks hold `upto` tokens; the device is synchronized first.  Layer sizes take any `upto`.
+size_t conversation_kv_layers(const SessionState& session, const QsaState* draft);
+bool conversation_kv_layer_sizes(const SessionState& session, const ModelGeometry& g, const QsaState* draft, size_t layer,
+                                 int64_t upto, std::array<uint64_t, 5>& sizes, std::string& error);
+bool conversation_kv_sources(std::vector<SessionKvSource>& sources, const SessionState& session, const ModelGeometry& g,
+                             const QsaState* draft, int64_t upto, std::string& error);
+bool conversation_kv_sinks(std::vector<SessionKvSink>& sinks, const SessionState& session, const ModelGeometry& g,
+                           const QsaState* draft, int64_t upto, std::string& error);
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
