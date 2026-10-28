@@ -823,7 +823,8 @@ struct Options {
     /// 0 = every checkpoint, as before.
     int64_t conversation_cache_park_checkpoints = 0;
     /// --serve --conversation-cache-disk DIR: the conversation cache's long-term level on disk (conversation_disk.hpp),
-    /// --conversation-cache-disk-mib in all (32 GiB by default), kept across restarts of the same build and model.  A conversation is saved
+    /// --conversation-cache-disk-mib in all (32 GiB by default), kept across restarts and rebuilds of the same engine
+    /// version (and disk format) with the same model and settings.  A conversation is saved
     /// right after a reply once it reaches --conversation-cache-disk-first-tokens and again every
     /// --conversation-cache-disk-step-tokens further on.  --conversation-cache-disk-topup-tokens N (0 = off): when RAM
     /// pushes out (or cannot hold) a conversation N or more tokens past its copy, that gap is saved too.  Above
@@ -10440,6 +10441,10 @@ int main(int argc, char** argv) {
         // conversation is saved right after a reply once it reaches the first step and at every further step
         // (disk_save_session), so RAM can push it out later with nothing to write; it comes back from there straight to
         // the GPU (the request path).  One GPU only: a layer split keeps the RAM cache alone.
+        // the disk copies' format and meaning: a copy is kept across restarts and rebuilds of the same engine version,
+        // so raise this with any change that makes saved K/V or running state mean something else (the kernels that
+        // write them, their layout, what a checkpoint holds) - every copy on disk is then dropped at the next start
+        constexpr int64_t kDiskFormat = 1;
         constexpr int64_t kDiskNear = 8192;      // the running state kept: a checkpoint at most this far before the end
         constexpr int64_t kDiskMinGain = 4096;   // a disk copy is restored when it saves at least this many tokens
         constexpr double kScoreHalfLife = 86400.0;
@@ -10459,18 +10464,12 @@ int main(int argc, char** argv) {
                 strata::core::SessionFileIdentity sid;
                 if (session_identity(sid, why, {})) {
                     strata::core::ConversationDiskIdentity did{sid.model, sid.config, 0, 0};
-                    // this engine binary (a rebuild may change what the saved bytes mean) and its K/V layout
-                    std::error_code fec;
-                    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", fec);
+                    // the engine version (like the session files: a rebuild of the same version keeps the copies),
+                    // kDiskFormat and the K/V layout; the model files and the settings that change what the bytes mean
+                    // are sid's
                     strata::core::SessionIdentityBuilder build(0xb17d);
                     build.str("version", STRATA_VERSION);
-                    build.str("compiled", __DATE__ " " __TIME__);
-                    if (!fec) {
-                        const auto size = std::filesystem::file_size(exe, fec);
-                        if (!fec) build.u64("size", (uint64_t) size);
-                        const auto when = std::filesystem::last_write_time(exe, fec);
-                        if (!fec) build.i64("mtime", (int64_t) when.time_since_epoch().count());
-                    }
+                    build.i64("disk_format", kDiskFormat);
                     did.build = build.digest();
                     const size_t layers = strata::core::conversation_kv_layers(ss, disk_draft);
                     strata::core::SessionIdentityBuilder lay(0x1a70);
