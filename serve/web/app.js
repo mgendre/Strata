@@ -135,6 +135,7 @@ const METRICS = [
   {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
+  {key: "diskw", label: "Disk write", icon: "disk", unit: "MB/s", series: "disk_write_mb", tone: "info"},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
@@ -401,20 +402,19 @@ function renderConvCache(c) {
   ]);
   renderConvDisk(c);
   $("cc-note").textContent = c.enabled && c.disk
-    ? "A request that continues a parked conversation gets its state back instead of reading it again. When RAM is full its oldest conversation goes to the disk's swap; conversations that keep coming back move to the disk's big level, kept across restarts."
+    ? "A request that continues a parked conversation gets its state back instead of reading it again. Long conversations are also saved on disk after a reply, step by step, so one that RAM lets go comes back from disk; the copies are kept across restarts, the least used leave first when the disk budget is full."
     : c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
 }
 
-// --conversation-cache-disk: the disk levels, where restored state came from, the disk writes, the usage graph (RAM /
-// swap / big over the last day, one sample a minute) with the writes per hour below it, and the conversations on disk
-const CC_SERIES = [[1, "RAM", "--cc-ram"], [2, "Disk swap", "--cc-swap"], [3, "Disk big", "--cc-big"]];
+// --conversation-cache-disk: the disk level, where restored state came from, the disk writes, what RAM and disk gave
+// back each hour of the last day with the bytes written each hour below it, and the conversations on disk
+let ccDiskToday = null;   // the conversation cache's disk writes today (the Disk write card's line)
 const SVGNS = "http://www.w3.org/2000/svg";
 const tb = (b, d = 1) => (b == null ? "–" : b >= 1099511627776 ? `${fmt(b / 1099511627776, 2)} TB` : `${gb(b, d)} GB`);
 const dur = (s) => (s < 90 ? `${fmt(s)} s` : s < 5400 ? `${fmt(s / 60)} min` : `${fmt(s / 3600, 1)} h`);
 const hhmm = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
-const ccHover = {usage: null, writes: null};   // the hovered or focused sample / hour, kept across re-renders
 function svgEl(tag, attrs, parent) {
   const e = document.createElementNS(SVGNS, tag);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
@@ -441,121 +441,116 @@ function ccTip(plot, x, y, title, rows) {
     tip.appendChild(row);
   }
   tip.hidden = false;
-  const box = $("cc-disk").querySelector(".cc-chart").getBoundingClientRect(), pb = plot.getBoundingClientRect();
+  const box = $("cc-chart").getBoundingClientRect(), pb = plot.getBoundingClientRect();
   const left = Math.min(Math.max(0, pb.left - box.left + x + 12), box.width - tip.offsetWidth);
   tip.style.left = `${left}px`;
   tip.style.top = `${pb.top - box.top + Math.max(0, y - tip.offsetHeight - 8)}px`;
 }
-function ccFrame(svg, w, h, pad, ymax, ticks) {   // recessive grid and y labels (GB)
+function ccFrame(svg, w, h, pad, ymax, ticks, label) {   // recessive grid and y labels
   for (const v of ticks) {
     const y = pad.t + (h - pad.t - pad.b) * (1 - v / ymax);
     svgEl("line", {x1: pad.l, x2: w - pad.r, y1: y, y2: y, style: `stroke:var(${v === 0 ? "--cc-axis" : "--cc-grid"});stroke-width:1`}, svg);
-    svgEl("text", {x: pad.l - 6, y: y + 4, "text-anchor": "end"}, svg).textContent = fmt(v, v < 1 && v > 0 ? 1 : 0);
+    svgEl("text", {x: pad.l - 6, y: y + 4, "text-anchor": "end"}, svg).textContent = label(v);
   }
 }
-function renderUsage(d, now) {
-  const svg = $("cc-usage"), plot = $("cc-usage-plot");
-  const w = Math.max(280, plot.clientWidth || 600), h = 160, pad = {l: 34, r: 8, t: 8, b: 20};
-  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-  svg.replaceChildren();
-  const t0 = now - 86400, pts = (d.history || []).filter((x) => x[0] >= t0);
-  const legend = $("cc-legend");
-  legend.replaceChildren(...CC_SERIES.map(([, name, color]) => {
-    const span = document.createElement("span"), key = document.createElement("i");
-    key.style.background = `var(${color})`;
-    span.append(key, name);
-    return span;
-  }));
-  const X = (t) => pad.l + (w - pad.l - pad.r) * (t - t0) / 86400;
-  if (pts.length < 2) {
-    svgEl("text", {x: pad.l, y: h / 2}, svg).textContent = "Collecting: one sample a minute";
-    return;
-  }
-  const ymax = niceMax(Math.max(...pts.flatMap((x) => [x[1], x[2], x[3]])) / 1073741824);
-  const Y = (b) => pad.t + (h - pad.t - pad.b) * (1 - b / 1073741824 / ymax);
-  ccFrame(svg, w, h, pad, ymax, [0, ymax / 2, ymax]);
-  for (const [t, label] of [[t0, "24 h ago"], [t0 + 43200, "12 h ago"], [now, "now"]])
-    svgEl("text", {x: X(t), y: h - 4, "text-anchor": t === t0 ? "start" : t === now ? "end" : "middle"}, svg).textContent = label;
-  for (const [k, , color] of CC_SERIES) {   // a gap of more than 3 minutes breaks the line (the server was down)
-    let dpath = "";
-    pts.forEach((x, i) => { dpath += `${i && x[0] - pts[i - 1][0] <= 180 ? "L" : "M"}${X(x[0]).toFixed(1)},${Y(x[k]).toFixed(1)}`; });
-    svgEl("path", {d: dpath, fill: "none", style: `stroke:var(${color});stroke-width:2;stroke-linejoin:round;stroke-linecap:round`}, svg);
-  }
-  const cross = svgEl("line", {y1: pad.t, y2: h - pad.b, style: "stroke:var(--cc-axis);stroke-width:1", visibility: "hidden"}, svg);
-  const show = (i) => {
-    ccHover.usage = i;
-    const x = pts[i];
-    cross.setAttribute("x1", X(x[0])); cross.setAttribute("x2", X(x[0])); cross.setAttribute("visibility", "visible");
-    ccTip(plot, X(x[0]), pad.t, hhmm(x[0]), CC_SERIES.map(([k, name, color]) => [`${gb(x[k], 2)} GB`, name, color]));
-  };
-  const hide = () => { ccHover.usage = null; cross.setAttribute("visibility", "hidden"); $("cc-tip").hidden = true; };
-  const hit = svgEl("rect", {x: pad.l, y: 0, width: w - pad.l - pad.r, height: h, fill: "transparent"}, svg);
-  const nearest = (ev) => {
-    const r = svg.getBoundingClientRect(), t = t0 + ((ev.clientX - r.left) * w / r.width - pad.l) / (w - pad.l - pad.r) * 86400;
-    let best = 0;
-    pts.forEach((x, i) => { if (Math.abs(x[0] - t) < Math.abs(pts[best][0] - t)) best = i; });
-    return best;
-  };
-  hit.addEventListener("pointermove", (ev) => show(nearest(ev)));
-  hit.addEventListener("pointerleave", hide);
-  svg.setAttribute("tabindex", "0");
-  svg.onfocus = () => show(ccHover.usage ?? pts.length - 1);
-  svg.onblur = hide;
-  svg.onkeydown = (ev) => {
-    const i = ccHover.usage ?? pts.length - 1;
-    if (ev.key === "ArrowLeft") { show(Math.max(0, i - 1)); ev.preventDefault(); }
-    if (ev.key === "ArrowRight") { show(Math.min(pts.length - 1, i + 1)); ev.preventDefault(); }
-  };
-  if (ccHover.usage != null && ccHover.usage < pts.length) show(ccHover.usage);
+const tokfmt = (n) => (n >= 1e6 ? `${fmt(n / 1e6, n >= 1e7 ? 0 : 1)}M` : n >= 1e3 ? `${fmt(n / 1e3, n >= 1e4 ? 0 : 1)}K` : fmt(n));
+const gblabel = (v) => fmt(v, v < 1 && v > 0 ? 1 : 0);
+function niceTokens(v) {   // a clean axis top in tokens: 1, 2 or 5 times a power of ten
+  if (!(v > 0)) return 1000;
+  const p = 10 ** Math.floor(Math.log10(v));
+  return [1, 2, 5, 10].map((m) => m * p).find((m) => m >= v);
 }
-function writesPerHour(d, now) {   // [hour start, bytes written in that hour] for the last 24 hours
-  const h0 = Math.floor(now / 3600) * 3600 - 23 * 3600, out = Array.from({length: 24}, (_, k) => [h0 + k * 3600, 0, null]);
+// the last 24 hours, hour by hour, from the server's samples [time, tokens from RAM, tokens from disk, bytes written,
+// restores from RAM, restores from disk]: what each gave back and what was written in the hour (the engine's counters
+// start again at an engine start: a drop counts from zero)
+function ccHours(d, now) {
+  const h0 = Math.floor(now / 3600) * 3600 - 23 * 3600;
+  const out = Array.from({length: 24}, (_, k) => ({t: h0 + k * 3600, ram: 0, disk: 0, written: 0, nram: 0, ndisk: 0, seen: false}));
   const pts = d.history || [];
-  for (let i = 0; i < pts.length; i++) {
+  const step = (a, b) => (b >= a ? b - a : b);
+  for (let i = 1; i < pts.length; i++) {
     const k = Math.floor((pts[i][0] - h0) / 3600);
     if (k < 0 || k > 23) continue;
-    if (i) out[k][1] += Math.max(0, pts[i][4] - pts[i - 1][4]);
-    out[k][2] = pts[i];   // the hour's last sample (the table view's levels)
+    const o = out[k], p = pts[i - 1], x = pts[i];
+    o.ram += step(p[1], x[1]); o.disk += step(p[2], x[2]); o.written += Math.max(0, x[3] - p[3]);
+    o.nram += step(p[4] || 0, x[4] || 0); o.ndisk += step(p[5] || 0, x[5] || 0); o.seen = true;
   }
   return out;
 }
-function renderWrites(d, now) {
-  const svg = $("cc-writes"), plot = $("cc-writes-plot"), hours = writesPerHour(d, now);
-  const w = Math.max(280, plot.clientWidth || 600), h = 96, pad = {l: 34, r: 8, t: 8, b: 20};
-  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-  svg.replaceChildren();
-  const ymax = niceMax(Math.max(...hours.map((x) => x[1])) / 1073741824);
-  ccFrame(svg, w, h, pad, ymax, [0, ymax]);
-  const slot = (w - pad.l - pad.r) / 24, bw = Math.min(24, slot * 0.6), base = h - pad.b;
-  hours.forEach(([t, bytes], k) => {
-    const x = pad.l + k * slot + (slot - bw) / 2, top = pad.t + (base - pad.t) * (1 - bytes / 1073741824 / ymax);
-    if (bytes > 0) {
-      const r = Math.min(4, bw / 2, base - top);
-      svgEl("path", {d: `M${x},${base}V${top + r}Q${x},${top} ${x + r},${top}H${x + bw - r}Q${x + bw},${top} ${x + bw},${top + r}V${base}Z`,
-                     style: "fill:var(--cc-writes)"}, svg);
-    }
+// columns from the baseline, one per hour; `parts` stacked bottom to top with a 2px surface gap, the top one rounded
+function ccColumns(svg, plot, w, h, pad, hours, parts, ymax, label, tip) {
+  const slot = (w - pad.l - pad.r) / 24, bw = Math.min(24, slot * 0.6), base = h - pad.b, span = base - pad.t;
+  hours.forEach((o, k) => {
+    const x = pad.l + k * slot + (slot - bw) / 2;
+    let y = base;
+    const segs = parts.map(([key, color]) => [o[key] / ymax * span, color]).filter(([hgt]) => hgt > 0);
+    segs.forEach(([hgt, color], j) => {
+      const top = y - hgt, last = j === segs.length - 1, r = last ? Math.min(4, bw / 2, hgt) : 0;
+      svgEl("path", {d: `M${x},${y}V${top + r}Q${x},${top} ${x + r},${top}H${x + bw - r}Q${x + bw},${top} ${x + bw},${top + r}V${y}Z`,
+                     style: `fill:var(${color})`}, svg);
+      y = top - (last ? 0 : 2);   // the surface gap between two segments
+    });
     if (k % 6 === 0 || k === 23)
-      svgEl("text", {x: x + bw / 2, y: h - 4, "text-anchor": "middle"}, svg).textContent = new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit"});
+      svgEl("text", {x: x + bw / 2, y: h - 4, "text-anchor": "middle"}, svg).textContent = new Date(o.t * 1000).toLocaleTimeString([], {hour: "2-digit"});
     const hit = svgEl("rect", {x: pad.l + k * slot, y: 0, width: slot, height: h, fill: "transparent", tabindex: "0"}, svg);
-    const show = () => { ccHover.writes = k; ccTip(plot, x + bw / 2, top, `${hhmm(t)}–${hhmm(t + 3600)}`, [[`${gb(bytes, 2)} GB`, "written", null]]); };
-    const hide = () => { ccHover.writes = null; $("cc-tip").hidden = true; };
+    const show = () => ccTip(plot, x + bw / 2, Math.min(y, base - 8), `${hhmm(o.t)}–${hhmm(o.t + 3600)}`, tip(o));
+    const hide = () => { $("cc-tip").hidden = true; };
     hit.addEventListener("pointerenter", show);
     hit.addEventListener("pointerleave", hide);
     hit.addEventListener("focus", show);
     hit.addEventListener("blur", hide);
   });
+}
+function ccSvg(id, plotId, fallbackH) {
+  const svg = $(id), plot = $(plotId);
+  const w = Math.max(280, plot.clientWidth || 600), h = Math.max(80, svg.clientHeight || fallbackH);
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  svg.replaceChildren();
+  return {svg, plot, w, h, pad: {l: 38, r: 8, t: 8, b: 20}};
+}
+function renderGiven(d, hours) {   // prompt tokens given back each hour: from RAM (below), from disk (above)
+  const {svg, plot, w, h, pad} = ccSvg("cc-usage", "cc-usage-plot", 160);
+  $("cc-legend").replaceChildren(...[["Disk", "--cc-dsk"], ["RAM", "--cc-ram"]].map(([name, color]) => {
+    const span = document.createElement("span"), key = document.createElement("i");
+    key.style.background = `var(${color})`;
+    span.append(key, name);
+    return span;
+  }));
+  if (!hours.some((o) => o.seen)) {
+    svgEl("text", {x: pad.l, y: h / 2}, svg).textContent = "Collecting: one sample a minute";
+    return;
+  }
+  const ymax = niceTokens(Math.max(...hours.map((o) => o.ram + o.disk)));
+  ccFrame(svg, w, h, pad, ymax, [0, ymax / 2, ymax], tokfmt);
+  const speed = d.prompt_tok_s;
+  ccColumns(svg, plot, w, h, pad, hours, [["ram", "--cc-ram"], ["disk", "--cc-dsk"]], ymax, tokfmt, (o) => {
+    const all = o.ram + o.disk;
+    const rows = [[`${tokfmt(o.disk)} tokens`, `from disk (${fmt(o.ndisk)} restores)`, "--cc-dsk"],
+                  [`${tokfmt(o.ram)} tokens`, `from RAM (${fmt(o.nram)} restores)`, "--cc-ram"]];
+    if (all) rows.push([`${fmt((100 * o.disk) / all)}%`, "from disk", null]);
+    if (speed && o.disk) rows.push([dur(o.disk / speed), "of reading saved by the disk", null]);
+    return rows;
+  });
+}
+function renderWrites(d, hours) {
+  const {svg, plot, w, h, pad} = ccSvg("cc-writes", "cc-writes-plot", 96);
+  const ymax = niceMax(Math.max(...hours.map((o) => o.written)) / 1073741824);
+  ccFrame(svg, w, h, pad, ymax, [0, ymax], gblabel);
+  const scaled = hours.map((o) => ({...o, gbw: o.written / 1073741824}));
+  ccColumns(svg, plot, w, h, pad, scaled, [["gbw", "--cc-writes"]], ymax, gblabel,
+            (o) => [[`${gb(o.written, 2)} GB`, "written", null]]);
   // the table view: every value of both charts without hovering
   const table = $("cc-hist-table");
   table.replaceChildren();
   const head = table.insertRow();
-  for (const [text, num] of [["Hour", false], ["RAM GB", true], ["Swap GB", true], ["Big GB", true], ["Written GB", true]]) {
+  for (const [text, num] of [["Hour", false], ["From RAM", true], ["From disk", true], ["Disk share", true], ["Written GB", true]]) {
     const th = document.createElement("th"); th.textContent = text; if (num) th.className = "num"; head.appendChild(th);
   }
-  for (const [t, bytes, last] of hours.slice().reverse()) {
-    if (!last && !bytes) continue;
-    const row = table.insertRow();
-    for (const [text, num] of [[`${hhmm(t)}–${hhmm(t + 3600)}`, false], [last ? gb(last[1], 2) : "–", true],
-                               [last ? gb(last[2], 2) : "–", true], [last ? gb(last[3], 2) : "–", true], [gb(bytes, 2), true]]) {
+  for (const o of hours.slice().reverse()) {
+    if (!o.seen) continue;
+    const row = table.insertRow(), all = o.ram + o.disk;
+    for (const [text, num] of [[`${hhmm(o.t)}–${hhmm(o.t + 3600)}`, false], [fmt(o.ram), true], [fmt(o.disk), true],
+                               [all ? `${fmt((100 * o.disk) / all)}%` : "–", true], [gb(o.written, 2), true]]) {
       const td = row.insertCell(); td.textContent = text; if (num) td.className = "num";
     }
   }
@@ -564,45 +559,39 @@ function renderDiskTable(d) {
   const table = $("cc-disk-table"), speed = d.prompt_tok_s, rows = d.entries || [];
   table.replaceChildren();
   const s = d.since_start || {};
-  $("cc-big-sum").textContent = `big: ${fmt(d.big.entries)} · served ${fmt(s.tokens_big)} tokens since start`;
+  $("cc-dsk-sum").textContent = `${fmt(d.disk.entries)} · served ${fmt(s.tokens)} tokens since start`;
   if (!rows.length) {
     const td = table.insertRow().insertCell();
-    td.textContent = "None yet: a conversation lands here when RAM pushes it out or cannot hold it.";
+    td.textContent = `None yet: a conversation is saved here after a reply once it reaches ${fmt(d.min_tokens)} tokens.`;
     return;
   }
-  const cols = [["Conversation", false], ["Level", false], ["Tokens", true], ["Size", true], ["Returns", true],
+  const cols = [["Conversation", false], ["Tokens", true], ["Size", true], ["Returns", true], ["Score", true],
                 ["Tokens served", true], ["Time saved", true], ["Written", true], ["Last used", false]];
   const head = table.insertRow();
   for (const [text, num] of cols) { const th = document.createElement("th"); th.textContent = text; if (num) th.className = "num"; head.appendChild(th); }
   for (const e of rows) {
     const row = table.insertRow();
-    const cells = [`#${e.id.slice(-6)}`, null, fmt(e.tokens), tb(e.bytes), fmt(e.returns), fmt(e.served_tokens),
+    const cells = [`#${e.id.slice(-6)}`, fmt(e.tokens), tb(e.bytes), fmt(e.returns), fmt(e.score, 1), fmt(e.served_tokens),
                    speed && e.served_tokens ? dur(e.served_tokens / speed) : "–", tb(e.written), since(e.last_used)];
     cells.forEach((text, i) => {
       const td = row.insertCell();
       if (cols[i][1]) td.className = "num";
-      if (i === 1) {
-        const lv = document.createElement("span"), key = document.createElement("i");
-        lv.className = "cc-level";
-        key.style.background = `var(${e.level === "big" ? "--cc-big" : "--cc-swap"})`;
-        lv.append(key, e.level === "big" ? "big" : "swap");
-        td.appendChild(lv);
-      } else td.textContent = text;
+      td.textContent = text;
     });
   }
 }
 function renderConvDisk(c) {
-  const d = c.disk;
-  $("cc-disk").hidden = !d;
+  const d = c.disk && c.disk.disk && c.disk.since_start ? c.disk : null;   // (a status.json of another engine version: hidden)
+  $("cc-card").classList.toggle("cc-has-disk", !!d);
+  ccDiskToday = d ? d.written_today : null;
+  if (!d) $("cc-disk-warn").hidden = true;
   if (!d) return;
   const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
   const now = d.time || Date.now() / 1000;
-  $("cc-swap-text").textContent = `${fmt(d.swap.entries)} · ${gb(d.swap.bytes)} / ${gb(d.swap.budget, 0)} GB`;
-  $("cc-swap-bar").style.width = pct(d.swap.bytes, d.swap.budget);
-  $("cc-big-text").textContent = `${fmt(d.big.entries)} · ${gb(d.big.bytes)} / ${gb(d.big.budget, 0)} GB`;
-  $("cc-big-bar").style.width = pct(d.big.bytes, d.big.budget);
+  $("cc-dsk-text").textContent = `${fmt(d.disk.entries)} · ${gb(d.disk.bytes)} / ${gb(d.disk.budget, 0)} GB`;
+  $("cc-dsk-bar").style.width = pct(d.disk.bytes, d.disk.budget);
   const s = d.since_start || {};
-  const ram = c.tokens_ram || 0, swap = s.tokens_swap || 0, big = s.tokens_big || 0, all = ram + swap + big;
+  const ram = c.tokens_ram || 0, dsk = s.tokens || 0, all = ram + dsk;
   const share = (n) => `${fmt(all ? (100 * n) / all : 0)}%`;
   const over = d.day_guide_bytes > 0 && d.written_today > d.day_guide_bytes;
   const warn = $("cc-disk-warn");
@@ -610,17 +599,18 @@ function renderConvDisk(c) {
   if (over) warn.innerHTML = `${icon("warning", "st-icon st-icon--sm")}<span>Over the daily guide: ${esc(tb(d.written_today))} written to disk today (guide ${esc(tb(d.day_guide_bytes, 0))}). Writing goes on.</span>`;
   const speed = d.prompt_tok_s;
   facts($("cc-disk-facts"), [
-    ["Restored from", `RAM ${fmt(c.restores)} · swap ${fmt(s.restores_swap)} · big ${fmt(s.restores_big)}`],
-    ["Tokens given back", all ? `RAM ${share(ram)} · swap ${share(swap)} · big ${share(big)} (${fmt(all)} tokens)` : null],
-    ["Time saved by the disk", speed && swap + big ? `about ${dur((swap + big) / speed)} of prompt reading (at ${fmt(speed)} tok/s)` : null],
+    ["Restored from", `RAM ${fmt(c.restores)} · disk ${fmt(s.restores)}`],
+    ["Tokens given back", all ? `RAM ${share(ram)} · disk ${share(dsk)} (${fmt(all)} tokens)` : null],
+    ["Time saved by the disk", speed && dsk ? `about ${dur(dsk / speed)} of prompt reading (at ${fmt(speed)} tok/s)` : null],
     ["Written to disk", `today ${tb(d.written_today)} (guide ${tb(d.day_guide_bytes, 0)}) · since start ${tb(s.written)} · all time ${tb(d.written_all_time)}`],
-    ["Not written again", s.reused || s.skipped ? `${tb(s.reused)} already on disk · ${fmt(s.skipped)} copies kept as they were` : null],
+    ["Saves", `${fmt(s.saves)} since start · ${tb(s.reused)} already on disk (not written again)`],
     ["Read from disk", `since start ${tb(s.read)}${s.written ? ` (${fmt((100 * s.read) / s.written)}% of what was written)` : ""} · all time ${tb(d.read_all_time)}`],
     [d.device ? `Disk ${d.device.device} since boot` : "", d.device ? `${tb(d.device.written)} written by all programs` : null],
     ["Files on disk", `${tb(d.physical_bytes)} (shared blocks counted once)`],
   ]);
-  renderUsage(d, now);
-  renderWrites(d, now);
+  const hours = ccHours(d, now);
+  renderGiven(d, hours);
+  renderWrites(d, hours);
   renderDiskTable(d);
 }
 
@@ -720,9 +710,17 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   } else {
     const big = hw.disk_read_mb >= 1000;
     setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
-              hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
+              "all disks");
   }
   spark("sp-disk", h.disk_read_mb);
+  if (hw.disk_write_mb == null) {
+    setMetric("diskw", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
+  } else {   // all disks; with --conversation-cache-disk, what the conversation cache wrote today
+    const big = hw.disk_write_mb >= 1000;
+    setMetric("diskw", big ? fmt(hw.disk_write_mb / 1024, 2) : fmt(hw.disk_write_mb, hw.disk_write_mb < 10 ? 1 : 0),
+              big ? "GB/s" : "MB/s", ccDiskToday != null ? `conversation cache today ${tb(ccDiskToday)}` : "all disks");
+  }
+  spark("sp-diskw", h.disk_write_mb);
 
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;

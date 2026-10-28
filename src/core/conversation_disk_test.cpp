@@ -108,14 +108,19 @@ ConversationDiskOptions options(const std::string& dir) {
     o.block_tokens = 32;
     o.min_tokens = 50;
     o.refresh_tokens = 8;
-    o.swap_bytes = 1 << 20;
-    o.big_bytes = 1 << 20;
+    o.budget_bytes = 1 << 20;
     o.day_guide_bytes = 1;
     return o;
 }
 
 ConversationDisk::Write write_of(const Conv& c, double score = 0) {
     return ConversationDisk::Write{c.ids, c.imgs, true, c.state, c.kv, score};
+}
+Conv longer(const Conv& base, int32_t seed, int n) {   // the same conversation, n tokens on
+    Conv c = conv(seed, (int64_t) base.ids.size() + n);
+    c.ids = extend(base.ids, n);
+    c.state.ids = c.ids;
+    return c;
 }
 } // namespace
 
@@ -148,17 +153,19 @@ int main(int argc, char** argv) {
     // a conversation of 100 tokens: four blocks (32, 32, 32, 4), all new
     Conv a = conv(11, 100);
     ConversationDiskStats st;
-    check(disk.spill(write_of(a), st, error) && !st.skipped && st.blocks == 4 && st.new_blocks == 4 && st.written > 0 &&
+    check(disk.save(write_of(a), st, error) && !st.skipped && st.blocks == 4 && st.new_blocks == 4 && st.written > 0 &&
           st.reused == 0, "a first copy writes every block");
-    check(!st.big && disk.swap().entries == 1 && disk.big().entries == 0, "a conversation never seen again goes to swap");
+    check(disk.usage().entries == 1 && disk.saved_tokens(extend(a.ids, 5), {}, true) == 100, "it is on disk");
+    check(disk.saved_tokens(extend(a.ids, 5), {}, false) == 0 && disk.saved_tokens({1, 2, 3}, {}, true) == 0,
+          "saved_tokens: another steering mode or another conversation has none");
     check(st.guide_crossed && disk.written_today() == st.written, "the day guide is crossed and counted, nothing stops");
 
     Conv short_one = conv(12, 40);
-    check(disk.spill(write_of(short_one), st, error) && st.skipped && disk.swap().entries == 1, "a short conversation is not stored");
+    check(disk.save(write_of(short_one), st, error) && st.skipped && disk.usage().entries == 1, "a short conversation is not stored");
 
     const auto prompt = extend(a.ids, 10);
     ConversationDiskMatch m = disk.best(prompt, {}, true);
-    check(m && m.tokens == 100 && !m.big, "a prompt that continues it finds the copy");
+    check(m && m.tokens == 100, "a prompt that continues it finds the copy");
     check(!disk.best(a.ids, {}, true), "the copy must be shorter than the prompt");
     check(!disk.best(prompt, {}, false), "another steering mode never matches");
     check(!disk.best(prompt, {{5, 1}}, true), "a picture the copy does not have never matches");
@@ -170,57 +177,41 @@ int main(int argc, char** argv) {
     check(t.holds(11) && t.finished == 2, "every K/V byte comes back, every layer refreshed");
     check(state.ids == a.ids && state.gdn == a.state.gdn && state.block_pos == a.state.block_pos && cvec,
           "the running state, ids and steering come back");
-    check(st.read > 0 && st.promoted && !st.big && disk.big().entries == 1 && disk.swap().entries == 0,
-          "a return from swap moves the copy to big");
-    check(disk.since_start().restores_swap == 1 && disk.since_start().tokens_swap == 100, "the swap return is counted");
+    check(st.read > 0 && std::abs(st.score - 1.0) < 1e-6 && disk.since_start().restores == 1 &&
+          disk.since_start().tokens == 100, "the return is counted: score 1");
 
-    // the same conversation, 40 tokens on: only the blocks past the full ones already on disk are written
-    Conv a2 = conv(11, 140);
-    a2.ids = extend(a.ids, 40);
-    a2.state.ids = a2.ids;
-    check(disk.spill(write_of(a2), st, error) && !st.skipped, "a longer turn is stored");
+    // the same conversation, 40 tokens on (its next save): only the blocks past the full ones on disk are written
+    Conv a2 = longer(a, 11, 40);
+    check(disk.save(write_of(a2, 1.0), st, error) && !st.skipped, "a longer turn is stored");
     check(st.blocks == 5 && st.new_blocks == 2 && st.reused > 0, "the three full blocks are named, not written");
-    check(st.big && disk.big().entries == 1 && disk.swap().entries == 0, "it replaces its copy, in big");
-    check(disk.best(extend(a2.ids, 5), {}, true).tokens == 140, "the longer copy is found");
-
-    Conv a3 = conv(11, 145);
-    a3.ids = extend(a2.ids, 5);
-    a3.state.ids = a3.ids;
+    check(disk.usage().entries == 1 && disk.best(extend(a2.ids, 5), {}, true).tokens == 140, "it replaces its copy");
+    Conv a3 = longer(a2, 11, 5);
     const uint64_t before = disk.written_all_time();
-    check(disk.spill(write_of(a3), st, error) && st.skipped && disk.written_all_time() == before,
+    check(disk.save(write_of(a3), st, error) && st.skipped && disk.written_all_time() == before,
           "fewer than refresh_tokens new tokens: the copy on disk stays, no K/V written");
-    check(disk.spill(write_of(a2), st, error) && st.skipped, "the same state again: nothing written");
+    check(disk.save(write_of(a2), st, error) && st.skipped, "the same state again: nothing written");
 
-    // swap holds one conversation of this size: the least recently used one goes
-    ConversationDiskOptions small = options(root.string());
-    ConversationDisk tight;
+    // a restart keeps every copy; over the budget the lowest score leaves first, then the least recently used
     {
-        Conv b = conv(21, 100), c = conv(31, 100);
-        check(disk.spill(write_of(b), st, error) && disk.swap().entries == 1, "b goes to swap");
-        const uint64_t one = disk.swap().bytes;
-        small.swap_bytes = one + one / 2;
-        small.big_bytes = 1 << 20;
-        check(tight.open(small, id, 2, sizes, note, error), "reopen with a swap of one conversation");
-        check(tight.swap().entries == 0 && tight.big().entries == 1, "a restart empties swap and keeps big");
-        check(tight.spill(write_of(b), st, error) && tight.spill(write_of(c), st, error), "two into a one-sized swap");
-        check(tight.swap().entries == 1 && tight.best(extend(c.ids, 3), {}, true) && !tight.best(extend(b.ids, 3), {}, true),
-              "the older one left swap");
-        check(tight.since_start().deleted >= 1, "the deletion is counted");
-        Conv hot = conv(41, 100);
-        check(tight.spill(write_of(hot, 3.0), st, error) && st.big && st.promoted, "a score of 2 or more goes straight to big");
-        // big holds about two of these now: a third high score pushes the lowest one back to swap
-        ConversationDiskOptions bigger = small;
-        bigger.big_bytes = tight.big().bytes + 10;
+        Conv b = conv(21, 100), c = conv(31, 100), hot = conv(41, 100);
+        check(disk.save(write_of(b), st, error) && disk.usage().entries == 2, "b stored (score 0)");
+        const uint64_t one = disk.usage().bytes;   // (a2 and b)
+        ConversationDiskOptions small = options(root.string());
+        small.budget_bytes = one + 10;                     // room for what is there, not for one more
         ConversationDisk d2;
-        check(d2.open(bigger, id, 2, sizes, note, error) && d2.big().entries == 2, "both big copies survive a restart");
-        Conv hotter = conv(51, 100);
-        check(d2.spill(write_of(hotter, 5.0), st, error) && d2.big().entries == 2 && d2.since_start().demotions == 1,
-              "the lowest score goes back to swap");
+        check(d2.open(small, id, 2, sizes, note, error) && d2.usage().entries == 2, "a restart keeps both copies");
+        check(d2.save(write_of(c), st, error) && d2.usage().entries == 2 && !d2.best(extend(b.ids, 3), {}, true) &&
+              d2.best(extend(a2.ids, 3), {}, true) && d2.best(extend(c.ids, 3), {}, true),
+              "c pushes out b (score 0, the older of the two with none), a2 (score 1) stays");
+        check(d2.save(write_of(hot, 3.0), st, error) && !d2.best(extend(c.ids, 3), {}, true) &&
+              d2.best(extend(hot.ids, 3), {}, true) && d2.best(extend(a2.ids, 3), {}, true),
+              "a copy with a score pushes out the one without");
+        check(d2.since_start().deleted >= 2, "the deletions are counted");
         Target t2(100);
         ConversationCheckpoint s2;
         bool cv = false;
         const auto mh = d2.best(extend(hot.ids, 1), {}, true);
-        check(mh && d2.load(mh, s2, cv, t2.sinks, st, error) && t2.holds(41), "a copy kept across a restart loads");
+        check(mh && d2.load(mh, s2, cv, t2.sinks, st, error) && t2.holds(41), "a copy loads after a restart");
     }
 
     // a damaged block: the load fails and the copy is not offered again
@@ -228,7 +219,7 @@ int main(int argc, char** argv) {
         ConversationDisk d3;
         check(d3.open(options(root.string()), id, 2, sizes, note, error), "reopen");
         Conv e = conv(61, 64);
-        check(d3.spill(write_of(e), st, error) && !st.skipped, "e stored");
+        check(d3.save(write_of(e), st, error) && !st.skipped, "e stored");
         for (const auto& item : fs::directory_iterator(root / "blocks")) {
             std::fstream f(item.path(), std::ios::in | std::ios::out | std::ios::binary);
             f.seekp(-1, std::ios::end);
@@ -241,21 +232,21 @@ int main(int argc, char** argv) {
         check(me && !d3.load(me, s3, cv, t3.sinks, st, error) && !d3.best(extend(e.ids, 1), {}, true),
               "a damaged copy fails to load and is dropped");
         const std::string json = d3.status_json();
-        check(json.find("\"swap\":{") != std::string::npos && json.find("\"written_all_time\":") != std::string::npos &&
-              json.find("\"entries\":[") != std::string::npos, "status.json carries levels, counters and rows");
-        check(d3.clear() >= 1 && d3.swap().entries == 0 && d3.big().entries == 0, "clear drops every copy");
+        check(json.find("\"disk\":{") != std::string::npos && json.find("\"written_all_time\":") != std::string::npos &&
+              json.find("\"entries\":[") != std::string::npos, "status.json carries usage, counters and rows");
+        check(d3.clear() >= 1 && d3.usage().entries == 0, "clear drops every copy");
     }
 
-    // another engine build: the big copies are dropped, no stray file stays
+    // another engine build: the copies are dropped, no stray file stays
     {
         ConversationDisk d4;
         Conv f = conv(71, 100);
-        check(d4.open(options(root.string()), id, 2, sizes, note, error) && d4.spill(write_of(f, 3.0), st, error) && st.big,
-              "f in big");
+        check(d4.open(options(root.string()), id, 2, sizes, note, error) && d4.save(write_of(f, 3.0), st, error),
+              "f stored");
         ConversationDisk d5;
         ConversationDiskIdentity other = id;
         other.build = 99;
-        check(d5.open(options(root.string()), other, 2, sizes, note, error) && d5.big().entries == 0 && d5.swap().entries == 0,
+        check(d5.open(options(root.string()), other, 2, sizes, note, error) && d5.usage().entries == 0,
               "another build keeps nothing");
         size_t files = 0;
         for (const auto& sub : {"blocks", "conv"})

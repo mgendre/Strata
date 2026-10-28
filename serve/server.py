@@ -776,7 +776,7 @@ class ConvCacheLog:
         self.reset()
 
     def reset(self):
-        # restores: from RAM; restores_disk: from --conversation-cache-disk ("restored N tokens from disk (swap|big)");
+        # restores: from RAM; restores_disk: from --conversation-cache-disk ("restored N tokens from disk");
         # tokens_ram: the tokens the RAM restores gave back
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "restores_disk": 0,
                       "tokens_ram": 0, "last_event": None, "last_tokens": None, "last_at": None, "last_source": None}
@@ -825,7 +825,7 @@ class ConvCacheLog:
                         st["restores"] += 1
                         st["tokens_ram"] += int(m.group(2))
                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
-                    st["last_source"] = disk.group(1) if disk else ("ram" if m.group(1) == "restored" else None)
+                    st["last_source"] = "disk" if disk else ("ram" if m.group(1) == "restored" else None)
                 continue
             m = self.DROPPED.search(line)
             if m:
@@ -833,7 +833,7 @@ class ConvCacheLog:
         return dict(self.state)
 
 
-DISK_RESTORE = re.compile(r"restored \d+ tokens from disk \((swap|big)\)")
+DISK_RESTORE = re.compile(r"restored \d+ tokens from disk\b")
 
 
 def conversation_disk_dir(engine) -> str | None:
@@ -887,18 +887,21 @@ def disk_written_since_boot(folder: str | None) -> dict | None:
 
 
 class CacheHistory:
-    """The conversation cache's usage over the last day for the Monitor's graph: one sample a minute of the bytes
-    parked in RAM, in the disk's swap and big levels, and the bytes written to the disk so far (all time)."""
+    """How much the conversation cache gave back over the last day, for the Monitor's graphs: one sample a minute of the
+    counters [time, tokens restored from RAM, tokens restored from disk, bytes written to disk (all time), restores
+    from RAM, restores from disk].  The engine's counters start again at each engine start; the page takes the
+    differences between samples (a drop is a new start)."""
     EVERY_S, KEEP = 60.0, 24 * 60
 
     def __init__(self):
         self.samples = collections.deque(maxlen=self.KEEP)
         self.lock = threading.Lock()
 
-    def add(self, ram: int, swap: int, big: int, written: int, now: float | None = None):
+    def add(self, tokens_ram: int, tokens_disk: int, written: int, restores_ram: int = 0, restores_disk: int = 0,
+            now: float | None = None):
         with self.lock:
-            self.samples.append([round(now if now is not None else time.time()), int(ram), int(swap), int(big),
-                                 int(written)])
+            self.samples.append([round(now if now is not None else time.time()), int(tokens_ram), int(tokens_disk),
+                                 int(written), int(restores_ram), int(restores_disk)])
 
     def view(self) -> list:
         with self.lock:
@@ -4458,8 +4461,8 @@ class Service:
             self.fifo.release()
 
     def start_cache_history(self):
-        """--conversation-cache-disk: one usage sample a minute (RAM, swap, big, bytes written) for the Monitor's
-        graph, whether the page is open or not."""
+        """--conversation-cache-disk: one sample a minute of what RAM and disk gave back and of the bytes written, for
+        the Monitor's graphs, whether the page is open or not."""
         folder = conversation_disk_dir(self.engine)
         if not folder:
             return
@@ -4471,8 +4474,10 @@ class Service:
                     parked = self.conv_log.poll(getattr(self.engine, "log_path", None),
                                                 getattr(self.engine, "log_start", None))
                     disk = status.read(folder) or {}
-                    self.cache_history.add(parked.get("bytes", 0), (disk.get("swap") or {}).get("bytes", 0),
-                                           (disk.get("big") or {}).get("bytes", 0), disk.get("written_all_time", 0))
+                    since = disk.get("since_start") or {}
+                    self.cache_history.add(parked.get("tokens_ram", 0), since.get("tokens", 0),
+                                           disk.get("written_all_time", 0), parked.get("restores", 0),
+                                           since.get("restores", 0))
                 except Exception as e:                 # tried again in a minute; the thread keeps running
                     print(f"[strata] conversation cache: usage sample: {e}", flush=True)
                 time.sleep(CacheHistory.EVERY_S)

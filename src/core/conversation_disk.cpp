@@ -1,4 +1,4 @@
-// --conversation-cache-disk: the conversation cache's swap and big levels on disk (conversation_disk.hpp).
+// --conversation-cache-disk: the conversation cache's long-term level on disk (conversation_disk.hpp).
 //
 // Files (little-endian, like the session files):
 //   blocks/<32 hex>.kvb   one K/V block: "SCDB", version, layer count, each layer's five part sizes, then the bytes of
@@ -28,7 +28,7 @@ namespace strata::core {
 namespace fs = std::filesystem;
 
 namespace {
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;   // 2: one level (1 had swap and big)
 constexpr uint64_t kSeedA = 0x5c0d15c0a11ull, kSeedB = 0xd15cb10cc0ffeeull, kSeedFile = 0xc0de5ca1eull;
 constexpr size_t kPiece = 16u << 20;
 
@@ -160,7 +160,6 @@ bool prefix_of(const std::vector<int32_t>& a, const std::vector<ConversationImag
     return j == a_imgs.size();
 }
 
-const char* level_name(bool big) { return big ? "big" : "swap"; }
 } // namespace
 
 std::vector<SessionKvSource> conversation_image_sources(const SavedConversation& image) {
@@ -212,12 +211,20 @@ std::string ConversationDisk::path(const char* sub, const std::string& name) con
 std::string ConversationDisk::block_name(const Hash& h) const { return hex(h.a) + hex(h.b) + ".kvb"; }
 std::string ConversationDisk::entry_name(uint64_t id, const char* ext) const { return hex(id) + ext; }
 
-ConversationDisk::Level ConversationDisk::level(bool big) const {
-    Level l;
-    l.budget = big ? opt_.big_bytes : opt_.swap_bytes;
+ConversationDisk::Usage ConversationDisk::usage() const {
+    Usage u;
+    u.budget = opt_.budget_bytes;
+    for (const Entry& e : entries_) { ++u.entries; u.bytes += e.bytes(); }
+    return u;
+}
+
+int64_t ConversationDisk::saved_tokens(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                                       bool cvec) const {
+    int64_t n = 0;
     for (const Entry& e : entries_)
-        if (e.big == big) { ++l.entries; l.bytes += e.bytes(); }
-    return l;
+        if (e.cvec == cvec && (int64_t) e.meta.ids.size() > n && prefix_of(e.meta.ids, e.meta.imgs, ids, images))
+            n = (int64_t) e.meta.ids.size();
+    return n;
 }
 
 uint64_t ConversationDisk::physical_bytes() const {
@@ -424,7 +431,7 @@ bool ConversationDisk::write_manifest(const Entry& e, std::string& error) {
     out.put<uint64_t>(identity_.model); out.put<uint64_t>(identity_.config);
     out.put<uint64_t>(identity_.build); out.put<uint64_t>(identity_.layout);
     out.put<uint64_t>(e.id);
-    out.put<uint8_t>(e.big ? 1 : 0); out.put<uint8_t>(e.cvec ? 1 : 0);
+    out.put<uint8_t>(e.cvec ? 1 : 0);
     out.put<uint64_t>(e.meta.ids.size());
     out.put<uint64_t>(e.state_hash.a); out.put<uint64_t>(e.state_hash.b); out.put<uint64_t>(e.state_bytes);
     out.put<uint64_t>(e.blocks.size());
@@ -448,7 +455,7 @@ bool ConversationDisk::read_manifest(const std::string& file, Entry& e, Conversa
     if (!in.ok || std::memcmp(magic, "SCDM", 4) != 0 || version != kVersion) { error = "conversation disk: not a manifest"; return false; }
     id.model = in.get<uint64_t>(); id.config = in.get<uint64_t>(); id.build = in.get<uint64_t>(); id.layout = in.get<uint64_t>();
     e.id = in.get<uint64_t>();
-    e.big = in.get<uint8_t>() != 0; e.cvec = in.get<uint8_t>() != 0;
+    e.cvec = in.get<uint8_t>() != 0;
     const uint64_t tokens = in.get<uint64_t>();
     e.state_hash.a = in.get<uint64_t>(); e.state_hash.b = in.get<uint64_t>(); e.state_bytes = in.get<uint64_t>();
     const uint64_t nb = in.get<uint64_t>();
@@ -497,31 +504,19 @@ void ConversationDisk::remove(size_t index) {
 }
 
 void ConversationDisk::fit(uint64_t keep_id) {
-    std::string error;
+    // over the budget: the lowest usage score goes (a copy never seen again has none), the least recently used among
+    // equals; the copy just stored or used last of all
     const int64_t t = now();
-    // big over its budget: the lowest score goes back to swap (only its manifest changes)
-    while (level(true).bytes > opt_.big_bytes) {
-        size_t v = entries_.size();
-        for (size_t i = 0; i < entries_.size(); ++i)
-            if (entries_[i].big &&
-                (v == entries_.size() || conversation_score_at(entries_[i].score, entries_[i].score_at, t, opt_.half_life_s) <
-                                             conversation_score_at(entries_[v].score, entries_[v].score_at, t, opt_.half_life_s)))
-                v = i;
-        if (v == entries_.size()) break;
-        entries_[v].big = false;
-        ++start_.demotions;
-        (void) write_manifest(entries_[v], error);
-    }
-    // swap over its budget: the least recently used copy goes (the one just stored last of all)
-    while (level(false).bytes > opt_.swap_bytes) {
-        size_t v = entries_.size();
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].big) continue;
-            if (v == entries_.size()) { v = i; continue; }
-            const bool keep_v = entries_[v].id == keep_id, keep_i = entries_[i].id == keep_id;
-            if (keep_v != keep_i ? keep_v : entries_[i].last_used < entries_[v].last_used) v = i;
-        }
-        if (v == entries_.size()) break;
+    while (usage().bytes > opt_.budget_bytes && !entries_.empty()) {
+        size_t v = 0;
+        auto worse = [&](const Entry& a, const Entry& b) {   // a leaves before b
+            if ((a.id == keep_id) != (b.id == keep_id)) return b.id == keep_id;
+            const double sa = conversation_score_at(a.score, a.score_at, t, opt_.half_life_s);
+            const double sb = conversation_score_at(b.score, b.score_at, t, opt_.half_life_s);
+            return sa != sb ? sa < sb : a.last_used < b.last_used;
+        };
+        for (size_t i = 1; i < entries_.size(); ++i)
+            if (worse(entries_[i], entries_[v])) v = i;
         remove(v);
     }
 }
@@ -584,7 +579,7 @@ bool ConversationDisk::open(const ConversationDiskOptions& options, const Conver
     }
     buffer_.resize(kPiece);
     load_counters();
-    size_t wiped = 0, dropped = 0;
+    size_t dropped = 0;
     std::vector<uint64_t> kept_ids;
     for (const auto& item : fs::directory_iterator(fs::path(opt_.dir) / "conv", ec)) {
         const fs::path p = item.path();
@@ -593,7 +588,6 @@ bool ConversationDisk::open(const ConversationDiskOptions& options, const Conver
         ConversationDiskIdentity id;
         std::string why;
         const bool ok = read_manifest(p.string(), e, id, why);
-        if (ok && !e.big) { ++wiped; continue; }                     // swap: emptied at every start
         const size_t want_tokens = e.meta.ids.size();
         bool keep = ok && id == identity_ && read_ids(e, why) && !e.meta.ids.empty() && e.meta.ids.size() == want_tokens;
         if (keep) {
@@ -610,7 +604,7 @@ bool ConversationDisk::open(const ConversationDiskOptions& options, const Conver
         entries_.push_back(std::move(e));
     }
     for (const Entry& e : entries_) ref(e);
-    // every file no kept copy names goes: swap's, other builds' and models', damaged ones, cut-short temporaries
+    // every file no kept copy names goes: other builds' and models', damaged ones, cut-short temporaries
     auto kept_name = [&](const std::string& stem) {
         for (uint64_t id : kept_ids) if (stem == hex(id)) return true;
         return false;
@@ -634,18 +628,18 @@ bool ConversationDisk::open(const ConversationDiskOptions& options, const Conver
         if (item.path().filename().string().rfind(".tmp-", 0) == 0) fs::remove(item.path(), ec);
     enabled_ = true;
     fit(0);
-    const Level b = big();
+    const Usage u = usage();
     char line[320];
-    std::snprintf(line, sizeof line, "swap emptied (%zu), big kept %zu (%llu MiB), dropped %zu (another build or model, or "
-                  "damaged), %zu stray blocks removed; written all time %llu MiB",
-                  wiped, b.entries, (unsigned long long) (b.bytes >> 20), dropped, orphan_blocks,
+    std::snprintf(line, sizeof line, "kept %zu conversations (%llu MiB), dropped %zu (another build or model, or damaged), "
+                  "%zu stray blocks removed; written all time %llu MiB",
+                  u.entries, (unsigned long long) (u.bytes >> 20), dropped, orphan_blocks,
                   (unsigned long long) (total_written_ >> 20));
     note = line;
     publish();
     return true;
 }
 
-bool ConversationDisk::spill(const Write& w, ConversationDiskStats& stats, std::string& error) {
+bool ConversationDisk::save(const Write& w, ConversationDiskStats& stats, std::string& error) {
     stats = {};
     if (!enabled_) { error = "conversation disk: not open"; return false; }
     const int64_t tokens = (int64_t) w.ids.size();
@@ -667,10 +661,8 @@ bool ConversationDisk::spill(const Write& w, ConversationDiskStats& stats, std::
         e.score = std::max(conversation_score_at(e.score, e.score_at, t, opt_.half_life_s), w.score);
         e.score_at = t;
         e.last_used = t;
-        if (!e.big && e.score >= opt_.promote_score) { e.big = true; stats.promoted = true; ++start_.promotions; }
         stats.skipped = true;
         stats.why = why;
-        stats.big = e.big;
         stats.score = e.score;
         ++start_.skipped;
         if (!write_manifest(e, error)) return false;
@@ -696,8 +688,6 @@ bool ConversationDisk::spill(const Write& w, ConversationDiskStats& stats, std::
     ne.score = std::max(b ? conversation_score_at(b->score, b->score_at, t, opt_.half_life_s) : 0.0, w.score);
     ne.score_at = t;
     ne.last_used = t;
-    ne.big = (b && b->big) || ne.score >= opt_.promote_score;
-    if (ne.big && !(b && b->big)) { stats.promoted = true; ++start_.promotions; }
     // the K/V blocks: the ones on disk already are only named
     std::vector<Hash> fresh_blocks;
     auto abandon = [&] {
@@ -748,11 +738,11 @@ bool ConversationDisk::spill(const Write& w, ConversationDiskStats& stats, std::
             if (entries_[i].id == gone) { remove(i); break; }
     stats.written = written;
     count_written(written, stats);
-    ++start_.spills;
+    ++start_.saves;
     start_.reused += stats.reused;
     fit(id);
     for (const Entry& e : entries_)
-        if (e.id == id) { stats.big = e.big; stats.score = e.score; }
+        if (e.id == id) stats.score = e.score;
     publish();
     save_counters();
     return true;
@@ -832,18 +822,15 @@ bool ConversationDisk::load(const ConversationDiskMatch& m, ConversationCheckpoi
     state = std::move(s);
     cvec = e.cvec;
     const int64_t t = now();
-    const bool was_big = e.big;
     ++e.returns;
     e.served_tokens += (uint64_t) m.tokens;
     e.score = conversation_score_at(e.score, e.score_at, t, opt_.half_life_s) + 1.0;
     e.score_at = t;
     e.last_used = t;
-    if (!e.big) { e.big = true; stats.promoted = true; ++start_.promotions; }
-    (was_big ? start_.restores_big : start_.restores_swap) += 1;
-    (was_big ? start_.tokens_big : start_.tokens_swap) += (uint64_t) m.tokens;
+    ++start_.restores;
+    start_.tokens += (uint64_t) m.tokens;
     stats.read = read;
     stats.tokens = tokens;
-    stats.big = was_big;
     stats.score = e.score;
     start_.read += read;
     total_read_ += read;
@@ -866,35 +853,28 @@ size_t ConversationDisk::clear() {
 std::string ConversationDisk::status_json() const {
     std::string s;
     char b[512];
-    const Level sw = swap(), bg = big();
+    const Usage u = usage();
     std::snprintf(b, sizeof b,
-                  "{\"version\":1,\"time\":%lld,\"block_tokens\":%lld,\"min_tokens\":%lld,\"refresh_tokens\":%lld,"
-                  "\"day_guide_bytes\":%llu,\"swap\":{\"entries\":%zu,\"bytes\":%llu,\"budget\":%llu},"
-                  "\"big\":{\"entries\":%zu,\"bytes\":%llu,\"budget\":%llu},\"physical_bytes\":%llu,",
+                  "{\"version\":2,\"time\":%lld,\"block_tokens\":%lld,\"min_tokens\":%lld,\"day_guide_bytes\":%llu,"
+                  "\"disk\":{\"entries\":%zu,\"bytes\":%llu,\"budget\":%llu},\"physical_bytes\":%llu,",
                   (long long) now(), (long long) opt_.block_tokens, (long long) opt_.min_tokens,
-                  (long long) opt_.refresh_tokens, (unsigned long long) opt_.day_guide_bytes,
-                  sw.entries, (unsigned long long) sw.bytes, (unsigned long long) sw.budget,
-                  bg.entries, (unsigned long long) bg.bytes, (unsigned long long) bg.budget,
-                  (unsigned long long) physical_bytes());
+                  (unsigned long long) opt_.day_guide_bytes, u.entries, (unsigned long long) u.bytes,
+                  (unsigned long long) u.budget, (unsigned long long) physical_bytes());
     s += b;
     std::snprintf(b, sizeof b,
                   "\"day\":%lld,\"written_today\":%llu,\"written_all_time\":%llu,\"read_all_time\":%llu,"
-                  "\"since_start\":{\"written\":%llu,\"read\":%llu,\"reused\":%llu,\"spills\":%llu,\"skipped\":%llu,"
-                  "\"restores_swap\":%llu,\"restores_big\":%llu,\"tokens_swap\":%llu,\"tokens_big\":%llu,"
-                  "\"promotions\":%llu,\"demotions\":%llu,\"deleted\":%llu},\"entries\":[",
+                  "\"since_start\":{\"written\":%llu,\"read\":%llu,\"reused\":%llu,\"saves\":%llu,\"skipped\":%llu,"
+                  "\"restores\":%llu,\"tokens\":%llu,\"deleted\":%llu},\"entries\":[",
                   (long long) day_, (unsigned long long) day_written_, (unsigned long long) total_written_,
                   (unsigned long long) total_read_, (unsigned long long) start_.written, (unsigned long long) start_.read,
-                  (unsigned long long) start_.reused, (unsigned long long) start_.spills,
-                  (unsigned long long) start_.skipped, (unsigned long long) start_.restores_swap,
-                  (unsigned long long) start_.restores_big, (unsigned long long) start_.tokens_swap,
-                  (unsigned long long) start_.tokens_big, (unsigned long long) start_.promotions,
-                  (unsigned long long) start_.demotions, (unsigned long long) start_.deleted);
+                  (unsigned long long) start_.reused, (unsigned long long) start_.saves,
+                  (unsigned long long) start_.skipped, (unsigned long long) start_.restores,
+                  (unsigned long long) start_.tokens, (unsigned long long) start_.deleted);
     s += b;
     std::vector<const Entry*> rows;
     for (const Entry& e : entries_) rows.push_back(&e);
     const int64_t t = now();
     std::sort(rows.begin(), rows.end(), [&](const Entry* x, const Entry* y) {
-        if (x->big != y->big) return x->big;
         const double sx = conversation_score_at(x->score, x->score_at, t, opt_.half_life_s);
         const double sy = conversation_score_at(y->score, y->score_at, t, opt_.half_life_s);
         return sx != sy ? sx > sy : x->last_used > y->last_used;
@@ -902,11 +882,10 @@ std::string ConversationDisk::status_json() const {
     for (size_t i = 0; i < rows.size(); ++i) {
         const Entry& e = *rows[i];
         std::snprintf(b, sizeof b,
-                      "%s{\"id\":\"%s\",\"level\":\"%s\",\"tokens\":%zu,\"bytes\":%llu,\"returns\":%llu,\"score\":%.3f,"
+                      "%s{\"id\":\"%s\",\"tokens\":%zu,\"bytes\":%llu,\"returns\":%llu,\"score\":%.3f,"
                       "\"served_tokens\":%llu,\"written\":%llu,\"created\":%lld,\"last_used\":%lld}",
-                      i ? "," : "", hex(e.id).c_str(), level_name(e.big), e.meta.ids.size(),
-                      (unsigned long long) e.bytes(), (unsigned long long) e.returns,
-                      conversation_score_at(e.score, e.score_at, t, opt_.half_life_s),
+                      i ? "," : "", hex(e.id).c_str(), e.meta.ids.size(), (unsigned long long) e.bytes(),
+                      (unsigned long long) e.returns, conversation_score_at(e.score, e.score_at, t, opt_.half_life_s),
                       (unsigned long long) e.served_tokens, (unsigned long long) e.written, (long long) e.created,
                       (long long) e.last_used);
         s += b;

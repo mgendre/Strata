@@ -17,11 +17,10 @@ class Engine:
 
 class ConvDiskServer(unittest.TestCase):
     RAM = "strata serve: conversation cache: restored 4000 tokens (live) in 30.0 ms; parked=2 bytes=209715200\n"
-    DISK = ("strata serve: conversation cache: restored 90000 tokens from disk (swap) in 812.0 ms, read 1400 MiB, "
-            "moved to big; parked=1 bytes=104857600\n")
-    STORED = ("strata serve: conversation cache: disk stored 90000 tokens (oldest in RAM, slots full) in swap in 650.0 ms: "
-              "wrote 1400 MiB (22 of 22 blocks new), 0 MiB already on disk; swap=1 (1400 MiB) big=0 (0 MiB) "
-              "written_today=1400 MiB\n")
+    DISK = ("strata serve: conversation cache: restored 90000 tokens from disk in 812.0 ms, read 1400 MiB (its return "
+            "2); parked=1 bytes=104857600\n")
+    STORED = ("strata serve: conversation cache: disk saved 90000 tokens (after the reply, a step reached) in 650.0 ms: "
+              "wrote 1400 MiB (22 of 22 blocks new), 0 MiB already on disk; disk=1 (1400 MiB) written_today=1400 MiB\n")
 
     def test_ram_and_disk_restores_are_told_apart(self):
         with tempfile.TemporaryDirectory() as d:
@@ -32,7 +31,7 @@ class ConvDiskServer(unittest.TestCase):
             self.assertEqual((st["last_event"], st["last_source"]), ("restored", "ram"))
             log.write_text(self.DISK, encoding="utf-8")
             st = ConvCacheLog().poll(str(log), 0)
-            self.assertEqual((st["restores"], st["restores_disk"], st["last_source"]), (0, 1, "swap"))
+            self.assertEqual((st["restores"], st["restores_disk"], st["last_source"]), (0, 1, "disk"))
 
     def test_the_folder_comes_from_the_engine_arguments(self):
         self.assertEqual(conversation_disk_dir(Engine(["--conversation-cache-disk", "/data/cc"])), "/data/cc")
@@ -46,14 +45,14 @@ class ConvDiskServer(unittest.TestCase):
             status = ConvDiskStatus()
             self.assertIsNone(status.read(d))                  # the engine has not written it yet
             p = Path(d) / "status.json"
-            p.write_text(json.dumps({"swap": {"entries": 1}}), encoding="utf-8")
-            self.assertEqual(status.read(d)["swap"]["entries"], 1)
-            p.write_text(json.dumps({"swap": {"entries": 2}}), encoding="utf-8")
+            p.write_text(json.dumps({"disk": {"entries": 1}}), encoding="utf-8")
+            self.assertEqual(status.read(d)["disk"]["entries"], 1)
+            p.write_text(json.dumps({"disk": {"entries": 2}}), encoding="utf-8")
             os.utime(p, ns=(1, 2_000_000_000_000_000_000))
-            self.assertEqual(status.read(d)["swap"]["entries"], 2)
+            self.assertEqual(status.read(d)["disk"]["entries"], 2)
             p.write_text("{cut sh", encoding="utf-8")        # a half-written file keeps the last good one
             os.utime(p, ns=(1, 3_000_000_000_000_000_000))
-            self.assertEqual(status.read(d)["swap"]["entries"], 2)
+            self.assertEqual(status.read(d)["disk"]["entries"], 2)
 
     @unittest.skipUnless(os.path.exists("/sys/dev/block"), "Linux only")
     def test_the_disk_under_the_folder(self):
@@ -66,20 +65,20 @@ class ConvDiskServer(unittest.TestCase):
     def test_history_keeps_one_day(self):
         h = CacheHistory()
         for i in range(CacheHistory.KEEP + 5):
-            h.add(i, 2 * i, 3 * i, 4 * i, now=1000 + 60 * i)
+            h.add(i, 2 * i, 3 * i, 4 * i, 5 * i, now=1000 + 60 * i)
         v = h.view()
         self.assertEqual(len(v), CacheHistory.KEEP)
-        self.assertEqual(v[-1], [1000 + 60 * (CacheHistory.KEEP + 4), CacheHistory.KEEP + 4, 2 * (CacheHistory.KEEP + 4),
-                                 3 * (CacheHistory.KEEP + 4), 4 * (CacheHistory.KEEP + 4)])
+        k = CacheHistory.KEEP + 4
+        self.assertEqual(v[-1], [1000 + 60 * k, k, 2 * k, 3 * k, 4 * k, 5 * k])
 
     def test_the_view(self):
         info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3, "conversation_cache_disk": 1}
         totals = {"reused": 100, "prompt_tokens": 2100, "prompt_ms": 1000}
         parked = ConvCacheLog().state
-        disk = {"swap": {"entries": 1, "bytes": 5, "budget": 10}, "entries": []}
-        v = conversation_cache_view(info, [], totals, parked, disk, {"device": "nvme1n1", "written": 7}, [[1, 2, 3, 4, 5]])
+        disk = {"disk": {"entries": 1, "bytes": 5, "budget": 10}, "entries": []}
+        v = conversation_cache_view(info, [], totals, parked, disk, {"device": "nvme1n1", "written": 7}, [[1, 2, 3, 4, 5, 6]])
         self.assertEqual(v["disk"]["prompt_tok_s"], 2000.0)
-        self.assertEqual((v["disk"]["device"]["device"], v["disk"]["history"]), ("nvme1n1", [[1, 2, 3, 4, 5]]))
+        self.assertEqual((v["disk"]["device"]["device"], v["disk"]["history"]), ("nvme1n1", [[1, 2, 3, 4, 5, 6]]))
         self.assertNotIn("disk", conversation_cache_view(info, [], totals, parked))
         off = dict(info, conversation_cache_disk=0)              # the engine said its disk levels are off
         self.assertNotIn("disk", conversation_cache_view(off, [], totals, parked, disk))
