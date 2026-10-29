@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from serve.server import (CacheHistory, ConvCacheLog, ConvDiskStatus, conversation_cache_view, conversation_disk_dir,
-                          disk_written_since_boot, long_read_speed, system_role_args)
+                          disk_written_since_boot, long_read_speed, prelude_cache_dir, system_role_args)
 
 
 class Engine:
@@ -136,6 +136,16 @@ class ConvDiskServer(unittest.TestCase):
             broken.load(path)
             self.assertEqual(broken.view(), [])
             CacheHistory().load(os.path.join(d, "missing.json"))   # missing: ignored
+
+    def test_the_view_carries_the_preludes(self):
+        info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3, "conversation_cache_disk": 1}
+        disk = {"disk": {"entries": 1, "bytes": 5, "budget": 10}, "entries": [{"id": "a", "returns": 1}]}
+        prelude = {"entries": [{"id": "p", "tokens": 8451, "returns": 2, "served_tokens": 16902, "last_used": 9}]}
+        view = conversation_cache_view(info, [], {}, ConvCacheLog().state, disk, None, [], prelude)
+        self.assertEqual(view["disk"]["prelude_entries"], prelude["entries"])
+        self.assertEqual(conversation_cache_view(info, [], {}, ConvCacheLog().state, disk)["disk"]["prelude_entries"], [])
+        self.assertEqual(prelude_cache_dir(Engine(["--prelude-cache", "pre"])), "/srv/strata/pre")
+        self.assertIsNone(prelude_cache_dir(Engine(["--conversation-cache-disk", "d"])))
 
     def test_the_view(self):
         info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3, "conversation_cache_disk": 1}
