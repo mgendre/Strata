@@ -10843,6 +10843,12 @@ int main(int argc, char** argv) {
             if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+            // ... and the copies it covers whose deepest checkpoint it does not hold: its client re-rendered the end
+            // of the last turn (the borrow left that copy parked)
+            if (const size_t covered = conversations.drop_covered(src.ids, src.imgs, src.cvec, kSpillCoveredSlack))
+                std::fprintf(stderr, "strata serve: conversation cache: dropped %zu older cop%s of this conversation "
+                             "(its last turn re-rendered); parked=%zu\n", covered, covered == 1 ? "y" : "ies",
+                             conversations.size());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).

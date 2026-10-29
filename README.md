@@ -86,6 +86,8 @@ cannot take, with no copy on disk is saved then, so the mid-size ones below the 
 - A copy that leaves RAM while a newer copy of the same conversation is still kept (the live one, or another parked
   copy holding all of it but its last few thousand tokens) is not spilled: agent clients that re-render the last
   turn make the engine borrow from the old copy and park a new one, and only the newest is worth saving.
+- When a conversation is parked, the older copies of it that it covers (all but their last 4,096 tokens, and at least
+  three quarters of them) are dropped from RAM, so they do not take the slots other conversations need.
 
 **`--conversation-cache-park-checkpoints N`** (0: all). A conversation parked in RAM keeps its last N checkpoints and
 its first one instead of all of them (118 MB each on Qwen3.8-Flash-Next).
