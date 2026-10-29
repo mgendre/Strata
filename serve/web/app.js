@@ -468,7 +468,7 @@ function niceTokens(v) {   // a clean axis top in tokens: 1, 2 or 5 times a powe
 // start again at an engine start: a drop counts from zero)
 function ccHours(d, now) {
   const h0 = Math.floor(now / 3600) * 3600 - 23 * 3600;
-  const out = Array.from({length: 24}, (_, k) => ({t: h0 + k * 3600, ram: 0, disk: 0, written: 0, nram: 0, ndisk: 0, seen: false}));
+  const out = Array.from({length: 24}, (_, k) => ({t: h0 + k * 3600, ram: 0, disk: 0, pre: 0, written: 0, nram: 0, ndisk: 0, npre: 0, seen: false}));
   const pts = d.history || [];
   const step = (a, b) => (b >= a ? b - a : b);
   for (let i = 1; i < pts.length; i++) {
@@ -476,7 +476,8 @@ function ccHours(d, now) {
     if (k < 0 || k > 23) continue;
     const o = out[k], p = pts[i - 1], x = pts[i];
     o.ram += step(p[1], x[1]); o.disk += step(p[2], x[2]); o.written += Math.max(0, x[3] - p[3]);
-    o.nram += step(p[4] || 0, x[4] || 0); o.ndisk += step(p[5] || 0, x[5] || 0); o.seen = true;
+    o.nram += step(p[4] || 0, x[4] || 0); o.ndisk += step(p[5] || 0, x[5] || 0);
+    o.pre += step(p[6] || 0, x[6] || 0); o.npre += step(p[7] || 0, x[7] || 0); o.seen = true;   // (the prelude cache)
   }
   return out;
 }
@@ -511,9 +512,11 @@ function ccSvg(id, plotId, fallbackH) {
   svg.replaceChildren();
   return {svg, plot, w, h, pad: {l: 38, r: 8, t: 8, b: 20}};
 }
-function renderGiven(d, hours) {   // prompt tokens given back each hour: from RAM (below), from disk (above)
+function renderGiven(d, hours) {   // prompt tokens given back each hour: from RAM (below), from disk, from the prelude cache (top)
   const {svg, plot, w, h, pad} = ccSvg("cc-usage", "cc-usage-plot", 160);
-  $("cc-legend").replaceChildren(...[["Disk", "--cc-dsk"], ["RAM", "--cc-ram"]].map(([name, color]) => {
+  const legend = [["Disk", "--cc-dsk"], ["RAM", "--cc-ram"]];
+  if (hours.some((o) => o.pre)) legend.unshift(["Preludes", "--cc-pre"]);   // only once the prelude cache has given some back
+  $("cc-legend").replaceChildren(...legend.map(([name, color]) => {
     const span = document.createElement("span"), key = document.createElement("i");
     key.style.background = `var(${color})`;
     span.append(key, name);
@@ -523,15 +526,18 @@ function renderGiven(d, hours) {   // prompt tokens given back each hour: from R
     svgEl("text", {x: pad.l, y: h / 2}, svg).textContent = "Collecting: one sample a minute";
     return;
   }
-  const ymax = niceTokens(Math.max(...hours.map((o) => o.ram + o.disk)));
+  const ymax = niceTokens(Math.max(...hours.map((o) => o.ram + o.disk + o.pre)));
   ccFrame(svg, w, h, pad, ymax, [0, ymax / 2, ymax], tokfmt);
   const speed = d.prompt_tok_s;
-  ccColumns(svg, plot, w, h, pad, hours, [["ram", "--cc-ram"], ["disk", "--cc-dsk"]], ymax, tokfmt, (o) => {
-    const all = o.ram + o.disk;
+  ccColumns(svg, plot, w, h, pad, hours, [["ram", "--cc-ram"], ["disk", "--cc-dsk"], ["pre", "--cc-pre"]], ymax, tokfmt, (o) => {
+    const all = o.ram + o.disk + o.pre;
     const rows = [[`${tokfmt(o.disk)} tokens`, `from disk (${fmt(o.ndisk)} restores)`, "--cc-dsk"],
                   [`${tokfmt(o.ram)} tokens`, `from RAM (${fmt(o.nram)} restores)`, "--cc-ram"]];
+    if (o.pre) rows.unshift([`${tokfmt(o.pre)} tokens`, `from preludes (${fmt(o.npre)} restores)`, "--cc-pre"]);
     if (all) rows.push([`${fmt((100 * o.disk) / all)}%`, "from disk", null]);
+    if (all && o.pre) rows.push([`${fmt((100 * o.pre) / all)}%`, "from preludes", null]);
     if (speed && o.disk) rows.push([dur(o.disk / speed), "of reading saved by the disk", null]);
+    if (speed && o.pre) rows.push([dur(o.pre / speed), "of reading saved by the preludes", null]);
     return rows;
   });
 }

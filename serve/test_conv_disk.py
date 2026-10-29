@@ -101,11 +101,11 @@ class ConvDiskServer(unittest.TestCase):
     def test_history_keeps_one_day(self):
         h = CacheHistory()
         for i in range(CacheHistory.KEEP + 5):
-            h.add(i, 2 * i, 3 * i, 4 * i, 5 * i, now=1000 + 60 * i)
+            h.add(i, 2 * i, 3 * i, 4 * i, 5 * i, 6 * i, 7 * i, now=1000 + 60 * i)
         v = h.view()
         self.assertEqual(len(v), CacheHistory.KEEP)
         k = CacheHistory.KEEP + 4
-        self.assertEqual(v[-1], [1000 + 60 * k, k, 2 * k, 3 * k, 4 * k, 5 * k])
+        self.assertEqual(v[-1], [1000 + 60 * k, k, 2 * k, 3 * k, 4 * k, 5 * k, 6 * k, 7 * k])
 
     def test_the_saving_uses_long_reads_only(self):
         hist = [{"prompt_read": 30000, "prompt_ms": 15000.0}, {"prompt_read": 10000, "prompt_ms": 5000.0},
@@ -127,6 +127,10 @@ class ConvDiskServer(unittest.TestCase):
             later = CacheHistory()                            # a day and more later: nothing is that recent
             later.load(path, now=100000 + 86400 + 600)
             self.assertEqual(later.view(), [])
+            Path(path).write_text(json.dumps([[100000, 1, 2, 3, 4, 5]]), encoding="utf-8")   # an older server's sample
+            old = CacheHistory()
+            old.load(path, now=100000)
+            self.assertEqual(old.view(), [[100000, 1, 2, 3, 4, 5, 0, 0]])      # no prelude restores
             Path(path).write_text("[[1, 2", encoding="utf-8")   # damaged: ignored
             broken = CacheHistory()
             broken.load(path)
