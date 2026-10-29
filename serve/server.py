@@ -965,8 +965,9 @@ def disk_written_since_boot(folder: str | None) -> dict | None:
 class CacheHistory:
     """How much the conversation cache gave back over the last day, for the Monitor's graphs: one sample a minute of the
     counters [time, tokens restored from RAM, tokens restored from disk, bytes written to disk (all time), restores
-    from RAM, restores from disk].  The engine's counters start again at each engine start; the page takes the
-    differences between samples (a drop is a new start)."""
+    from RAM, restores from disk, tokens restored from the prelude cache, restores from it].  The engine's counters
+    start again at each engine start; the page takes the differences between samples (a drop is a new start).  A
+    saved sample of an older server (six values) loads with no prelude restores."""
     EVERY_S, KEEP = 60.0, 24 * 60
 
     def __init__(self):
@@ -974,10 +975,11 @@ class CacheHistory:
         self.lock = threading.Lock()
 
     def add(self, tokens_ram: int, tokens_disk: int, written: int, restores_ram: int = 0, restores_disk: int = 0,
-            now: float | None = None):
+            tokens_prelude: int = 0, restores_prelude: int = 0, now: float | None = None):
         with self.lock:
             self.samples.append([round(now if now is not None else time.time()), int(tokens_ram), int(tokens_disk),
-                                 int(written), int(restores_ram), int(restores_disk)])
+                                 int(written), int(restores_ram), int(restores_disk), int(tokens_prelude),
+                                 int(restores_prelude)])
 
     def view(self) -> list:
         with self.lock:
@@ -995,8 +997,8 @@ class CacheHistory:
         with self.lock:
             self.samples.clear()
             for r in rows if isinstance(rows, list) else []:
-                if isinstance(r, list) and len(r) == 6 and all(isinstance(v, (int, float)) for v in r) and r[0] >= cut:
-                    self.samples.append([int(v) for v in r])
+                if isinstance(r, list) and len(r) in (6, 8) and all(isinstance(v, (int, float)) for v in r) and r[0] >= cut:
+                    self.samples.append([int(v) for v in r] + [0, 0] * (len(r) == 6))
 
     def save(self, path: str):
         """Writes the samples beside the engine's status.json (~60 KB, once a minute), under a temporary name first."""
@@ -4627,7 +4629,8 @@ class Service:
                     since = disk.get("since_start") or {}
                     self.cache_history.add(parked.get("tokens_ram", 0), since.get("tokens", 0),
                                            disk.get("written_all_time", 0), parked.get("restores", 0),
-                                           since.get("restores", 0))
+                                           since.get("restores", 0), parked.get("tokens_prelude", 0),
+                                           parked.get("restores_prelude", 0))
                     self.cache_history.save(saved)
                 except Exception as e:                 # tried again in a minute; the thread keeps running
                     print(f"[strata] conversation cache: usage sample: {e}", flush=True)
