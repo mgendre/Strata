@@ -47,6 +47,7 @@ shows what both do in the Monitor, while keeping writes to the SSD low.
 | **Second GPU line.** With `--peer-device`, one line per request says where the experts ran: the main GPU's cache, the second GPU, over PCIe, or on the CPU. | always, with `--peer-device` |
 | **Second GPU refill by SM loads.** With `--peer-device`, the adaptive tier copies experts into the second GPU with the GPU's own loads instead of its copy engine. On the copy engine, each layer's work on that card waited until the whole round of copies had landed. | `--peer-refill-sm N` (0: the copy engine) |
 | **No expert on both GPUs.** The main GPU's adaptive tier no longer takes an expert that is still being copied into the second GPU, which left both cards holding it. | always, with `--peer-device` |
+| **Prompt heads (a diagnostic).** Each distinct system turn a request opens with (an agent's system prompt and tools) is written to a folder once, with an index of how often and when it came, so a diff shows what an agent changes between sessions and why its next chat cannot start after the stored prelude. | `"prompt_heads": DIR` in the config (off) |
 | **Monitor.** The Conversation cache card shows the RAM and disk bars, where restored conversations came from, the prompt tokens given back per hour (RAM and disk), the disk writes per hour and today, and one row per conversation on disk. A Disk write card sits next to Disk read. | always |
 
 ### How the disk cache works
