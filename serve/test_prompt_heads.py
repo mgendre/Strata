@@ -84,6 +84,16 @@ class Divergences(unittest.TestCase):
             rows = [json.loads(l) for l in (Path(d) / "divergences" / "index.jsonl").read_text().splitlines()]
             self.assertEqual([r["common"] for r in rows], [8])         # (the system turn 6 + <|im_start|> user)
 
+    def test_a_rewrite_that_shrinks_the_prompt_is_written_down(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = PromptHeads(d, Tok())
+            PromptHeads.MIN_TOKENS = 40
+            tool, later = list(range(100, 140)), list(range(200, 230))   # an old tool output, then the later turns
+            h.note(prompt([1, 2, 3], tool + later))                   # 80 ids: kept to compare with
+            h.note(prompt([1, 2, 3], [5] + later))                    # the tool output cleared: 41 ids
+            rows = [json.loads(l) for l in (Path(d) / "divergences" / "index.jsonl").read_text().splitlines()]
+            self.assertEqual([(r["tokens"], r["recent_tokens"], r["common"]) for r in rows], [(41, 80, 8)])
+
     def test_kept_later(self):
         import array
         b = lambda xs: array.array("i", xs).tobytes()

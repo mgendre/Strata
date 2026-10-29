@@ -831,21 +831,20 @@ class PromptHeads:
         return False
 
     def divergence(self, ids, head_len: int) -> str | None:
-        """A conversation that changed early: this prompt shares the system turn (and part of the first message, or
-        later turns: kept_later) with a recent long prompt, but parts from it more than SLACK ids before that prompt's end (a client that rewrote its
+        """A conversation that changed early: this prompt (of any length) shares the system turn (and part of the first
+        message, or later turns: kept_later) with a recent long prompt (MIN_TOKENS or more), but parts from it more than SLACK ids before that prompt's end (a client that rewrote its
         history: the engine can then only resume at a checkpoint before the change).  Writes divergences/<time>.txt
         with both texts around the change and one line in divergences/index.jsonl; the file's name, or None."""
-        if len(ids) < self.MIN_TOKENS:
-            return None
         cur = array.array("i", ids).tobytes()
         best, at = None, -1
         for old in reversed(self.recent):                   # the newest first: it wins a tie
             c = self.common_prefix(cur, old)
             if c > at:
                 best, at = old, c
-        self.recent.append(cur)
-        if len(self.recent) > self.RECENT:
-            self.recent.pop(0)
+        if len(ids) >= self.MIN_TOKENS:                     # only long prompts are kept to compare with; any prompt is
+            self.recent.append(cur)                         # checked (a rewrite that clears an old tool output shrinks it)
+            if len(self.recent) > self.RECENT:
+                self.recent.pop(0)
         if best is None:
             return None
         old_len = len(best) // 4
