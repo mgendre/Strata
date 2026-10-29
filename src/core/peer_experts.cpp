@@ -108,12 +108,16 @@ void PeerExperts::close() {
         if (h_x_) cudaFreeHost(h_x_);
         if (h_out_) cudaFreeHost(h_out_);
         if (h_meta_) cudaFreeHost(h_meta_);
+        if (h_jobs_) cudaFreeHost(h_jobs_);
         if (refill_ev_) cudaEventDestroy(refill_ev_);
         if (stream_) cudaStreamDestroy(stream_);
         if (refill_) cudaStreamDestroy(refill_);
     }
     d_x_ = d_out_ = h_x_ = h_out_ = nullptr;
     d_meta_ = h_meta_ = d_scratch_ = nullptr;
+    h_jobs_ = d_jobs_ = nullptr;
+    jobs_cap_ = 0;
+    refill_sm_ = 0;
     d_q8_ = nullptr;
     d_sx_ = d_sh_ = nullptr;
     stream_ = refill_ = nullptr;
@@ -137,6 +141,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     n_expert_ = n_expert;
     src_ = &src;
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
+    incoming_.assign((size_t) (n_layers * n_expert), 0);
     {   // direct access both ways (NVLink or another P2P path): the prompt path copies activations and results over it
         int a = 0, b = 0;
         cudaDeviceCanAccessPeer(&a, primary_device(), device);
@@ -238,7 +243,48 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         return false;
     }
     resident_ = (int64_t) pick.size();
+    // the adaptive refill by SM loads (set_refill_sm, --peer-refill-sm; 0 = the copy engine): only where this card
+    // reads registered memory by its host address; tried once here on the first slot (rewritten with its own bytes)
+    {
+        int want = refill_sm_want_;
+        int can = 0;
+        if (want > 0 && (cudaDeviceGetAttribute(&can, cudaDevAttrCanUseHostPointerForRegisteredMem, device) != cudaSuccess || !can)) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata: peer GPU %d: the adaptive refill stays on the copy engine (the card does not read "
+                                 "registered memory by its host address)\n", device);
+            want = 0;
+        }
+        refill_sm_ = want;
+        const uint8_t* b = src.blob(f0.first, f0.second);
+        if (refill_sm_ > 0 && src.device_alias(f0.first, f0.second) == b) {
+            strata::kernels::CopyJob j{b, cache_.device_slot(res_[(size_t) (f0.first * n_expert + f0.second)]),
+                                       (unsigned long long) lay.blob_bytes(f0.first)};
+            if (!refill_jobs(&j, 1, err) || !ck(cudaStreamSynchronize(refill_), "refill test", err) ||
+                !cache_.verify_slot(res_[(size_t) (f0.first * n_expert + f0.second)], b, err, (int64_t) lay.blob_bytes(f0.first))) {
+                err = "peer experts: the SM refill test: " + err;
+                close();
+                return false;
+            }
+        }
+    }
     return true;
+}
+
+bool PeerExperts::refill_jobs(const strata::kernels::CopyJob* jobs, size_t n, std::string& err) {
+    if (n == 0) return true;
+    if (n > jobs_cap_) {   // only between rounds: the round before has landed (pending_ was empty)
+        if (h_jobs_ != nullptr) cudaFreeHost(h_jobs_);
+        h_jobs_ = d_jobs_ = nullptr;
+        jobs_cap_ = 0;
+        const size_t cap = std::max<size_t>(n, 256);
+        if (!ck(cudaHostAlloc(&h_jobs_, cap * sizeof(strata::kernels::CopyJob), cudaHostAllocPortable | cudaHostAllocMapped), "refill jobs", err) ||
+            !ck(cudaHostGetDevicePointer(&d_jobs_, h_jobs_, 0), "refill jobs alias", err))
+            return false;
+        jobs_cap_ = cap;
+    }
+    std::memcpy(h_jobs_, jobs, n * sizeof(strata::kernels::CopyJob));
+    strata::kernels::copy_jobs_sm((const strata::kernels::CopyJob*) d_jobs_, (int) n, refill_sm_, refill_);
+    return ck(cudaGetLastError(), "refill kernel", err);
 }
 
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
@@ -362,18 +408,24 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
     std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
     if ((int) swaps.size() > max_swaps) swaps.resize((size_t) max_swaps);
     On on(device_);
+    std::vector<strata::kernels::CopyJob> jobs;
     for (const Swap& s : swaps) {
         const size_t in = (size_t) (s.layer * n_expert_ + s.in), out = (size_t) (s.layer * n_expert_ + s.out);
         const int32_t slot = res_[out];
         const uint8_t* b = src_->blob(s.layer, s.in);
         if (slot < 0 || b == nullptr) continue;
-        if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(s.layer), cudaMemcpyHostToDevice,
-                                refill_), "refill", err))
+        const size_t bytes = (size_t) lay.blob_bytes(s.layer);
+        uint8_t* dst = cache_.device_slot(slot);
+        if (refill_sm_ > 0 && src_->device_alias(s.layer, s.in) == b && (((uintptr_t) b | (uintptr_t) dst | bytes) & 15) == 0)
+            jobs.push_back({b, dst, (unsigned long long) bytes});   // registered memory: SM loads (refill_jobs)
+        else if (!ck(cudaMemcpyAsync(dst, b, bytes, cudaMemcpyHostToDevice, refill_), "refill", err))
             return false;
         res_[out] = kNotResident;              // evicted now: the CPU computes it meanwhile
         pending_.emplace_back((int32_t) in, slot);
+        incoming_[in] = 1;
         ++swaps_;
     }
+    if (!refill_jobs(jobs.data(), jobs.size(), err)) return false;
     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
 }
 
@@ -384,7 +436,10 @@ void PeerExperts::apply_pending(bool wait) {
         if (wait) cudaEventSynchronize(refill_ev_);
         else if (cudaEventQuery(refill_ev_) != cudaSuccess) return;
     }
-    for (const auto& [i, slot] : pending_) res_[(size_t) i] = slot;
+    for (const auto& [i, slot] : pending_) {
+        res_[(size_t) i] = slot;
+        incoming_[(size_t) i] = 0;
+    }
     pending_.clear();
 }
 

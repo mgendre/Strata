@@ -650,6 +650,7 @@ struct Options {
     int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
+    int peer_refill_sm = 0;   ///< --peer-refill-sm: SM blocks for the peer's adaptive copies (0 = the copy engine)
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
@@ -1119,6 +1120,9 @@ void usage() {
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
+                 "  --peer-refill-sm N    the peer cache's adaptive copies by N blocks of SM loads instead of the copy\n"
+                 "                       engine, which otherwise holds back every layer's launch on that card until the\n"
+                 "                       round has landed (default 0: the copy engine; 4 fills a PCIe 4.0 x4 link)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
@@ -3333,6 +3337,7 @@ int main(int argc, char** argv) {
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
+        else if (a == "--peer-refill-sm") o.peer_refill_sm = std::max(0, std::atoi(next("--peer-refill-sm")));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
@@ -7655,6 +7660,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         const auto tp0 = Clock::now();
+        peer.set_refill_sm(o.peer_refill_sm);
         if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
                        err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -7664,6 +7670,13 @@ int main(int argc, char** argv) {
                              "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
                      std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+        if (peer.refill_sm() > 0)
+            std::fprintf(stderr, "strata generate: peer GPU %d: the adaptive tier's copies go by %d blocks of SM loads, "
+                                 "leaving the copy engine to each layer's launch (--peer-refill-sm)\n",
+                         o.peer_device, peer.refill_sm());
+        else
+            std::fprintf(stderr, "strata generate: peer GPU %d: the adaptive tier's copies go by the copy engine "
+                                 "(--peer-refill-sm 4: by SM loads)\n", o.peer_device);
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
@@ -11738,7 +11751,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && (peer.has(l, e) || peer.incoming(l, e))) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;

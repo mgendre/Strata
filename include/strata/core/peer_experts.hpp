@@ -25,6 +25,8 @@
 #include <utility>
 #include <vector>
 
+namespace strata::kernels { struct CopyJob; }
+
 namespace strata::core {
 
 /// multi-GPU: set once at startup when a peer device is configured (--peer-device N).  The mapped host buffers
@@ -50,6 +52,11 @@ public:
 
     /// Whether the peer holds (layer, expert) right now.
     bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }
+    /// Whether (layer, expert) is on its way into the peer (an adaptive round's copy that `apply_pending` has not
+    /// taken yet).  The primary's own round skips these: taking one too would leave both cards holding it.
+    bool incoming(int64_t layer, int64_t expert) const {
+        return !incoming_.empty() && incoming_[(size_t) (layer * n_expert_ + expert)] != 0;
+    }
 
     /// The device address of (layer, expert)'s blob on the peer, or null when it is not resident.
     const uint8_t* slot_ptr(int64_t layer, int64_t expert) {
@@ -80,9 +87,13 @@ public:
     int64_t entries() const { return entries_; }      ///< routed entries the peer computed
     int64_t experts() const { return experts_; }      ///< distinct (layer, expert) the peer computed
     int64_t swaps() const { return swaps_; }
+    int refill_sm() const { return refill_sm_; }      ///< SM blocks of the adaptive refill (0 = the copy engine)
+    /// Before `open`: the adaptive refill by `blocks` blocks of SM loads (0 = the copy engine, the default).
+    void set_refill_sm(int blocks) { refill_sm_want_ = blocks; }
     double ms_wait = 0;                               ///< host time spent in finish() waiting for the peer
 
 private:
+    bool refill_jobs(const strata::kernels::CopyJob* jobs, size_t n, std::string& err);
     int device_ = -1;
     bool p2p_ = false;
     int64_t n_layers_ = 0, n_expert_ = 0;
@@ -90,6 +101,12 @@ private:
     ExpertSource* src_ = nullptr;
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
+    std::vector<uint8_t> incoming_;                      ///< [n_layers * n_expert] -> 1 while in pending_
+    int refill_sm_ = 0;                               ///< adaptive refill: SM copy blocks (0 = the copy engine)
+    int refill_sm_want_ = 0;                          ///< asked for (set_refill_sm), kept across close()
+    void* h_jobs_ = nullptr;                          ///< its job table (pinned, mapped), `jobs_cap_` entries
+    void* d_jobs_ = nullptr;
+    size_t jobs_cap_ = 0;
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;
