@@ -52,11 +52,11 @@ class Heads(unittest.TestCase):
 
 class Divergences(unittest.TestCase):
     def setUp(self):
-        self.saved = (PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST, PromptHeads.WINDOW)
-        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST, PromptHeads.WINDOW = 10, 4, 3, 4   # small prompts
+        self.saved = (PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.WINDOW)
+        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.WINDOW = 10, 4, 4   # small prompts for the test
 
     def tearDown(self):
-        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST, PromptHeads.WINDOW = self.saved
+        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.WINDOW = self.saved
 
     def test_a_history_rewritten_early_is_written_down(self):
         with tempfile.TemporaryDirectory() as d:
@@ -93,6 +93,14 @@ class Divergences(unittest.TestCase):
             h.note(prompt([1, 2, 3], [5] + later))                    # the tool output cleared: 41 ids
             rows = [json.loads(l) for l in (Path(d) / "divergences" / "index.jsonl").read_text().splitlines()]
             self.assertEqual([(r["tokens"], r["recent_tokens"], r["common"]) for r in rows], [(41, 80, 8)])
+
+    def test_a_new_subagent_on_the_same_task_is_not_a_rewrite(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = PromptHeads(d, Tok())
+            task = list(range(100, 120))                              # "You are a subagent ... Implement <plan>"
+            h.note(prompt([1, 2, 3], task + list(range(300, 360))))   # the first subagent's long session
+            h.note(prompt([1, 2, 3], task + list(range(600, 620))))   # a new one: the same task, another report
+            self.assertFalse((Path(d) / "divergences").exists())
 
     def test_kept_later(self):
         import array

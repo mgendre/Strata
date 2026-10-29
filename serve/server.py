@@ -795,9 +795,9 @@ class PromptHeads:
                 return list(ids[:i])
         return None
 
-    # the divergence check: prompts kept, the shortest checked, the margin before the recent prompt's end, the ids of the
-    # first message the two must share (else it is another chat of the agent), the ids of text written after the change
-    RECENT, MIN_TOKENS, SLACK, FIRST, CONTEXT, WINDOW = 8, 8192, 4096, 64, 1200, 32
+    # the divergence check: prompts kept to compare with, their shortest, the margin before the recent prompt's end, the
+    # ids of text written after the change, the window kept_later looks for
+    RECENT, MIN_TOKENS, SLACK, CONTEXT, WINDOW = 8, 8192, 4096, 1200, 32
 
     @staticmethod
     def common_prefix(a: bytes, b: bytes) -> int:
@@ -831,8 +831,8 @@ class PromptHeads:
         return False
 
     def divergence(self, ids, head_len: int) -> str | None:
-        """A conversation that changed early: this prompt (of any length) shares the system turn (and part of the first
-        message, or later turns: kept_later) with a recent long prompt (MIN_TOKENS or more), but parts from it more than SLACK ids before that prompt's end (a client that rewrote its
+        """A conversation that changed early: this prompt (of any length) shares the system turn and still holds later
+        parts (kept_later) of a recent long prompt (MIN_TOKENS or more), but parts from it more than SLACK ids before that prompt's end (a client that rewrote its
         history: the engine can then only resume at a checkpoint before the change).  Writes divergences/<time>.txt
         with both texts around the change and one line in divergences/index.jsonl; the file's name, or None."""
         cur = array.array("i", ids).tobytes()
@@ -850,8 +850,8 @@ class PromptHeads:
         old_len = len(best) // 4
         if at < head_len or at + self.SLACK >= old_len:    # another agent, or the same conversation going on
             return None
-        if at < head_len + self.FIRST and not self.kept_later(best, cur, at, self.WINDOW):   # another chat of the agent
-            return None
+        if not self.kept_later(best, cur, at, self.WINDOW):  # another chat of the agent (a new subagent on the same task
+            return None                                      # shares the first message's start, not the later turns)
         old_ids = array.array("i")
         old_ids.frombytes(best)
         span = lambda xs: self.tok.decode(list(xs[max(0, at - 200): at + self.CONTEXT]))
