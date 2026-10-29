@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from serve.server import (CacheHistory, ConvCacheLog, ConvDiskStatus, conversation_cache_view, conversation_disk_dir,
-                          disk_written_since_boot, long_read_speed)
+                          disk_written_since_boot, long_read_speed, system_role_args)
 
 
 class Engine:
@@ -32,6 +32,32 @@ class ConvDiskServer(unittest.TestCase):
             log.write_text(self.DISK, encoding="utf-8")
             st = ConvCacheLog().poll(str(log), 0)
             self.assertEqual((st["restores"], st["restores_disk"], st["last_source"]), (0, 1, "disk"))
+
+    def test_prelude_restores_are_counted_apart(self):
+        prelude = ("strata serve: prelude cache: restored a prelude of 8413 tokens in 187.0 ms, read 235 MiB (its use 1); "
+                   "preludes=2\n")
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(self.RAM + prelude + self.DISK + prelude, encoding="utf-8")
+            st = ConvCacheLog().poll(str(log), 0)
+            self.assertEqual((st["restores"], st["restores_disk"], st["restores_prelude"]), (1, 1, 2))
+            self.assertEqual((st["tokens_ram"], st["tokens_prelude"]), (4000, 16826))
+            self.assertEqual((st["last_event"], st["last_tokens"], st["last_source"]), ("restored", 8413, "prelude"))
+
+    def test_the_system_role_token_goes_with_the_prelude_cache(self):
+        class Tok:
+            def __init__(self, ids): self.ids = ids
+            def encode(self, text, parse_special=False): return self.ids
+        with tempfile.TemporaryDirectory() as d:
+            new, old = Path(d) / "strata", Path(d) / "strata-old"
+            new.write_bytes(b"...--system-role-token..."); old.write_bytes(b"...")
+            cfg = {"args": ["--prelude-cache", "/p"]}
+            self.assertEqual(system_role_args(cfg, str(new), Tok([8948])), ["--system-role-token", "8948"])
+            self.assertEqual(system_role_args({"args": []}, str(new), Tok([8948])), [])         # no prelude cache
+            self.assertEqual(system_role_args(cfg, str(old), Tok([8948])), [])                  # an older engine
+            self.assertEqual(system_role_args(cfg, str(new), Tok([1, 2])), [])                  # "system" split in two
+            self.assertEqual(system_role_args({"args": ["--prelude-cache", "/p", "--system-role-token", "7"]},
+                                              str(new), Tok([8948])), [])                       # set by hand: kept
 
     def test_conversations_that_left_ram(self):
         lines = ("strata serve: conversation cache: left RAM (budget full): 59529 tokens, on disk 3100 behind\n"

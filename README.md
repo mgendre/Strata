@@ -93,8 +93,10 @@ keeps it on disk too, so a new chat still starts after it once those conversatio
 restarted.
 
 - The prelude ends at the first turn boundary after the system prompt, when it is at least `--prompt-cache-root`
-  tokens long (2,048 by default). It is saved right after the reply of the first chat that reads it, once.
-- A new chat that starts with a saved prelude, and that RAM cannot resume further, comes back from it.
+  tokens long (2,048 by default). It is saved right after the reply of the first chat that reads it, once. A chat that
+  does not start with a system prompt has no prelude (the server passes the id of `system` to the engine).
+- A new chat that starts with a saved prelude, and that RAM cannot resume further, comes back from it. The Monitor counts
+  these restores and their tokens next to the RAM and disk ones.
 - The folder keeps `--prelude-cache-mib` in all (5 GiB by default, about 20 preludes of 8K tokens). The prelude used
   least leaves first. Like the disk cache, it is kept across restarts of the same engine version, model and settings.
 

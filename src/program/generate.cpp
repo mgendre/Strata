@@ -861,6 +861,8 @@ struct Options {
     /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = 248045;
+    /// --serve, --prelude-cache: the id of "system" (the server passes it): a prelude is a system turn only
+    int64_t system_role_token = -1;
     /// --serve (#458, opt-in): the role token of a short turn the server puts right before the new assistant turn
     /// (the "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
     /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.
@@ -1033,6 +1035,8 @@ void usage() {
                  "                       near it, thinner further back) instead of the most recently used: a client that\n"
                  "                       rewrites its history N tokens back reads about N again, not the whole conversation\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
+                 "  --system-role-token ID  --prelude-cache: the id of \"system\"; a prelude is then a system turn\n"
+                 "                       only (the server passes it; -1: the first turn, whatever its role)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
@@ -3254,6 +3258,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
+        else if (a == "--system-role-token") o.system_role_token = std::atoll(next("--system-role-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
@@ -10560,9 +10565,9 @@ int main(int argc, char** argv) {
                 std::string note;
                 if (prelude.open(popt, did, layers, disk_sizes, note, why))
                     std::fprintf(stderr, "strata serve: prelude cache: at %s: %lld MiB, the preludes (system prompt and tools) "
-                                         "of %lld tokens or more; %s\n",
+                                         "of %lld tokens or more%s; %s\n",
                                  o.prelude_cache.c_str(), (long long) o.prelude_cache_mib, (long long) o.prompt_cache_root,
-                                 note.c_str());
+                                 o.system_role_token >= 0 ? ", system turns only" : "", note.c_str());
             }
             if (!prelude.enabled()) std::fprintf(stderr, "strata serve: prelude cache: off (%s)\n", why.c_str());
         }
@@ -10708,7 +10713,7 @@ int main(int argc, char** argv) {
                                         const strata::core::QsaState* draft) {
             if (!prelude.enabled()) return;
             const int64_t end = strata::program::conv_cache::prelude_end(lids.data(), lids.size(), o.turn_token,
-                                                                         o.prompt_cache_root);
+                                                                         o.prompt_cache_root, o.system_role_token);
             if (end <= 0) return;
             const ConvCheckpoint* root = nullptr;
             for (const ConvCheckpoint& c : lchecks)
