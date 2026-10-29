@@ -106,6 +106,13 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).
 void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream);
+/// multi-GPU, the peer's adaptive refill: copy jobs[0, n) (src: pinned mapped host memory the device reads by its
+/// host address, dst: device memory; both 16-byte aligned, bytes a multiple of 16) with `blocks` blocks of SM loads
+/// instead of the copy engine.  `jobs` itself is read by the device (mapped host memory).  A copy-engine refill on
+/// the peer's chipset link holds back the small copies of every layer's launch on the same card until the whole
+/// round has landed (a 72-expert round: ~23 ms); SM loads leave the copy engine to them.
+struct CopyJob { const void* src; void* dst; unsigned long long bytes; };
+void copy_jobs_sm(const CopyJob* jobs, int n, int blocks, void* stream);
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
                            const int32_t* count, void* stream);
 /// copy_rows_from_mapped after spinning on *flag >= value (every block's thread 0 polls the mapped flag; the

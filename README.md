@@ -45,6 +45,8 @@ shows what both do in the Monitor, while keeping writes to the SSD low.
 | **Smaller parked conversations in RAM.** A parked conversation keeps its last N checkpoints and its first one (the end of the system prompt) instead of all of them. Each checkpoint is about 118 MB on Qwen3.8-Flash-Next. | `--conversation-cache-park-checkpoints N` (0: all) |
 | **Clearer log.** One line for each save to disk, each restore from disk, and each conversation that leaves RAM, with whether it is on disk. | always, with the disk cache |
 | **Second GPU line.** With `--peer-device`, one line per request says where the experts ran: the main GPU's cache, the second GPU, over PCIe, or on the CPU. | always, with `--peer-device` |
+| **Second GPU refill by SM loads.** With `--peer-device`, the adaptive tier copies experts into the second GPU with the GPU's own loads instead of its copy engine. On the copy engine, each layer's work on that card waited until the whole round of copies had landed. | `--peer-refill-sm N` (0: the copy engine) |
+| **No expert on both GPUs.** The main GPU's adaptive tier no longer takes an expert that is still being copied into the second GPU, which left both cards holding it. | always, with `--peer-device` |
 | **Monitor.** The Conversation cache card shows the RAM and disk bars, where restored conversations came from, the prompt tokens given back per hour (RAM and disk), the disk writes per hour and today, and one row per conversation on disk. A Disk write card sits next to Disk read. | always |
 
 ### How the disk cache works
@@ -111,6 +113,25 @@ system prompt) was the same text.
 
 A conversation of 13.6K tokens spilled when RAM let it go wrote 310 MiB in 0.26 s; it came back from disk in 0.21 s and
 read its prompt in 0.96 s instead of about 6.8 s.
+
+### The second GPU's refill
+
+With `--peer-device`, the adaptive tier moves the experts the text uses into the second GPU while Strata writes an
+answer: up to `--peer-adapt-swaps` copies of about 2 MiB per round. On the copy engine, the small copies that start each
+layer's work on that card wait behind the whole round. Measured on an RTX 3060 behind the X570 chipset (PCIe 4.0 x4),
+one layer's work there took 0.11 ms alone and 23 ms during a round of 72 copies. With `--peer-refill-sm 4`, four
+blocks of the GPU copy the experts at the same 6 GB/s, and the layer's work took 0.12 ms.
+
+```json
+"--peer-refill-sm", "4"
+```
+
+Decode on the same PC (RTX 3080 Ti + RTX 3060, four answers of 400 tokens, three rounds): 91.7 tok/s before, 97.0
+tok/s with `--peer-refill-sm 4`. The CPU waited 1.5 ms per decode window for the second GPU instead of 3.3 ms. Once
+these copies are cheap, the second GPU can follow the text more closely: `--adapt-decay 0.92 --peer-adapt-swaps 144`
+gave 98.9 tok/s (three runs; runs of the same settings differ by about 2%). Before the change, the same two settings
+made decode slower (79 tok/s), because each copy into the second GPU cost about 0.3 ms of every window. The copies move
+the same bytes, so the answers keep their quality.
 
 Not measured yet: days of real use, AMD (HIP), Intel (SYCL), Mac (Metal) and Windows. With a layer split across two
 GPUs (`--layer-split`) the disk cache and the prelude cache stay off.
