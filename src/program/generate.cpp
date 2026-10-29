@@ -834,6 +834,17 @@ struct Options {
     int64_t conversation_cache_disk_first_tokens = 32768, conversation_cache_disk_step_tokens = 16384;
     int64_t conversation_cache_disk_topup_tokens = 0;
     int64_t conversation_cache_disk_day_gib = 200;
+    /// --conversation-cache-disk-spill-tokens N (0 = off): a conversation of N tokens or more that leaves RAM (or that RAM
+    /// cannot take) with no copy on disk is saved then, below the first save step too - only the ones RAM loses are
+    /// written, not every conversation that reaches N.
+    int64_t conversation_cache_disk_spill_tokens = 0;
+    /// --serve --prelude-cache DIR: the prelude cache (prelude_end in conv_cache.hpp).  An agent's prelude - its system
+    /// prompt and tools, up to the first turn boundary, at least --prompt-cache-root tokens - is saved there once, right
+    /// after the reply of the request that read it, apart from the conversations (its own --prelude-cache-mib, 5 GiB by
+    /// default, kept across restarts like the disk tier's copies).  A new chat that starts with a stored prelude and that
+    /// neither the live session nor RAM resumes further comes back from it.  "" = off.
+    std::string prelude_cache;
+    int64_t prelude_cache_mib = 5120;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -850,6 +861,8 @@ struct Options {
     /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = 248045;
+    /// --serve, --prelude-cache: the id of "system" (the server passes it): a prelude is a system turn only
+    int64_t system_role_token = -1;
     /// --serve (#458, opt-in): the role token of a short turn the server puts right before the new assistant turn
     /// (the "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
     /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.
@@ -1022,6 +1035,8 @@ void usage() {
                  "                       near it, thinner further back) instead of the most recently used: a client that\n"
                  "                       rewrites its history N tokens back reads about N again, not the whole conversation\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
+                 "  --system-role-token ID  --prelude-cache: the id of \"system\"; a prelude is then a system turn\n"
+                 "                       only (the server passes it; -1: the first turn, whatever its role)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
@@ -3198,12 +3213,14 @@ int main(int argc, char** argv) {
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-disk") o.conversation_cache_disk = next("--conversation-cache-disk");
+        else if (a == "--prelude-cache") o.prelude_cache = next("--prelude-cache");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-cache-park-gain" || a == "--conversation-cache-park-checkpoints" ||
                  a == "--conversation-cache-disk-mib" ||
                  a == "--conversation-cache-disk-first-tokens" || a == "--conversation-cache-disk-step-tokens" ||
                  a == "--conversation-cache-disk-topup-tokens" || a == "--conversation-cache-disk-day-gib" ||
+                 a == "--conversation-cache-disk-spill-tokens" || a == "--prelude-cache-mib" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
@@ -3211,7 +3228,8 @@ int main(int argc, char** argv) {
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
                                    a == "--conversation-cache-park-gain" || a == "--conversation-cache-park-checkpoints" ||
                                    a == "--conversation-cache-disk-first-tokens" ||
-                                   a == "--conversation-cache-disk-step-tokens" || a == "--conversation-cache-disk-topup-tokens")
+                                   a == "--conversation-cache-disk-step-tokens" || a == "--conversation-cache-disk-topup-tokens" ||
+                                   a == "--conversation-cache-disk-spill-tokens")
                                       ? INT32_MAX
                                       : a == "--conversation-cache-disk-day-gib" ? INT64_MAX / (1ll << 30)
                                                                                  : INT64_MAX / (1024 * 1024);
@@ -3229,6 +3247,8 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-cache-disk-step-tokens") o.conversation_cache_disk_step_tokens = std::max<int64_t>(1, number);
             else if (a == "--conversation-cache-disk-topup-tokens") o.conversation_cache_disk_topup_tokens = number;
             else if (a == "--conversation-cache-disk-day-gib") o.conversation_cache_disk_day_gib = number;
+            else if (a == "--conversation-cache-disk-spill-tokens") o.conversation_cache_disk_spill_tokens = number;
+            else if (a == "--prelude-cache-mib") o.prelude_cache_mib = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
@@ -3238,6 +3258,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
+        else if (a == "--system-role-token") o.system_role_token = std::atoll(next("--system-role-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
@@ -10454,60 +10475,101 @@ int main(int argc, char** argv) {
         };
         strata::core::ConversationDisk disk;
         const strata::core::QsaState* disk_draft = use_mtp ? &mtp.kv_state() : nullptr;
-        if (o.serve && !o.conversation_cache_disk.empty()) {
-            std::string why;
+        // what the disk tier's and the prelude cache's files are bound to: the model files and the settings that change
+        // what the bytes mean (sid's), the engine version (like the session files: a rebuild of the same version keeps
+        // the copies) with kDiskFormat, and the K/V layout
+        auto disk_identity = [&](strata::core::ConversationDiskIdentity& did, size_t& layers, std::string& why) {
             if (!conversations.enabled()) {
                 why = "the RAM conversation cache is off";
-            } else if (!stages.empty()) {
+                return false;
+            }
+            if (!stages.empty()) {
                 why = "a layer split keeps the RAM cache alone";
-            } else {
-                strata::core::SessionFileIdentity sid;
-                if (session_identity(sid, why, {})) {
-                    strata::core::ConversationDiskIdentity did{sid.model, sid.config, 0, 0};
-                    // the engine version (like the session files: a rebuild of the same version keeps the copies),
-                    // kDiskFormat and the K/V layout; the model files and the settings that change what the bytes mean
-                    // are sid's
-                    strata::core::SessionIdentityBuilder build(0xb17d);
-                    build.str("version", STRATA_VERSION);
-                    build.i64("disk_format", kDiskFormat);
-                    did.build = build.digest();
-                    const size_t layers = strata::core::conversation_kv_layers(ss, disk_draft);
-                    strata::core::SessionIdentityBuilder lay(0x1a70);
-                    lay.u64("layers", layers);
-                    std::string lerr;
-                    for (size_t l = 0; l < layers; ++l)
-                        for (const int64_t t : {(int64_t) 1, (int64_t) 4096, (int64_t) 8193}) {
-                            std::array<uint64_t, 5> z{};
-                            if (strata::core::conversation_kv_layer_sizes(ss, g, disk_draft, l, t, z, lerr))
-                                lay.bytes("sizes", z.data(), sizeof z);
-                        }
-                    did.layout = lay.digest();
-                    strata::core::ConversationDiskOptions dopt;
-                    dopt.dir = o.conversation_cache_disk;
-                    dopt.budget_bytes = (uint64_t) o.conversation_cache_disk_mib << 20;
-                    dopt.min_tokens = o.conversation_cache_disk_first_tokens;
-                    dopt.refresh_tokens = 1;   // (the engine decides when: disk_step)
-                    dopt.half_life_s = kScoreHalfLife;
-                    dopt.day_guide_bytes = (uint64_t) o.conversation_cache_disk_day_gib << 30;
-                    std::string note;
-                    if (disk.open(dopt, did, layers,
-                                  [&ss, &g, disk_draft](size_t layer, int64_t t, std::array<uint64_t, 5>& z) {
-                                      std::string e;
-                                      return strata::core::conversation_kv_layer_sizes(ss, g, disk_draft, layer, t, z, e);
-                                  },
-                                  note, why))
-                        std::fprintf(stderr, "strata serve: conversation cache: disk at %s: %lld MiB, conversations saved after "
-                                             "a reply at %lld tokens and every %lld further, top-up %s; %s\n",
-                                     o.conversation_cache_disk.c_str(), (long long) o.conversation_cache_disk_mib,
-                                     (long long) o.conversation_cache_disk_first_tokens,
-                                     (long long) o.conversation_cache_disk_step_tokens,
-                                     o.conversation_cache_disk_topup_tokens > 0
-                                         ? ("after " + std::to_string(o.conversation_cache_disk_topup_tokens) + " tokens").c_str()
-                                         : "off", note.c_str());
+                return false;
+            }
+            strata::core::SessionFileIdentity sid;
+            if (!session_identity(sid, why, {})) return false;
+            did = {sid.model, sid.config, 0, 0};
+            strata::core::SessionIdentityBuilder build(0xb17d);
+            build.str("version", STRATA_VERSION);
+            build.i64("disk_format", kDiskFormat);
+            did.build = build.digest();
+            layers = strata::core::conversation_kv_layers(ss, disk_draft);
+            strata::core::SessionIdentityBuilder lay(0x1a70);
+            lay.u64("layers", layers);
+            std::string lerr;
+            for (size_t l = 0; l < layers; ++l)
+                for (const int64_t t : {(int64_t) 1, (int64_t) 4096, (int64_t) 8193}) {
+                    std::array<uint64_t, 5> z{};
+                    if (strata::core::conversation_kv_layer_sizes(ss, g, disk_draft, l, t, z, lerr))
+                        lay.bytes("sizes", z.data(), sizeof z);
                 }
+            did.layout = lay.digest();
+            return true;
+        };
+        auto disk_sizes = [&ss, &g, disk_draft](size_t layer, int64_t t, std::array<uint64_t, 5>& z) {
+            std::string e;
+            return strata::core::conversation_kv_layer_sizes(ss, g, disk_draft, layer, t, z, e);
+        };
+        if (o.serve && !o.conversation_cache_disk.empty()) {
+            std::string why;
+            strata::core::ConversationDiskIdentity did;
+            size_t layers = 0;
+            if (disk_identity(did, layers, why)) {
+                strata::core::ConversationDiskOptions dopt;
+                dopt.dir = o.conversation_cache_disk;
+                dopt.budget_bytes = (uint64_t) o.conversation_cache_disk_mib << 20;
+                // (the engine decides when: disk_step, and the spill below the first step)
+                dopt.min_tokens = o.conversation_cache_disk_spill_tokens > 0
+                                      ? std::min(o.conversation_cache_disk_first_tokens, o.conversation_cache_disk_spill_tokens)
+                                      : o.conversation_cache_disk_first_tokens;
+                dopt.refresh_tokens = 1;
+                dopt.half_life_s = kScoreHalfLife;
+                dopt.day_guide_bytes = (uint64_t) o.conversation_cache_disk_day_gib << 30;
+                std::string note;
+                if (disk.open(dopt, did, layers, disk_sizes, note, why))
+                    std::fprintf(stderr, "strata serve: conversation cache: disk at %s: %lld MiB, conversations saved after "
+                                         "a reply at %lld tokens and every %lld further, top-up %s, spill %s; %s\n",
+                                 o.conversation_cache_disk.c_str(), (long long) o.conversation_cache_disk_mib,
+                                 (long long) o.conversation_cache_disk_first_tokens,
+                                 (long long) o.conversation_cache_disk_step_tokens,
+                                 o.conversation_cache_disk_topup_tokens > 0
+                                     ? ("after " + std::to_string(o.conversation_cache_disk_topup_tokens) + " tokens").c_str()
+                                     : "off",
+                                 o.conversation_cache_disk_spill_tokens > 0
+                                     ? ("from " + std::to_string(o.conversation_cache_disk_spill_tokens) + " tokens").c_str()
+                                     : "off",
+                                 note.c_str());
             }
             if (!disk.enabled())
                 std::fprintf(stderr, "strata serve: conversation cache: disk off (%s)\n", why.c_str());
+        }
+        // --prelude-cache DIR: the agents' preludes (their system prompt and tools), one copy each, in a store of their
+        // own with the disk tier's format (a prelude is a copy whose running state is the root checkpoint)
+        strata::core::ConversationDisk prelude;
+        constexpr int64_t kPreludeMinGain = 1024;   // a prelude is restored when it saves at least this many tokens
+        if (o.serve && !o.prelude_cache.empty()) {
+            std::string why;
+            strata::core::ConversationDiskIdentity did;
+            size_t layers = 0;
+            if (o.prompt_cache <= 0 || o.turn_token < 0 || o.prompt_cache_root <= 0) {
+                why = "it needs the root checkpoint: --prompt-cache, --turn-token and --prompt-cache-root";
+            } else if (disk_identity(did, layers, why)) {
+                strata::core::ConversationDiskOptions popt;
+                popt.dir = o.prelude_cache;
+                popt.budget_bytes = (uint64_t) o.prelude_cache_mib << 20;
+                popt.min_tokens = o.prompt_cache_root;
+                popt.refresh_tokens = 1;
+                popt.half_life_s = kScoreHalfLife;
+                popt.day_guide_bytes = (uint64_t) o.conversation_cache_disk_day_gib << 30;
+                std::string note;
+                if (prelude.open(popt, did, layers, disk_sizes, note, why))
+                    std::fprintf(stderr, "strata serve: prelude cache: at %s: %lld MiB, the preludes (system prompt and tools) "
+                                         "of %lld tokens or more%s; %s\n",
+                                 o.prelude_cache.c_str(), (long long) o.prelude_cache_mib, (long long) o.prompt_cache_root,
+                                 o.system_role_token >= 0 ? ", system turns only" : "", note.c_str());
+            }
+            if (!prelude.enabled()) std::fprintf(stderr, "strata serve: prelude cache: off (%s)\n", why.c_str());
         }
         // the save step a conversation of n tokens has reached (-1: below the first)
         auto disk_step = [&](int64_t n) {
@@ -10520,6 +10582,16 @@ int main(int argc, char** argv) {
             return o.conversation_cache_disk_topup_tokens > 0 && n >= o.conversation_cache_disk_first_tokens &&
                    n - saved >= o.conversation_cache_disk_topup_tokens;
         };
+        // --conversation-cache-disk-spill-tokens: a conversation RAM lets go with no copy on disk, from that size on
+        auto spill_due = [&](int64_t n, int64_t saved) {
+            return o.conversation_cache_disk_spill_tokens > 0 && n >= o.conversation_cache_disk_spill_tokens && saved == 0;
+        };
+        // when RAM lets a conversation go (or cannot take it): the spill or the top-up
+        auto leave_due = [&](int64_t n, int64_t saved) { return spill_due(n, saved) || topup_due(n, saved); };
+        const bool leave_saves = o.conversation_cache_disk_topup_tokens > 0 || o.conversation_cache_disk_spill_tokens > 0;
+        const int64_t disk_min_tokens = o.conversation_cache_disk_spill_tokens > 0
+                                            ? std::min(o.conversation_cache_disk_first_tokens, o.conversation_cache_disk_spill_tokens)
+                                            : o.conversation_cache_disk_first_tokens;
         // one disk write and its log lines
         auto disk_save = [&](const std::vector<int32_t>& dids, const std::vector<ImgKey>& dimgs, bool dcvec,
                              const ConvCheckpoint& state, const std::vector<strata::core::SessionKvSource>& kv,
@@ -10560,7 +10632,7 @@ int main(int argc, char** argv) {
                                      const std::vector<ConvCheckpoint>& lchecks, const strata::core::SessionState& session,
                                      const strata::core::QsaState* draft, const char* why,
                                      const std::function<bool(int64_t, int64_t)>& due) {
-            if (!disk.enabled() || (int64_t) lids.size() < o.conversation_cache_disk_first_tokens) return;
+            if (!disk.enabled() || (int64_t) lids.size() < disk_min_tokens) return;
             try {
                 ConvCheckpoint live_state;
                 live_state.ids = lids;
@@ -10591,9 +10663,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: disk write failed (out of memory)\n");
             }
         };
-        // the top-up of a parked conversation RAM pushes out (or could not keep after its capture): from its host copy
+        // the spill or top-up of a parked conversation RAM pushes out (or could not keep after its capture): from its host
+        // copy
         auto disk_topup_image = [&](strata::core::SavedConversation& image, const char* why) {
-            if (!disk.enabled() || o.conversation_cache_disk_topup_tokens <= 0 || !image.stage_images.empty()) return;
+            if (!disk.enabled() || !leave_saves || !image.stage_images.empty()) return;
             strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: its host K/V has landed, VRAM slot or not)
             strata::core::conversation_checkpoint_join(image.live.gdn.data());
             for (const ConvCheckpoint& c : image.checkpoints) strata::core::conversation_checkpoint_join(c.gdn.data());
@@ -10602,9 +10675,10 @@ int main(int argc, char** argv) {
             const int64_t n = (int64_t) state.ids.size();
             const std::vector<int32_t> dids(image.live.ids.begin(), image.live.ids.begin() + (std::ptrdiff_t) n);
             const std::vector<ImgKey> dimgs = below(image.live.imgs, n);
-            if (!topup_due(n, disk.saved_tokens(dids, dimgs, image.cvec))) return;
+            const int64_t saved = disk.saved_tokens(dids, dimgs, image.cvec);
+            if (!leave_due(n, saved)) return;
             disk_save(dids, dimgs, image.cvec, state, strata::core::conversation_image_sources(image),
-                      score_now(image.score, image.score_at), why);
+                      score_now(image.score, image.score_at), saved == 0 && spill_due(n, saved) ? "spill" : why);
         };
         // a conversation leaves RAM: whether its copy on disk has it (and how far behind it is), for the log and the
         // monitor ("left RAM (why): N tokens, on disk M behind" or "..., not on disk (...)"), then the optional top-up
@@ -10620,7 +10694,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: left RAM (%s): %zu tokens, not on disk (%s)\n",
                              why, image.live.ids.size(),
                              n < o.conversation_cache_disk_first_tokens ? "below the first save step" : "no copy");
-            if (o.conversation_cache_disk_topup_tokens > 0) disk_topup_image(image, "top-up");
+            if (leave_saves) disk_topup_image(image, "top-up");
         };
         if (disk.enabled())
             conversations.on_evict([&](strata::core::SavedConversation& image, const char* why) {
@@ -10631,6 +10705,46 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: disk write failed (%s)\n", ex.what());
                 }
             });
+        // --prelude-cache: after a reply, the conversation's prelude when the store does not have it yet - its K/V up to
+        // the prelude's end, read where it is on the device, and the root checkpoint as its running state (on the host
+        // already).  Once per distinct system prompt: the next chats of that agent find it on disk and skip the check.
+        auto prelude_save_session = [&](const std::vector<int32_t>& lids, const std::vector<ImgKey>& limgs, bool lcvec,
+                                        const std::vector<ConvCheckpoint>& lchecks, const strata::core::SessionState& session,
+                                        const strata::core::QsaState* draft) {
+            if (!prelude.enabled()) return;
+            const int64_t end = strata::program::conv_cache::prelude_end(lids.data(), lids.size(), o.turn_token,
+                                                                         o.prompt_cache_root, o.system_role_token);
+            if (end <= 0) return;
+            const ConvCheckpoint* root = nullptr;
+            for (const ConvCheckpoint& c : lchecks)
+                if ((int64_t) c.ids.size() == end && std::equal(c.ids.begin(), c.ids.end(), lids.begin())) {
+                    root = &c;
+                    break;
+                }
+            if (root == nullptr) return;   // the chain has no checkpoint there (a resume from further on): nothing to save
+            try {
+                const std::vector<ImgKey> pimgs = below(limgs, end);
+                const std::vector<int32_t> pids(lids.begin(), lids.begin() + (std::ptrdiff_t) end);
+                if (prelude.saved_tokens(pids, pimgs, lcvec) >= end) return;
+                const auto t0 = Clock::now();
+                strata::core::conversation_checkpoint_join(root->gdn.data());
+                std::string e;
+                std::vector<strata::core::SessionKvSource> kv;
+                strata::core::ConversationDiskStats st;
+                if (!strata::core::conversation_kv_sources(kv, session, g, draft, end, e) ||
+                    !prelude.save(strata::core::ConversationDisk::Write{pids, pimgs, lcvec, *root, kv, 0.0}, st, e)) {
+                    std::fprintf(stderr, "strata serve: prelude cache: write failed (%s)\n", e.c_str());
+                    return;
+                }
+                const auto u = prelude.usage();
+                std::fprintf(stderr, "strata serve: prelude cache: saved a prelude of %lld tokens in %.1f ms: wrote %llu MiB; "
+                                     "preludes=%zu (%llu MiB)\n",
+                             (long long) end, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             (unsigned long long) (st.written >> 20), u.entries, (unsigned long long) (u.bytes >> 20));
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: prelude cache: write failed (out of memory)\n");
+            }
+        };
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
         struct ParkSource {
@@ -10801,8 +10915,8 @@ int main(int argc, char** argv) {
             // --conversation-cache-disk --conversation-cache-disk-topup-tokens N: the outgoing conversation does not fit in
             // RAM and is N or more tokens past its copy on disk: that gap goes from the GPU to the disk now
             auto disk_topup_live = [&](const char* why) {
-                if (o.conversation_cache_disk_topup_tokens <= 0 || !src.with_reuse || n_st > 0) return;
-                disk_save_session(src.ids, src.imgs, src.cvec, view.checkpoints, src.session, src.draft0, why, topup_due);
+                if (!leave_saves || !src.with_reuse || n_st > 0) return;
+                disk_save_session(src.ids, src.imgs, src.cvec, view.checkpoints, src.session, src.draft0, why, leave_due);
             };
             // A park carrying its own retained K/V replaces memory the cache
             // already held, so capacity is make_room's call - it runs next either
@@ -13933,6 +14047,7 @@ int main(int argc, char** argv) {
                         nan_flush = false;
                         const size_t n_parked = conversations.clear();
                         if (disk.enabled()) disk.clear();
+                        if (prelude.enabled()) prelude.clear();
                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
                                      n_parked == 1 ? "" : "s");
@@ -14251,6 +14366,7 @@ int main(int argc, char** argv) {
                 tail_ckpt_len = -1;
                 const size_t n_parked = conversations.clear();
                 if (disk.enabled()) disk.clear();   // (--conversation-cache-disk: its copies too)
+                if (prelude.enabled()) prelude.clear();   // (--prelude-cache: the preludes too)
                 size_t n_slots = 0, n_running = 0;
                 for (BSlot& sl : bs)
                     if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
@@ -14378,6 +14494,16 @@ int main(int argc, char** argv) {
             if (disk.enabled() && stages.empty()) {
                 disk_in = disk.best(ids, req_imgs, want_cvec);
                 if (disk_in.tokens < std::max({resume, slot_tokens, parked.tokens}) + kDiskMinGain) disk_in = {};
+            }
+            // --prelude-cache: a stored prelude that resumes this prompt at least kPreludeMinGain tokens further than all
+            // of those (and than the disk tier's copy) comes back the same way, from its own store (`from_prelude`)
+            bool from_prelude = false;
+            if (prelude.enabled() && stages.empty()) {
+                const strata::core::ConversationDiskMatch pm = prelude.best(ids, req_imgs, want_cvec);
+                if (pm.tokens >= std::max({resume, slot_tokens, parked.tokens, disk_in.tokens}) + kPreludeMinGain) {
+                    disk_in = pm;
+                    from_prelude = true;
+                }
             }
             const int64_t score_prev_len = live_ok ? (int64_t) live.size() : 0;   // (the usage score: same conversation?)
             bool score_set = false;   // a conversation came back (RAM or disk) or another one borrowed: its score is set
@@ -14671,7 +14797,7 @@ int main(int argc, char** argv) {
                 if (!ok) e = "the K/V cannot grow to it";
                 std::vector<strata::core::SessionKvSink> sinks;
                 ok = ok && strata::core::conversation_kv_sinks(sinks, ss, g, disk_draft, disk_in.tokens, e) &&
-                     disk.load(disk_in, state, dcvec, sinks, dst, e) &&
+                     (from_prelude ? prelude : disk).load(disk_in, state, dcvec, sinks, dst, e) &&
                      strata::core::conversation_checkpoint_validate(state, ss, g, e) &&
                      (int64_t) state.ids.size() == disk_in.tokens;
                 if (ok) {
@@ -14684,17 +14810,23 @@ int main(int argc, char** argv) {
                     resume = disk_in.tokens;
                     from_live = false;
                     lent_slot = -1;
-                    live_score = dst.score;
+                    live_score = from_prelude ? 0 : dst.score;   // (a prelude starts another conversation, as a borrow does)
                     live_score_at = unix_now();
                     score_set = true;
-                    std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens from disk in %.1f ms, "
-                                         "read %llu MiB (its return %.0f); parked=%zu bytes=%zu\n",
-                                 (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                                 (unsigned long long) (dst.read >> 20), dst.score, conversations.size(),
-                                 conversations.bytes());
+                    if (from_prelude)
+                        std::fprintf(stderr, "strata serve: prelude cache: restored a prelude of %lld tokens in %.1f ms, "
+                                             "read %llu MiB (its use %.0f); preludes=%zu\n",
+                                     (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                     (unsigned long long) (dst.read >> 20), dst.score, prelude.usage().entries);
+                    else
+                        std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens from disk in %.1f ms, "
+                                             "read %llu MiB (its return %.0f); parked=%zu bytes=%zu\n",
+                                     (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                     (unsigned long long) (dst.read >> 20), dst.score, conversations.size(),
+                                     conversations.bytes());
                 } else {
-                    std::fprintf(stderr, "strata serve: conversation cache: disk restore failed (%s); reading the prompt\n",
-                                 e.c_str());
+                    std::fprintf(stderr, "strata serve: %s restore failed (%s); reading the prompt\n",
+                                 from_prelude ? "prelude cache:" : "conversation cache: disk", e.c_str());
                     live.clear();
                     live_imgs.clear();
                     checks.clear();
@@ -17380,9 +17512,11 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             // --conversation-cache-disk: the reply is out; the live conversation is saved when it reached a step (a request
             // that comes meanwhile waits for the write, a fraction of a second)
-            if (admit_slot < 0 && !cancelled && live_ok && stages.empty())
+            if (admit_slot < 0 && !cancelled && live_ok && stages.empty()) {
                 disk_save_session(live, live_imgs, cvec_cached, checks, ss, disk_draft, "after the reply, a step reached",
                                   step_reached);
+                prelude_save_session(live, live_imgs, cvec_cached, checks, ss, disk_draft);   // --prelude-cache: a new one
+            }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;

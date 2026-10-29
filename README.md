@@ -40,6 +40,8 @@ shows what both do in the Monitor, while keeping writes to the SSD low.
 | Change | Options (default) |
 | --- | --- |
 | **Conversation cache on disk.** Long conversations are saved on an SSD and come back from there instead of being read again. | `--conversation-cache-disk DIR` (off), `--conversation-cache-disk-mib` (32768), `--conversation-cache-disk-first-tokens` (32768), `--conversation-cache-disk-step-tokens` (16384), `--conversation-cache-disk-topup-tokens` (0: off), `--conversation-cache-disk-day-gib` (200: a warning only) |
+| **Prelude cache.** The prelude of each agent (its system prompt and tools, up to the first turn) is saved once in a folder of its own. A new chat of that agent starts after it, also after a restart, instead of reading it again. | `--prelude-cache DIR` (off), `--prelude-cache-mib` (5120) |
+| **Spill.** A conversation below the first save step is written to disk when RAM lets it go, so only the ones RAM loses are saved. | `--conversation-cache-disk-spill-tokens N` (0: off) |
 | **Smaller parked conversations in RAM.** A parked conversation keeps its last N checkpoints and its first one (the end of the system prompt) instead of all of them. Each checkpoint is about 118 MB on Qwen3.8-Flash-Next. | `--conversation-cache-park-checkpoints N` (0: all) |
 | **Clearer log.** One line for each save to disk, each restore from disk, and each conversation that leaves RAM, with whether it is on disk. | always, with the disk cache |
 | **Second GPU line.** With `--peer-device`, one line per request says where the experts ran: the main GPU's cache, the second GPU, over PCIe, or on the CPU. | always, with `--peer-device` |
@@ -52,6 +54,8 @@ shows what both do in the Monitor, while keeping writes to the SSD low.
 - Only what is new is written. The conversation is stored in blocks of 4K tokens named by their content, so a block
   already on disk is never written again. Each save adds the new blocks and one snapshot of the model's state.
 - When RAM drops a conversation, nothing is written: its copy is on disk already.
+- With `--conversation-cache-disk-spill-tokens N`, a conversation of N tokens or more that RAM drops with no copy on
+  disk is written then. The request that pushed it out waits for the write (0.26 s for 13.6K tokens).
 - When the conversation comes back, its copy goes from the disk to the GPU, and only the tokens since the last save are
   read again.
 - The copies are kept across restarts and rebuilds of the same engine version, with the same model and settings.
@@ -81,8 +85,35 @@ On one Linux PC with a PCIe 4 NVMe SSD, Qwen3.8-Flash-Next IQ3\_S, test conversa
 - A parked conversation with 9 checkpoints took 807 MB with `--conversation-cache-park-checkpoints 3`, instead of about
   1.4 GB.
 
+### The prelude cache
+
+Agents send the same system prompt and tools at the start of every new chat: 7K to 10K tokens for the agents measured
+here. Strata already keeps that part in RAM while one of the agent's conversations is parked there. The prelude cache
+keeps it on disk too, so a new chat still starts after it once those conversations have left RAM or the engine has
+restarted.
+
+- The prelude ends at the first turn boundary after the system prompt, when it is at least `--prompt-cache-root`
+  tokens long (2,048 by default). It is saved right after the reply of the first chat that reads it, once. A chat that
+  does not start with a system prompt has no prelude (the server passes the id of `system` to the engine).
+- A new chat that starts with a saved prelude, and that RAM cannot resume further, comes back from it. The Monitor counts
+  these restores and their tokens next to the RAM and disk ones.
+- The folder keeps `--prelude-cache-mib` in all (5 GiB by default, about 20 preludes of 8K tokens). The prelude used
+  least leaves first. Like the disk cache, it is kept across restarts of the same engine version, model and settings.
+
+```json
+"--prelude-cache", "/path/to/prelude-cache",
+"--prelude-cache-mib", "5120"
+```
+
+Measured on the same PC with an 8,413-token system prompt: the save took 0.2 s (235 MiB). After a restart, the
+restore took 0.19 s and the request read its prompt in 0.56 s instead of 7.4 s. The answer (a code planted in the
+system prompt) was the same text.
+
+A conversation of 13.6K tokens spilled when RAM let it go wrote 310 MiB in 0.26 s; it came back from disk in 0.21 s and
+read its prompt in 0.96 s instead of about 6.8 s.
+
 Not measured yet: days of real use, AMD (HIP), Intel (SYCL), Mac (Metal) and Windows. With a layer split across two
-GPUs (`--layer-split`) the disk cache stays off.
+GPUs (`--layer-split`) the disk cache and the prelude cache stay off.
 
 ## Models
 

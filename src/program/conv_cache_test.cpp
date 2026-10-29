@@ -151,6 +151,30 @@ int main() {
                   restore_fits(full, none, 2, 0),
               "no sample, no cards, no need: do not refuse");
     }
+    {   // --prelude-cache: the prelude ends at the first turn boundary after token 0, as the root checkpoint does
+        using strata::program::conv_cache::prelude_end;
+        constexpr int32_t T = 248045;   // <|im_start|>
+        std::vector<int32_t> ids(9000, 7);
+        ids[0] = T;
+        ids[7295] = T;   // the user turn after a 7,295-token system prompt
+        ids[8100] = T;
+        check(prelude_end(ids.data(), ids.size(), T, 2048) == 7295, "a 7,295-token system prompt: the prelude ends there");
+        check(prelude_end(ids.data(), ids.size(), T, 8000) == -1, "shorter than --prompt-cache-root: none");
+        check(prelude_end(ids.data(), ids.size(), T, 0) == -1 && prelude_end(ids.data(), ids.size(), -1, 2048) == -1,
+              "no root (--prompt-cache-root 0) or no turn token: none");
+        check(prelude_end(ids.data(), 7296, T, 2048) == -1, "nothing after the boundary: none (no reply to save it after)");
+        std::vector<int32_t> flat(9000, 7);
+        check(prelude_end(flat.data(), flat.size(), T, 2048) == -1, "a prompt with no turn boundary: none");
+        check(prelude_end(ids.data(), 1, T, 2048) == -1 && prelude_end(nullptr, 0, T, 2048) == -1, "an empty prompt: none");
+        const int32_t SYS = 8948, USER = 872;   // (any ids: the role token after the first <|im_start|>)
+        ids[0] = T; ids[1] = SYS;
+        check(prelude_end(ids.data(), ids.size(), T, 2048, SYS) == 7295, "a system turn first: its prelude");
+        ids[1] = USER;
+        check(prelude_end(ids.data(), ids.size(), T, 2048, SYS) == -1, "a user turn first (no system prompt): none");
+        check(prelude_end(ids.data(), ids.size(), T, 2048) == 7295, "no role token given: the first turn, whatever it is");
+        ids[0] = 5;
+        check(prelude_end(ids.data(), ids.size(), T, 2048, SYS) == -1, "a prompt that does not open with a turn: none");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }
