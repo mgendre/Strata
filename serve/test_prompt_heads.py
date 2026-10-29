@@ -52,11 +52,11 @@ class Heads(unittest.TestCase):
 
 class Divergences(unittest.TestCase):
     def setUp(self):
-        self.saved = (PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST)
-        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST = 10, 4, 3   # small prompts for the test
+        self.saved = (PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST, PromptHeads.WINDOW)
+        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST, PromptHeads.WINDOW = 10, 4, 3, 4   # small prompts
 
     def tearDown(self):
-        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST = self.saved
+        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST, PromptHeads.WINDOW = self.saved
 
     def test_a_history_rewritten_early_is_written_down(self):
         with tempfile.TemporaryDirectory() as d:
@@ -74,6 +74,22 @@ class Divergences(unittest.TestCase):
             self.assertIn("parted from a recent one of 52 at id 13", text)
             self.assertIn(" 104 999 106 ", text)                      # this prompt's text around the change
             self.assertIn(" 104 105 106 ", text)                      # the recent prompt's
+
+    def test_a_change_at_the_very_start_of_the_first_message_is_written_down_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = PromptHeads(d, Tok())
+            history = list(range(100, 160))
+            h.note(prompt([1, 2, 3], history))
+            h.note(prompt([1, 2, 3], [999] + history[1:] + [7, 7]))   # id 0 of the first message rewritten
+            rows = [json.loads(l) for l in (Path(d) / "divergences" / "index.jsonl").read_text().splitlines()]
+            self.assertEqual([r["common"] for r in rows], [8])         # (the system turn 6 + <|im_start|> user)
+
+    def test_kept_later(self):
+        import array
+        b = lambda xs: array.array("i", xs).tobytes()
+        old = b(list(range(0, 200)))
+        self.assertTrue(PromptHeads.kept_later(old, b([5] + list(range(1, 200)) + [9]), 0, width=8))
+        self.assertFalse(PromptHeads.kept_later(old, b([5] * 200), 0, width=8))
 
     def test_common_prefix(self):
         import array

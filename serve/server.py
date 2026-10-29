@@ -797,7 +797,7 @@ class PromptHeads:
 
     # the divergence check: prompts kept, the shortest checked, the margin before the recent prompt's end, the ids of the
     # first message the two must share (else it is another chat of the agent), the ids of text written after the change
-    RECENT, MIN_TOKENS, SLACK, FIRST, CONTEXT = 8, 8192, 4096, 64, 1200
+    RECENT, MIN_TOKENS, SLACK, FIRST, CONTEXT, WINDOW = 8, 8192, 4096, 64, 1200, 32
 
     @staticmethod
     def common_prefix(a: bytes, b: bytes) -> int:
@@ -811,9 +811,28 @@ class PromptHeads:
                 hi = mid - 1
         return lo
 
+    @staticmethod
+    def kept_later(old: bytes, new: bytes, at: int, width: int = 32) -> bool:
+        """Whether `new` still holds parts of `old` from after id `at` (a 32-id window at half, four fifths and nineteen
+        twentieths of the way to old's end): a rewritten history keeps its later turns, another chat does not."""
+        n = len(old) // 4
+        for frac in (0.5, 0.8, 0.95):
+            pos = min(at + int((n - at) * frac), n - width)    # (the window fits in old)
+            if pos <= at:
+                continue
+            win = old[4 * pos: 4 * (pos + width)]
+            if len(win) < 4 * width:
+                continue
+            i = new.find(win)
+            while i >= 0 and i % 4:                          # an id boundary only
+                i = new.find(win, i + 1)
+            if i >= 0:
+                return True
+        return False
+
     def divergence(self, ids, head_len: int) -> str | None:
-        """A conversation that changed early: this prompt shares the system turn and part of the first message with a
-        recent long prompt, but parts from it more than SLACK ids before that prompt's end (a client that rewrote its
+        """A conversation that changed early: this prompt shares the system turn (and part of the first message, or
+        later turns: kept_later) with a recent long prompt, but parts from it more than SLACK ids before that prompt's end (a client that rewrote its
         history: the engine can then only resume at a checkpoint before the change).  Writes divergences/<time>.txt
         with both texts around the change and one line in divergences/index.jsonl; the file's name, or None."""
         if len(ids) < self.MIN_TOKENS:
@@ -830,7 +849,9 @@ class PromptHeads:
         if best is None:
             return None
         old_len = len(best) // 4
-        if at < head_len + self.FIRST or at + self.SLACK >= old_len:   # another chat of the agent, or the same one going on
+        if at < head_len or at + self.SLACK >= old_len:    # another agent, or the same conversation going on
+            return None
+        if at < head_len + self.FIRST and not self.kept_later(best, cur, at, self.WINDOW):   # another chat of the agent
             return None
         old_ids = array.array("i")
         old_ids.frombytes(best)
