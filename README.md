@@ -109,7 +109,10 @@ GPU with N blocks of that GPU's own loads instead of its copy engine.
 
 **`"prompt_heads": DIR`** in the config (off). A diagnostic: each distinct system turn a request opens with is
 written to DIR once as text, with `index.json` counting how often and when it came. A diff of two files shows what an
-agent changes between sessions. Cost: system prompts stored as plain text on the local disk (at most 200 files).
+agent changes between sessions. It also writes `divergences/`: when a long prompt shares the system turn and part of
+the first message with a recent one but parts from it more than 4,096 tokens before that one's end (the client
+rewrote its history, so the engine can only resume before the change), both texts around the change. Cost: system
+prompts and those excerpts stored as plain text on the local disk (at most 200 files each).
 
 **`"elastic": true`** in the config's `vision` section, with `"elastic_idle_s"` (120). The image encoder starts with
 the first picture and stops after that many seconds without one.

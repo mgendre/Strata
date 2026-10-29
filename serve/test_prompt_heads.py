@@ -50,5 +50,39 @@ class Heads(unittest.TestCase):
             self.assertEqual(len(list(Path(d).glob("*.txt"))), 1)
 
 
+class Divergences(unittest.TestCase):
+    def setUp(self):
+        self.saved = (PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST)
+        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST = 10, 4, 3   # small prompts for the test
+
+    def tearDown(self):
+        PromptHeads.MIN_TOKENS, PromptHeads.SLACK, PromptHeads.FIRST = self.saved
+
+    def test_a_history_rewritten_early_is_written_down(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = PromptHeads(d, Tok())
+            first = list(range(100, 140))
+            h.note(prompt([1, 2, 3], first))                          # (the system turn: T SYS 1 2 3 END, 6 ids)
+            h.note(prompt([1, 2, 3], first + [7, 7]))                 # the same conversation going on
+            h.note(prompt([1, 2, 3], [500] * 40))                     # another chat of the same agent
+            self.assertFalse((Path(d) / "divergences").exists())
+            changed = first[:5] + [999] + first[6:]                  # the client rewrote id 5 of the first message
+            h.note(prompt([1, 2, 3], changed + [7, 7]))
+            rows = [json.loads(l) for l in (Path(d) / "divergences" / "index.jsonl").read_text().splitlines()]
+            self.assertEqual([(r["common"], r["head"], r["recent_tokens"]) for r in rows], [(13, 6, 52)])
+            text = (Path(d) / "divergences" / rows[0]["file"]).read_text()
+            self.assertIn("parted from a recent one of 52 at id 13", text)
+            self.assertIn(" 104 999 106 ", text)                      # this prompt's text around the change
+            self.assertIn(" 104 105 106 ", text)                      # the recent prompt's
+
+    def test_common_prefix(self):
+        import array
+        a = array.array("i", [1, 2, 3, 4, 5]).tobytes()
+        b = array.array("i", [1, 2, 3, 9]).tobytes()
+        self.assertEqual(PromptHeads.common_prefix(a, b), 3)
+        self.assertEqual(PromptHeads.common_prefix(a, a), 5)
+        self.assertEqual(PromptHeads.common_prefix(a, b""), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
