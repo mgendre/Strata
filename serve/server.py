@@ -761,6 +761,63 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+class PromptHeads:
+    """"prompt_heads": DIR (opt-in, a diagnostic): the system turn a request opens with - the agent's system prompt and
+    tools as the template renders them, the part --prelude-cache keeps - one text file per distinct one, and
+    index.json with its token count and how often and when it came.  Diff two files to see what an agent changes from
+    one session to the next (a date, a folder) and so why its next chat cannot start after the stored prelude.  At
+    most `cap` text files; past that the index still counts."""
+    TURN_ID = 248045                                    # <|im_start|> (the engine's --turn-token)
+
+    def __init__(self, folder, tok, cap: int = 200):
+        self.dir = Path(folder)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.tok, self.cap = tok, cap
+        role = tok.encode("system", parse_special=True)
+        self.system_id = role[0] if len(role) == 1 else None
+        self.lock = threading.Lock()
+        self.path = self.dir / "index.json"
+        try:
+            self.index = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.index = {}
+        self.saved_at = 0.0
+
+    def head(self, ids) -> list[int] | None:
+        """The system turn's ids (up to the next <|im_start|>), or None for a prompt that does not open with one."""
+        if self.system_id is None or len(ids) < 3 or ids[0] != self.TURN_ID or ids[1] != self.system_id:
+            return None
+        for i in range(2, len(ids)):
+            if ids[i] == self.TURN_ID:
+                return list(ids[:i])
+        return None
+
+    def note(self, ids) -> str | None:
+        """Count the request's system turn; its key, or None."""
+        head = self.head(ids)
+        if head is None:
+            return None
+        key = hashlib.sha1(",".join(map(str, head)).encode()).hexdigest()[:16]
+        now = time.time()
+        with self.lock:
+            e = self.index.get(key)
+            new = e is None
+            if new:
+                e = self.index[key] = {"tokens": len(head), "first": round(now), "count": 0, "file": None}
+                if sum(1 for v in self.index.values() if v.get("file")) < self.cap:
+                    name = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}-{key}.txt"
+                    (self.dir / name).write_text(self.tok.decode(head), encoding="utf-8")
+                    e["file"] = name
+            e["count"] += 1
+            e["last"] = round(now)
+            if new or now - self.saved_at >= 30:
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self.index, indent=1), encoding="utf-8")
+                os.replace(tmp, self.path)
+                self.saved_at = now
+        return key
+
+
 class ConvCacheLog:
     """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
@@ -2805,6 +2862,16 @@ def vision_start_error(line: str, log=None, code: int | None = None, waited: flo
     return msg
 
 
+def vision_elastic_off(cfg: dict, vcfg: dict) -> str | None:
+    """Why the vision section's "elastic" cannot apply, or None.  An encoder on a GPU takes its VRAM from the expert
+    cache, which needs "vram_elastic"; one on the CPU (no "gpu": true) needs no VRAM and starts and stops all the same,
+    also beside --peer-device, which keeps --vram-elastic off."""
+    if vcfg.get("elastic") is True and vcfg.get("gpu") and cfg.get("vram_elastic") is not True:
+        return ('the vision section\'s "elastic" needs "vram_elastic": true for an encoder on the GPU (the expert cache '
+                "gives it its VRAM): the encoder starts with the model instead")
+    return None
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -2847,6 +2914,9 @@ class Vision:
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
         self.max_tokens = self.token_limit(cfg)
         self.elastic = cfg.get("elastic") is True
+        # the reader runs on a GPU (reader_args' --gpu): an elastic one takes its VRAM from the expert cache.  A CPU
+        # reader needs none, so it starts and stops with the pictures whatever the engine's VRAM can do
+        self.on_gpu = bool(cfg.get("gpu"))
         self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         if not lazy and not self.elastic:
@@ -4229,6 +4299,7 @@ class Service:
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.
         self.prompts = None
+        self.prompt_heads: PromptHeads | None = None    # "prompt_heads": DIR (main)
         if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
             from strata_tokenizer import PromptEncoder
             # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
@@ -4490,7 +4561,7 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
-        if hasattr(self.engine, "vram") and self.loaded():
+        if getattr(v, "on_gpu", True) and hasattr(self.engine, "vram") and self.loaded():
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
@@ -4567,8 +4638,10 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False):
             return
+        held = (f"while it runs the expert cache keeps {v.elastic_mib} MiB free for it" if getattr(v, "on_gpu", True)
+                else "it runs on the CPU, so it takes RAM only while it runs and no VRAM")
         print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
-              f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
+              f"without one; {held}", flush=True)
 
         def loop():
             while True:
@@ -5101,9 +5174,16 @@ class Service:
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
         if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
-            return self.prompts.encode(prompt, plain, store)
-        return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
-            self.tok.encode(prompt, parse_special=True)
+            ids = self.prompts.encode(prompt, plain, store)
+        else:
+            ids = self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
+                self.tok.encode(prompt, parse_special=True)
+        if store and self.prompt_heads is not None:
+            try:
+                self.prompt_heads.note(ids)
+            except OSError as e:                # a diagnostic: a full disk never fails the request
+                print(f"[strata] prompt_heads: {e}", flush=True)
+        return ids
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
@@ -9100,11 +9180,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
             if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
                 vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
+            why = vision_elastic_off(cfg, vcfg)
+            if why:
+                print(f"[strata] {why}", flush=True)
                 vcfg["elastic"] = False
-            elif vcfg.get("elastic") is True and layer_split_of(cfg):
+            elif vcfg.get("elastic") is True and vcfg.get("gpu") and layer_split_of(cfg):
                 # the engine turns --vram-elastic off on a layer split (a cache per GPU): the encoder still starts
                 # with the first picture and stops when idle, but its VRAM has to be free already
                 print('[strata] images: on a layer split the expert cache cannot make room for the image encoder (the '
@@ -9190,6 +9270,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
+    if cfg.get("prompt_heads"):
+        svc.prompt_heads = PromptHeads(cfg["prompt_heads"], tok)
+        print(f"[strata] prompt_heads: each distinct system turn goes to {cfg['prompt_heads']} (index.json counts them)",
+              flush=True)
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
         # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
         # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.
