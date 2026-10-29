@@ -120,6 +120,18 @@ int main() {
               "pressure drops retained storage before evicting parked conversations");
     }
     const std::vector<int64_t> a = {1, 2, 3, 4}, b = {9, 8, 7, 6};
+    {   // drop_covered: the older copies of a conversation whose last turn the client re-rendered go when it parks
+        ConversationCache cache(1 << 20, 6);
+        check(cache.put(image({1, 2, 3, 4, 5, 6, 7, 8, 50, 51})), "the older copy (its last turn 50 51)");
+        check(cache.put(image({1, 2, 90, 91, 92, 93, 94, 95})), "another conversation on the same system prompt (1 2)");
+        check(cache.put(image({1, 2, 3})), "a short one that the outgoing shares all of");
+        std::vector<int32_t> outgoing{1, 2, 3, 4, 5, 6, 7, 8, 60, 61, 62};
+        check(cache.drop_covered(outgoing, {}, true, 2) == 2 && cache.size() == 1,
+              "the older copy and the short covered one go; the other conversation stays");
+        check(cache.drop_covered(outgoing, {}, false, 2) == 0, "a copy with another control vector stays");
+        check(cache.put(image({1, 2, 3, 4, 5, 6, 7, 8, 50, 51})), "the older copy again");
+        check(cache.drop_covered(outgoing, {}, true, 1) == 0, "beyond the slack (2 tokens past the shared 8): kept");
+    }
     {   // shared_elsewhere: what another parked copy holds of an outgoing one (the spill skips older sibling copies)
         ConversationCache cache(1 << 20, 4);
         std::int64_t seen = -1;
