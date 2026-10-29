@@ -27,6 +27,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import collections
 import base64
@@ -764,7 +765,8 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 class PromptHeads:
     """"prompt_heads": DIR (opt-in, a diagnostic): the system turn a request opens with - the agent's system prompt and
     tools as the template renders them, the part --prelude-cache keeps - one text file per distinct one, and
-    index.json with its token count and how often and when it came.  Diff two files to see what an agent changes from
+    index.json with its token count and how often and when it came.  Also divergences/: a conversation whose history
+    the client rewrote early (see divergence()).  Diff two files to see what an agent changes from
     one session to the next (a date, a folder) and so why its next chat cannot start after the stored prelude.  At
     most `cap` text files; past that the index still counts."""
     TURN_ID = 248045                                    # <|im_start|> (the engine's --turn-token)
@@ -782,6 +784,7 @@ class PromptHeads:
         except (OSError, ValueError):
             self.index = {}
         self.saved_at = 0.0
+        self.recent: list[bytes] = []                   # the last RECENT long prompts' ids, for divergence()
 
     def head(self, ids) -> list[int] | None:
         """The system turn's ids (up to the next <|im_start|>), or None for a prompt that does not open with one."""
@@ -792,11 +795,91 @@ class PromptHeads:
                 return list(ids[:i])
         return None
 
+    # the divergence check: prompts kept to compare with, their shortest, the margin before the recent prompt's end, the
+    # ids of text written after the change, the window kept_later looks for
+    RECENT, MIN_TOKENS, SLACK, CONTEXT, WINDOW = 8, 8192, 4096, 1200, 32
+
+    @staticmethod
+    def common_prefix(a: bytes, b: bytes) -> int:
+        """The longest common prefix of two int32 id arrays (as bytes), in ids: a binary search over slice equality."""
+        lo, hi = 0, min(len(a), len(b)) // 4
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:4 * mid] == b[:4 * mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    @staticmethod
+    def kept_later(old: bytes, new: bytes, at: int, width: int = 32) -> bool:
+        """Whether `new` still holds parts of `old` from after id `at` (a 32-id window at half, four fifths and nineteen
+        twentieths of the way to old's end): a rewritten history keeps its later turns, another chat does not."""
+        n = len(old) // 4
+        for frac in (0.5, 0.8, 0.95):
+            pos = min(at + int((n - at) * frac), n - width)    # (the window fits in old)
+            if pos <= at:
+                continue
+            win = old[4 * pos: 4 * (pos + width)]
+            if len(win) < 4 * width:
+                continue
+            i = new.find(win)
+            while i >= 0 and i % 4:                          # an id boundary only
+                i = new.find(win, i + 1)
+            if i >= 0:
+                return True
+        return False
+
+    def divergence(self, ids, head_len: int) -> str | None:
+        """A conversation that changed early: this prompt (of any length) shares the system turn and still holds later
+        parts (kept_later) of a recent long prompt (MIN_TOKENS or more), but parts from it more than SLACK ids before that prompt's end (a client that rewrote its
+        history: the engine can then only resume at a checkpoint before the change).  Writes divergences/<time>.txt
+        with both texts around the change and one line in divergences/index.jsonl; the file's name, or None."""
+        cur = array.array("i", ids).tobytes()
+        best, at = None, -1
+        for old in reversed(self.recent):                   # the newest first: it wins a tie
+            c = self.common_prefix(cur, old)
+            if c > at:
+                best, at = old, c
+        if len(ids) >= self.MIN_TOKENS:                     # only long prompts are kept to compare with; any prompt is
+            self.recent.append(cur)                         # checked (a rewrite that clears an old tool output shrinks it)
+            if len(self.recent) > self.RECENT:
+                self.recent.pop(0)
+        if best is None:
+            return None
+        old_len = len(best) // 4
+        if at < head_len or at + self.SLACK >= old_len:    # another agent, or the same conversation going on
+            return None
+        if not self.kept_later(best, cur, at, self.WINDOW):  # another chat of the agent (a new subagent on the same task
+            return None                                      # shares the first message's start, not the later turns)
+        old_ids = array.array("i")
+        old_ids.frombytes(best)
+        span = lambda xs: self.tok.decode(list(xs[max(0, at - 200): at + self.CONTEXT]))
+        now = time.time()
+        name = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}-{at}.txt"
+        d = self.dir / "divergences"
+        d.mkdir(exist_ok=True)
+        if len(list(d.glob("*.txt"))) < self.cap:
+            (d / name).write_text(
+                f"A prompt of {len(ids)} ids parted from a recent one of {old_len} at id {at} (system turn: "
+                f"{head_len}).\n\n===== the recent prompt, from 200 ids before the change =====\n{span(old_ids)}\n\n"
+                f"===== this prompt, from 200 ids before the change =====\n{span(ids)}\n", encoding="utf-8")
+        else:
+            name = None
+        with open(d / "index.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"time": round(now), "tokens": len(ids), "recent_tokens": old_len, "common": at,
+                                "head": head_len, "file": name}) + "\n")
+        print(f"[strata] prompt_heads: a conversation changed at id {at} of {old_len} (system turn {head_len}); "
+              f"{'divergences/' + name if name else 'the file cap is reached'}", flush=True)
+        return name
+
     def note(self, ids) -> str | None:
         """Count the request's system turn; its key, or None."""
         head = self.head(ids)
         if head is None:
             return None
+        with self.lock:
+            self.divergence(ids, len(head))
         key = hashlib.sha1(",".join(map(str, head)).encode()).hexdigest()[:16]
         now = time.time()
         with self.lock:
