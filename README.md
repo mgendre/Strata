@@ -83,6 +83,9 @@ stops.
 cannot take, with no copy on disk is saved then, so the mid-size ones below the first step are not lost.
 - Gain: a 13.6K-token conversation came back from disk in 0.21 s and read its prompt in 0.96 s instead of about 6.8 s.
 - Cost: the request that pushed it out waits for the write (0.26 s, 310 MiB for 13.6K tokens).
+- A copy that leaves RAM while a newer copy of the same conversation is still kept (the live one, or another parked
+  copy holding all of it but its last few thousand tokens) is not spilled: agent clients that re-render the last
+  turn make the engine borrow from the old copy and park a new one, and only the newest is worth saving.
 
 **`--conversation-cache-park-checkpoints N`** (0: all). A conversation parked in RAM keeps its last N checkpoints and
 its first one instead of all of them (118 MB each on Qwen3.8-Flash-Next).

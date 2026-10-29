@@ -10596,6 +10596,7 @@ int main(int argc, char** argv) {
                    n - saved >= o.conversation_cache_disk_topup_tokens;
         };
         // --conversation-cache-disk-spill-tokens: a conversation RAM lets go with no copy on disk, from that size on
+        constexpr int64_t kSpillCoveredSlack = 4096;   // a disk block: what an older sibling copy may hold beyond a newer one
         auto spill_due = [&](int64_t n, int64_t saved) {
             return o.conversation_cache_disk_spill_tokens > 0 && n >= o.conversation_cache_disk_spill_tokens && saved == 0;
         };
@@ -10690,6 +10691,20 @@ int main(int argc, char** argv) {
             const std::vector<ImgKey> dimgs = below(image.live.imgs, n);
             const int64_t saved = disk.saved_tokens(dids, dimgs, image.cvec);
             if (!leave_due(n, saved)) return;
+            if (saved == 0 && spill_due(n, saved) && !topup_due(n, saved)) {
+                // no spill for an older copy of a conversation that is still here: the live session or another parked
+                // copy holds all of it but its last reply (within one disk block); that one is saved when it goes
+                int64_t covered = conversations.shared_elsewhere(image);
+                const size_t m = std::min(live.size(), image.live.ids.size());
+                size_t k = 0;
+                while (k < m && live[k] == image.live.ids[k]) ++k;
+                covered = std::max<int64_t>(covered, (int64_t) k);
+                if (covered + kSpillCoveredSlack >= n) {
+                    std::fprintf(stderr, "strata serve: conversation cache: no spill for %lld tokens: a newer copy holds %lld "
+                                         "of them\n", (long long) n, (long long) covered);
+                    return;
+                }
+            }
             disk_save(dids, dimgs, image.cvec, state, strata::core::conversation_image_sources(image),
                       score_now(image.score, image.score_at), saved == 0 && spill_due(n, saved) ? "spill" : why);
         };

@@ -1,5 +1,6 @@
 #include "strata/core/conversation_cache.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -119,6 +120,16 @@ int main() {
               "pressure drops retained storage before evicting parked conversations");
     }
     const std::vector<int64_t> a = {1, 2, 3, 4}, b = {9, 8, 7, 6};
+    {   // shared_elsewhere: what another parked copy holds of an outgoing one (the spill skips older sibling copies)
+        ConversationCache cache(1 << 20, 4);
+        std::int64_t seen = -1;
+        cache.on_evict([&](SavedConversation& out, const char*) { seen = cache.shared_elsewhere(out); });
+        check(cache.put(image({1, 2, 3, 4, 50, 51})), "park the older copy (its last reply 50 51)");
+        check(cache.put(image({1, 2, 3, 4, 60, 61, 62})), "park the newer sibling (the reply resent as 60 61 62)");
+        check(cache.put(image({9, 9, 9})), "park another conversation");
+        check(cache.evict_oldest("slots") && seen == 4, "the oldest copy shares 4 tokens with its newer sibling");
+        check(cache.evict_oldest("slots") && seen == 0, "the sibling shares nothing with the other conversation");
+    }
     {
         ConversationCache cache(1024, 2);
         check(cache.put(image({1, 2, 3})), "park A");

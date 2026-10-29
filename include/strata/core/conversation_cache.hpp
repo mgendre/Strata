@@ -441,6 +441,20 @@ public:
     // --conversation-cache-disk: called with each conversation evict_oldest pushes out, before it is dropped (the
     // disk level keeps it).  Unset (the default): dropped as before.  It must not throw.
     void on_evict(std::function<void(SavedConversation&, const char*)> f) { on_evict_ = std::move(f); }
+    /// The longest prefix of `out`'s live tokens that another entry (not `out` itself) holds in its live state: an
+    /// older copy of a conversation whose newer copy is still parked (the client resent the history without the
+    /// copy's last reply, so the newer one is a sibling, not a superset) shares all but that reply with it.
+    int64_t shared_elsewhere(const SavedConversation& out) const {
+        int64_t best = 0;
+        for (const auto& e : entries_) {
+            if (&e == &out) continue;
+            const size_t n = std::min(e.live.ids.size(), out.live.ids.size());
+            size_t k = 0;
+            while (k < n && e.live.ids[k] == out.live.ids[k]) ++k;
+            best = std::max<int64_t>(best, (int64_t) k);
+        }
+        return best;
+    }
 
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
