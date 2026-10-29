@@ -912,6 +912,17 @@ DISK_RESTORE = re.compile(r"restored \d+ tokens from disk\b")
 LEFT_RAM = re.compile(r"conversation cache: left RAM \([^)]*\): \d+ tokens, (on disk|not on disk)")
 
 
+def prelude_cache_dir(engine) -> str | None:
+    """--prelude-cache DIR from the engine's arguments (its status.json is there, in the disk tier's format), or None."""
+    spawn = getattr(engine, "spawn", None)
+    args = spawn[1] if spawn and len(spawn) > 2 and isinstance(spawn[1], (list, tuple)) else []
+    if "--prelude-cache" in args[:-1]:
+        folder = str(args[args.index("--prelude-cache") + 1])
+        cwd = spawn[2] if isinstance(spawn[2], str) else None
+        return folder if os.path.isabs(folder) or not cwd else os.path.join(cwd, folder)
+    return None
+
+
 def conversation_disk_dir(engine) -> str | None:
     """--conversation-cache-disk DIR from the engine's arguments (its status.json is there), or None."""
     spawn = getattr(engine, "spawn", None)
@@ -1040,11 +1051,13 @@ def long_read_speed(hist: list) -> float | None:
 
 
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, disk: dict | None = None,
-                            device: dict | None = None, history: list | None = None) -> dict:
+                            device: dict | None = None, history: list | None = None,
+                            prelude: dict | None = None) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back.
     With --conversation-cache-disk: its levels, counters and copies (`disk`, the engine's status.json), the disk's
-    writes since boot (`device`) and the usage samples of the last day (`history`)."""
+    writes since boot (`device`) and the usage samples of the last day (`history`); with --prelude-cache, its
+    copies (`prelude`, its status.json) for the list of what came back.""" 
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
     view = {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
@@ -1058,7 +1071,9 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, 
                         # what reading a long prompt again costs, for the time a copy saved (tokens it gave back /
                         # speed): reads of LONG_READ tokens or more only - short reads are mostly a request's fixed
                         # cost and would make the saving look about twice as large
-                        "prompt_tok_s": long_read_speed(hist)}
+                        "prompt_tok_s": long_read_speed(hist),
+                        # --prelude-cache: its copies too, for the card's list of what came back
+                        "prelude_entries": (prelude or {}).get("entries") or []}
     return view
 
 
@@ -4215,6 +4230,7 @@ class Service:
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.conv_disk = ConvDiskStatus()               # --conversation-cache-disk: the engine's status.json
+        self.prelude_disk = ConvDiskStatus()            # --prelude-cache: its status.json (the same format)
         self.cache_history = CacheHistory()             # ... and the usage samples of the last day (start_cache_history)
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
@@ -5056,10 +5072,11 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         folder = conversation_disk_dir(self.engine)
         disk = self.conv_disk.read(folder)
+        prelude = self.prelude_disk.read(prelude_cache_dir(self.engine))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked, disk,
                                                               disk_written_since_boot(folder) if disk else None,
-                                                              self.cache_history.view() if disk else None),
+                                                              self.cache_history.view() if disk else None, prelude),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}

@@ -564,24 +564,28 @@ function renderWrites(d, hours) {
     }
   }
 }
-function renderDiskTable(d) {   // the 10 conversations on disk read back most recently (the copies never read back are left out)
+function renderDiskTable(d) {   // the 10 copies read back most recently: conversations on disk and preludes (never read back: left out)
   const table = $("cc-disk-table"), speed = d.prompt_tok_s;
-  const rows = (d.entries || []).filter((e) => e.returns > 0).sort((a, b) => b.last_used - a.last_used).slice(0, 10);
+  const rows = [...(d.entries || []).map((e) => ({...e, from: "Disk"})),
+                ...(d.prelude_entries || []).map((e) => ({...e, from: "Prelude"}))]
+    .filter((e) => e.returns > 0).sort((a, b) => b.last_used - a.last_used).slice(0, 10);
   table.replaceChildren();
   const s = d.since_start || {};
-  $("cc-dsk-sum").textContent = `${fmt(d.disk.entries)} on disk · served ${fmt(s.tokens)} tokens since start`;
+  const pre = (d.prelude_entries || []).length;
+  $("cc-dsk-sum").textContent = `${fmt(d.disk.entries)} on disk${pre ? ` · ${fmt(pre)} preludes` : ""} · served ` +
+                                `${fmt(s.tokens)} tokens since start`;
   if (!rows.length) {
     const td = table.insertRow().insertCell();
-    td.textContent = "None yet: no conversation on disk has come back from it.";
+    td.textContent = "None yet: no conversation on disk and no prelude has come back from it.";
     return;
   }
-  const cols = [["Conversation", false], ["Tokens", true], ["Returns", true], ["Tokens served", true],
+  const cols = [["Conversation", false], ["From", false], ["Tokens", true], ["Returns", true], ["Tokens served", true],
                 ["Time saved", true], ["Last used", false]];
   const head = table.insertRow();
   for (const [text, num] of cols) { const th = document.createElement("th"); th.textContent = text; if (num) th.className = "num"; head.appendChild(th); }
   rows.forEach((e) => {
     const row = table.insertRow();
-    const cells = [`#${e.id.slice(-6)}`, fmt(e.tokens), fmt(e.returns), fmt(e.served_tokens),
+    const cells = [`#${e.id.slice(-6)}`, e.from, fmt(e.tokens), fmt(e.returns), fmt(e.served_tokens),
                    speed && e.served_tokens ? dur(e.served_tokens / speed) : "–", since(e.last_used)];
     cells.forEach((text, i) => {
       const td = row.insertCell();

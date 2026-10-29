@@ -198,12 +198,13 @@
           </div>
         </div>
         <div class="cc-list cc-disk-only">
-          <div class="cc-chart-head"><span class="cc-chart-title">Read back from disk</span>
+          <div class="cc-chart-head"><span class="cc-chart-title">Read back from disk and preludes</span>
             <span class="muted small" id="cc-dsk-sum"></span></div>
           <div class="cc-table-wrap"><table class="cc-table" id="cc-disk-table"></table></div>
-          <p class="muted small cc-note">The 10 conversations on disk that came back from it most recently (by their last
-            use). Returns: times it came back from disk. Tokens served: all those returns together. Time saved: those
-            tokens at the speed of a long prompt read.</p>
+          <p class="muted small cc-note">The 10 copies that came back most recently (by their last use): conversations
+            from the disk cache and agents' preludes (system prompt and tools) from the prelude cache. Returns: times it
+            came back. Tokens served: all those returns together. Time saved: those tokens at the speed of a long prompt
+            read.</p>
         </div>
         <p class="muted small cc-note" id="cc-note"></p>
       </div>
