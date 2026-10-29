@@ -166,6 +166,14 @@ int main() {
         std::vector<int32_t> flat(9000, 7);
         check(prelude_end(flat.data(), flat.size(), T, 2048) == -1, "a prompt with no turn boundary: none");
         check(prelude_end(ids.data(), 1, T, 2048) == -1 && prelude_end(nullptr, 0, T, 2048) == -1, "an empty prompt: none");
+        const int32_t SYS = 8948, USER = 872;   // (any ids: the role token after the first <|im_start|>)
+        ids[0] = T; ids[1] = SYS;
+        check(prelude_end(ids.data(), ids.size(), T, 2048, SYS) == 7295, "a system turn first: its prelude");
+        ids[1] = USER;
+        check(prelude_end(ids.data(), ids.size(), T, 2048, SYS) == -1, "a user turn first (no system prompt): none");
+        check(prelude_end(ids.data(), ids.size(), T, 2048) == 7295, "no role token given: the first turn, whatever it is");
+        ids[0] = 5;
+        check(prelude_end(ids.data(), ids.size(), T, 2048, SYS) == -1, "a prompt that does not open with a turn: none");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

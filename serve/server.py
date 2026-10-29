@@ -768,6 +768,9 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # --prelude-cache: "prelude cache: restored a prelude of N tokens in ..." (a new chat that started after an agent's
+    # system prompt read from its own store)
+    PRELUDE = re.compile(r"prelude cache: restored a prelude of (\d+) tokens")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -778,9 +781,10 @@ class ConvCacheLog:
     def reset(self):
         # restores: from RAM; restores_disk: from --conversation-cache-disk ("restored N tokens from disk");
         # tokens_ram: the tokens the RAM restores gave back
+        # restores_prelude / tokens_prelude: --prelude-cache's restores and the tokens they gave back
         # left_*: --conversation-cache-disk's "left RAM (why): N tokens, on disk M behind | not on disk (...)"
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "restores_disk": 0,
-                      "tokens_ram": 0, "left_ram": 0, "left_on_disk": 0, "left_not_saved": 0,
+                      "restores_prelude": 0, "tokens_prelude": 0, "tokens_ram": 0, "left_ram": 0, "left_on_disk": 0, "left_not_saved": 0,
                       "last_event": None, "last_tokens": None, "last_at": None, "last_source": None}
 
     def poll(self, path, start) -> dict:
@@ -809,6 +813,13 @@ class ConvCacheLog:
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
+            m = self.PRELUDE.search(line) if "prelude cache:" in line else None
+            if m:
+                st = self.state
+                st["restores_prelude"] += 1
+                st["tokens_prelude"] += int(m.group(1))
+                st["last_event"], st["last_tokens"], st["last_at"], st["last_source"] = "restored", int(m.group(1)), now, "prelude"
+                continue
             if "conversation cache:" not in line:
                 continue
             m = self.EVENT.search(line)
@@ -3227,6 +3238,22 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
           "changing it keeps the cached conversation", flush=True)
     return ["--tail-role-token", str(role[0])]
+
+
+def system_role_args(cfg: dict, exe: str, tok) -> list[str]:
+    """--prelude-cache: the id of "system" as --system-role-token, so the engine keeps a prelude only for a chat that
+    opens with a system turn (a chat without one would store its first user message); [] without the prelude cache,
+    with an engine too old for the flag, or a tokenizer that splits "system"."""
+    args = cfg.get("args") or []
+    if "--prelude-cache" not in args or "--system-role-token" in args:
+        return []
+    try:
+        with open(engine_binary(exe, cfg), "rb") as f:
+            known = b"--system-role-token" in f.read()
+    except OSError:
+        known = False
+    role = tok.encode("system", parse_special=True)
+    return ["--system-role-token", str(role[0])] if known and len(role) == 1 else []
 
 
 def engine_silence_s(cfg: dict) -> float:
@@ -9133,6 +9160,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
+        effort_end = (effort_end or []) + system_role_args(cfg, exe, tok)
         from serve import replicas as rp
         try:
             groups = rp.gpu_groups(cfg)
