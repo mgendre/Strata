@@ -593,7 +593,7 @@ function renderConvDisk(c) {
   if (!d) return;
   const now = d.time || Date.now() / 1000;
   const s = d.since_start || {};
-  const ram = c.tokens_ram || 0, dsk = s.tokens || 0, all = ram + dsk;
+  const ram = c.tokens_ram || 0, dsk = s.tokens || 0, pre = c.tokens_prelude || 0, all = ram + dsk + pre;
   const share = (n) => `${fmt(all ? (100 * n) / all : 0)}%`;
   const over = d.day_guide_bytes > 0 && d.written_today > d.day_guide_bytes;
   const warn = $("cc-disk-warn");
@@ -601,8 +601,10 @@ function renderConvDisk(c) {
   if (over) warn.innerHTML = `${icon("warning", "st-icon st-icon--sm")}<span>Over the daily guide: ${esc(tb(d.written_today))} written to disk today (guide ${esc(tb(d.day_guide_bytes, 0))}). Writing goes on.</span>`;
   const speed = d.prompt_tok_s;
   facts($("cc-disk-facts"), [
-    ["Restored from", `RAM ${fmt(c.restores)} · disk ${fmt(s.restores)}`],
-    ["Tokens given back", all ? `RAM ${share(ram)} · disk ${share(dsk)} (${fmt(all)} tokens)` : null],
+    ["Restored from", `RAM ${fmt(c.restores)} · disk ${fmt(s.restores)}` +
+                      (c.restores_prelude ? ` · preludes ${fmt(c.restores_prelude)}` : "")],
+    ["Tokens given back", all ? `RAM ${share(ram)} · disk ${share(dsk)}` + (pre ? ` · preludes ${share(pre)}` : "") +
+                          ` (${fmt(all)} tokens)` : null],
     ["Time saved by the disk", speed && dsk ? `about ${dur(dsk / speed)} of prompt reading (at ${fmt(speed)} tok/s)` : null],
     ["Written to disk", `today ${tb(d.written_today)} (guide ${tb(d.day_guide_bytes, 0)}) · since start ${tb(s.written)} · all time ${tb(d.written_all_time)}`],
     ["Saves", `${fmt(s.saves)} since start · ${tb(s.reused)} already on disk (not written again)`],
