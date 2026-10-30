@@ -24,7 +24,7 @@ slow link.
 | **Second GPU refill by SM loads.** With `--peer-device`, the experts copied into the second GPU no longer hold back that card's work. | `--peer-refill-sm N` |
 | **Image encoder on the CPU, started on demand.** `"elastic": true` now works for a CPU encoder, also with `--peer-device`. | `"elastic": true` (config, `vision` section) |
 | **No expert on both GPUs.** The main GPU no longer takes an expert that is being copied into the second GPU. | always, with `--peer-device` |
-| **A second GPU on a slow PCIe link waits less: its rows go straight to RAM, its input is quantized on the host.** For a second GPU in a chipset or x4 slot, where every layer's input and results crossing the link hold up decode. It writes its expert rows into RAM as whole 128-byte lines while it computes, and gets its input already quantized (3.5x fewer bytes). The same bits; decode windows about 4% shorter on a PCIe 4.0 x4 link. | always, with `--peer-device` (`STRATA_PEER_DOWN_HOST=0` / `STRATA_PEER_HOST_Q8=0` turn either off) |
+| **Less waiting for a second GPU on a slow PCIe link.** Nothing to set. At every layer of every token, the PC sends the second GPU its share of the work and waits for the results. The package sent is now 3.5 times smaller (converted by the CPU before it leaves), and the results come back while the card computes instead of in a separate copy afterwards. The same results, bit for bit; decode about 4% faster with the reference PC's RTX 3060 on PCIe 4.0 x4. | always, with `--peer-device` |
 | **Second GPU line.** One log line per request: where the experts ran (main GPU, second GPU, PCIe, CPU) and how long the CPU waited for the second GPU. | always, with `--peer-device` |
 | **Prompt reads skip the experts no token uses** (taken from upstream PR [#4283](https://github.com/Niko1221/Strata/pull/4283), by [@bitaccesscomau](https://github.com/bitaccesscomau); see below). A prompt chunk of 1,024 tokens or more no longer copies over PCIe the experts no token of the chunk routes to. The same bits. | `STRATA_PREFILL_ROUTED_STREAM=1` (env) |
 | **Monitor.** A widget per GPU under the tiles: its role (model, peer experts for the second GPU, layer split), load, VRAM, temperature, power, and PCIe traffic each way as a share of its link (Gen4 x16 about 30 GB/s each way, x4 about 7.5). The Conversation cache card has a small graph per store on disk (conversations, preludes): the prompt tokens it gave back each hour of the last day, and a line of what it wrote. A Disk write card sits next to Disk read, with what the disks took over the last 24 hours. | always |
@@ -108,8 +108,13 @@ card waited behind the whole round (0.11 ms alone, 23 ms during a round of 72 co
   copies. 4 reach the full speed of a PCIe 4.0 x4 link (6.0 GB/s), so more would only take cores from the experts. A
   wider link (x8, x16) may need more blocks; not measured. Reference PC: 4.
 
-**Always on with `--peer-device`: the second GPU's rows and input, for a card on a slow PCIe link.** A second GPU
-computes its share of every layer's experts, and the CPU waits for its results before the layer can finish. When that
+**Always on with `--peer-device`, nothing to set: less waiting for a second GPU on a slow PCIe link.** In plain
+words: at every layer of every token (48 layers per token), the PC sends the second GPU the data for its share of the
+work, the card computes, and it sends the results back; the CPU waits for them before the layer can finish. Two things
+changed: the data is converted to the card's compact format by the CPU before it is sent (3.5 times fewer bytes on
+the link), and the results are written straight into the PC's RAM as they are computed (no separate copy at the end).
+The details: a second GPU computes its share of every layer's experts, and the CPU waits for its results before the
+layer can finish. When that
 card sits in a chipset or x4 slot (the reference PC's RTX 3060: PCIe 4.0 x4, through the X570 chipset), the link is
 narrow, so the input going in and the rows coming back are a real part of that wait, at every layer of every token.
 Its share used to be copied in as floats, quantized there, computed into its memory, then scattered to RAM over its
