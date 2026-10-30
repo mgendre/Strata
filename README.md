@@ -24,7 +24,7 @@ slow link.
 | **Second GPU refill by SM loads.** With `--peer-device`, the experts copied into the second GPU no longer hold back that card's work. | `--peer-refill-sm N` |
 | **Image encoder on the CPU, started on demand.** `"elastic": true` now works for a CPU encoder, also with `--peer-device`. | `"elastic": true` (config, `vision` section) |
 | **No expert on both GPUs.** The main GPU no longer takes an expert that is being copied into the second GPU. | always, with `--peer-device` |
-| **Less waiting for a second GPU on a slow PCIe link.** Nothing to set. At every layer of every token, the PC sends the second GPU its share of the work and waits for the results. The package sent is now 3.5 times smaller (converted by the CPU before it leaves), and the results come back while the card computes instead of in a separate copy afterwards. The same results, bit for bit; decode about 4% faster with the reference PC's RTX 3060 on PCIe 4.0 x4. | always, with `--peer-device` |
+| **Less waiting for a second GPU on a slow PCIe link.** At every layer of every token, the PC sends the second GPU its share of the work and waits for the results. The package sent is now 3.5 times smaller (converted by the CPU before it leaves), and the results come back while the card computes instead of in a separate copy afterwards. The same results, bit for bit; decode about 4% faster with the reference PC's RTX 3060 on PCIe 4.0 x4. | `--peer-slow-link` (with `--peer-device`) |
 | **Second GPU line.** One log line per request: where the experts ran (main GPU, second GPU, PCIe, CPU) and how long the CPU waited for the second GPU. | always, with `--peer-device` |
 | **Prompt reads skip the experts no token uses** (taken from upstream PR [#4283](https://github.com/Niko1221/Strata/pull/4283), by [@bitaccesscomau](https://github.com/bitaccesscomau); see below). A prompt chunk of 1,024 tokens or more no longer copies over PCIe the experts no token of the chunk routes to. The same bits. | `STRATA_PREFILL_ROUTED_STREAM=1` (env) |
 | **Monitor.** A widget per GPU under the tiles: its role (model, peer experts for the second GPU, layer split), load, VRAM, temperature, power, and PCIe traffic each way as a share of its link (Gen4 x16 about 30 GB/s each way, x4 about 7.5). The Conversation cache card has a small graph per store on disk (conversations, preludes): the prompt tokens it gave back each hour of the last day, and a line of what it wrote. A Disk write card sits next to Disk read, with what the disks took over the last 24 hours. | always |
@@ -108,7 +108,7 @@ card waited behind the whole round (0.11 ms alone, 23 ms during a round of 72 co
   copies. 4 reach the full speed of a PCIe 4.0 x4 link (6.0 GB/s), so more would only take cores from the experts. A
   wider link (x8, x16) may need more blocks; not measured. Reference PC: 4.
 
-**Always on with `--peer-device`, nothing to set: less waiting for a second GPU on a slow PCIe link.** In plain
+**`--peer-slow-link`** (off). With `--peer-device`: less waiting for a second GPU on a slow PCIe link. In plain
 words: at every layer of every token (48 layers per token), the PC sends the second GPU the data for its share of the
 work, the card computes, and it sends the results back; the CPU waits for them before the layer can finish. Two things
 changed: the data is converted to the card's compact format by the CPU before it is sent (3.5 times fewer bytes on
@@ -128,8 +128,10 @@ link after the experts (x4: ~27 us a layer). Now its down kernel writes each ent
 - The same bits: `STRATA_PEER_CHECK=1` also runs the old path and compares every row (880,771 rows, 0 different).
 - `STRATA_PEER_TIMING=1` logs, per request, where a layer's call on the second GPU goes (copies, quantization,
   experts, the CPU's wait).
-- Values: nothing to set, it is on with `--peer-device`. `STRATA_PEER_DOWN_HOST=0` turns the direct rows off and
-  `STRATA_PEER_HOST_Q8=0` the host quantization (to compare, or if a problem shows). The direct rows apply to two down-row
+- Values: a switch, no number. Add `--peer-slow-link` to turn it on; without it the second GPU works as upstream
+  (floats in, rows copied back after its experts). Turn it on for a second GPU on a narrow or shared link; on a fast
+  one it is harmless, but untested. With it on, `STRATA_PEER_DOWN_HOST=0` leaves the direct rows off and
+  `STRATA_PEER_HOST_Q8=0` the host quantization (to compare the two halves, or if a problem shows). Reference PC: on. The direct rows apply to two down-row
   formats at Qwen3.8-Flash-Next's expert width (IQ4_NL among them, the reference pack's); other formats keep the old
   path by themselves. `STRATA_PEER_CHECK=1` and `STRATA_PEER_TIMING=1` are diagnostics: off in normal use.
 
@@ -158,7 +160,8 @@ All of them on the reference PC (in the run config's `args`, and the `vision` se
 "--conversation-cache-park-checkpoints", "3",
 "--prelude-cache", "/path/to/prelude-cache",
 "--prelude-cache-mib", "10240",
-"--peer-refill-sm", "4"
+"--peer-refill-sm", "4",
+"--peer-slow-link"
 ```
 
 ```json
