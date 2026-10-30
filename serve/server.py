@@ -766,7 +766,7 @@ class PromptHeads:
     """"prompt_heads": DIR (opt-in, a diagnostic): the system turn a request opens with - the agent's system prompt and
     tools as the template renders them, the part --prelude-cache keeps - one text file per distinct one, and
     index.json with its token count and how often and when it came.  Also divergences/: a conversation whose history
-    the client rewrote early (see divergence()).  Diff two files to see what an agent changes from
+    the client rewrote early (see divergence()), and tail-rewrites/: one whose previous prompt's end it re-rendered.  Diff two files to see what an agent changes from
     one session to the next (a date, a folder) and so why its next chat cannot start after the stored prelude.  At
     most `cap` text files; past that the index still counts."""
     TURN_ID = 248045                                    # <|im_start|> (the engine's --turn-token)
@@ -798,6 +798,7 @@ class PromptHeads:
     # the divergence check: prompts kept to compare with, their shortest, the margin before the recent prompt's end, the
     # ids of text written after the change, the window kept_later looks for
     RECENT, MIN_TOKENS, SLACK, CONTEXT, WINDOW = 8, 8192, 4096, 1200, 32
+    TAIL_CAP = 40                                       # tail-rewrites/: at most this many text files
 
     @staticmethod
     def common_prefix(a: bytes, b: bytes) -> int:
@@ -848,7 +849,11 @@ class PromptHeads:
         if best is None:
             return None
         old_len = len(best) // 4
-        if at < head_len or at + self.SLACK >= old_len:    # another agent, or the same conversation going on
+        if at < head_len:                                   # another agent
+            return None
+        if at + self.SLACK >= old_len:                      # the same conversation going on
+            if at < old_len:                                # ... with the end of its previous prompt rewritten
+                self.tail_rewrite(ids, best, at, head_len)
             return None
         if not self.kept_later(best, cur, at, self.WINDOW):  # another chat of the agent (a new subagent on the same task
             return None                                      # shares the first message's start, not the later turns)
@@ -871,6 +876,33 @@ class PromptHeads:
                                 "head": head_len, "file": name}) + "\n")
         print(f"[strata] prompt_heads: a conversation changed at id {at} of {old_len} (system turn {head_len}); "
               f"{'divergences/' + name if name else 'the file cap is reached'}", flush=True)
+        return name
+
+    def tail_rewrite(self, ids, old: bytes, at: int, head_len: int) -> str | None:
+        """A conversation that goes on but no longer holds the end of its previous prompt: the client re-rendered the
+        last turn (a reminder left out, a reasoning dropped), so the engine resumes at a checkpoint before `at` and
+        reads the previous reply again.  Writes tail-rewrites/<time>.txt with the previous prompt's end and this
+        prompt from the same id (at most TAIL_CAP files) and one line in tail-rewrites/index.jsonl; the file's name."""
+        old_ids = array.array("i")
+        old_ids.frombytes(old)
+        old_len = len(old_ids)
+        now = time.time()
+        name = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}-{at}.txt"
+        d = self.dir / "tail-rewrites"
+        d.mkdir(exist_ok=True)
+        if len(list(d.glob("*.txt"))) < self.TAIL_CAP:
+            before = lambda xs: self.tok.decode(list(xs[max(0, at - 200): at]))
+            (d / name).write_text(
+                f"A prompt of {len(ids)} ids holds the previous one of {old_len} up to id {at}, {old_len - at} ids before "
+                f"its end (system turn: {head_len}).\n\n===== the 200 ids before the change =====\n{before(ids)}\n\n"
+                f"===== the previous prompt, from the change to its end =====\n{self.tok.decode(list(old_ids[at:]))}\n\n"
+                f"===== this prompt, from the change =====\n{self.tok.decode(list(ids[at: at + self.CONTEXT]))}\n",
+                encoding="utf-8")
+        else:
+            name = None
+        with open(d / "index.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"time": round(now), "tokens": len(ids), "recent_tokens": old_len, "common": at,
+                                "back": old_len - at, "head": head_len, "file": name}) + "\n")
         return name
 
     def note(self, ids) -> str | None:
@@ -3411,6 +3443,15 @@ def system_role_args(cfg: dict, exe: str, tok) -> list[str]:
         known = False
     role = tok.encode("system", parse_special=True)
     return ["--system-role-token", str(role[0])] if known and len(role) == 1 else []
+
+
+def engine_extra_args(cfg: dict, exe: str, tok) -> tuple[list[str], bool]:
+    """The engine arguments the server adds (#458's --tail-role-token, the prelude cache's --system-role-token) and
+    whether a non-default effort goes in a trailing turn.  Only #458's own arguments turn that on: a prelude cache
+    alone must not (it did from b649562c: every agent turn then read its previous reply again, as the effort turn
+    before it left the history).  ValueError for a bad "effort_position"."""
+    effort = effort_end_args(cfg, exe, tok)
+    return (effort or []) + system_role_args(cfg, exe, tok), bool(effort)
 
 
 def engine_silence_s(cfg: dict) -> float:
@@ -8836,7 +8877,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
-def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool,
+def start_replicas(cfg: dict, groups: list[list[int]], exe: str, extra_args: list[str], lazy: bool,
                    *, offline: bool = False):
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
@@ -8852,7 +8893,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     def one(i: int):
         rc = rp.replica_cfg(cfg, i, groups[i])
         try:
-            engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+            engines[i] = StrataEngine(exe, engine_args(rc) + extra_args, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None)
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
@@ -8880,7 +8921,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     return rp.ReplicaEngine(engines, load_tokens=load)
 
 
-def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bool, *, offline: bool = False):
+def start_split(cfg: dict, spec: dict, exe: str, extra_args: list[str], lazy: bool, *, offline: bool = False):
     """Opt-in split serving (serve/split.py): a prefill engine and a decode engine, one card each, the same model and the
     same session settings.  Started one after the other, so a shared expert arena is filled once; the SplitEngine in
     front hands a long prompt from the first to the second."""
@@ -8899,7 +8940,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
                 rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
             if role == "prefill":
                 warn_budget_over_ram(engine_args(rc) if "args" in rc else [])
-            engines[role] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+            engines[role] = StrataEngine(exe, engine_args(rc) + extra_args, cwd=rc.get("cwd"), log=rc.get("log"),
                                          env=child_env(rc, offline=offline), lazy=lazy)
     except BaseException:
         for e in engines.values():
@@ -9325,10 +9366,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:
-            effort_end = effort_end_args(cfg, exe, tok)  # #458
+            extra_args, effort_end = engine_extra_args(cfg, exe, tok)   # #458, --prelude-cache
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        effort_end = (effort_end or []) + system_role_args(cfg, exe, tok)
         from serve import replicas as rp
         try:
             groups = rp.gpu_groups(cfg)
@@ -9342,11 +9382,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         except split_mod.SplitConfigError as e:
             raise SystemExit(f"[strata] config {e}")
         if groups:
-            engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
+            engine = start_replicas(cfg, groups, exe, extra_args, lazy, offline=a.offline)
         elif split:
-            engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
+            engine = start_split(cfg, split, exe, extra_args, lazy, offline=a.offline)
         else:
-            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+            engine = StrataEngine(exe, engine_args(cfg) + extra_args, cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
@@ -9355,7 +9395,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if note:                                        # #560 #516: before --open starts a browser on that card
             print(note, flush=True)
     else:
-        effort_end = None
+        effort_end = False
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."],
             cycle=getattr(a, "script_cycle", False),
@@ -9506,7 +9546,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
-    svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    svc.effort_end = effort_end                         # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True
         try:
