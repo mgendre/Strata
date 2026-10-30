@@ -135,9 +135,9 @@ main { flex: 1; min-height: 0; display: flex; }
    disk neon pink, validated together in both themes: color-blind separation, 3:1 on the card; writes per hour: slot 7;
    preludes: neon green, light #00a83a / dark #00b140, validated all-pairs with the RAM blue and the disk pink) -
    with the copies on disk below; without the disk level the left side is the whole card */
-.cc-card { --cc-ram: #2a78d6; --cc-dsk: #d6249f; --cc-pre: #00a83a; --cc-writes: #6250d6;
+.cc-card { --cc-ram: #2a78d6; --cc-dsk: #d6249f; --cc-pre: var(--st-accent); --cc-writes: #6250d6;
   --cc-grid: var(--st-line-soft); --cc-axis: var(--st-line); }
-[data-theme="dark"] .cc-card { --cc-ram: #3987e5; --cc-dsk: #f0449e; --cc-pre: #00b140; --cc-writes: #9085e9; }
+[data-theme="dark"] .cc-card { --cc-ram: #3987e5; --cc-dsk: #f0449e; --cc-writes: #9085e9; }
 .cc-card:not(.cc-has-disk) .cc-disk-only { display: none; }
 .cc-split { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--st-s-6); align-items: start; }
 .cc-card.cc-has-disk .cc-split { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
@@ -157,9 +157,12 @@ main { flex: 1; min-height: 0; display: flex; }
 .cc-legend { display: flex; gap: var(--st-s-3); font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
 .cc-legend span { display: inline-flex; align-items: center; gap: 5px; }
 .cc-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }   /* columns: square keys */
+.cc-legend i.cc-key-line { width: 12px; height: 2px; border-radius: 1px; }   /* a line series */
 .cc-plot { position: relative; }
 .cc-svg { display: block; width: 100%; height: 160px; overflow: visible; }
 .cc-svg--short { height: 96px; }
+.cc-pre[hidden] { display: none; }
+.cc-card .cc-svg.cc-svg--pre, .cc-card.cc-has-disk .cc-svg.cc-svg--pre { height: 90px; }   /* a small graph, disk or not */
 .cc-svg text { font-size: 11px; fill: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
 .cc-tip { position: absolute; z-index: 2; pointer-events: none; background: var(--st-surface); border: 1px solid var(--st-line);
   border-radius: var(--st-r-sm); box-shadow: var(--st-sh-card); padding: 6px 8px; font-size: var(--st-fs-xs);

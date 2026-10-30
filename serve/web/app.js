@@ -404,11 +404,7 @@ function renderConvCache(c) {
     ["Last switch", c.enabled ? event : null],
   ]);
   renderConvDisk(c);
-  $("cc-note").textContent = c.enabled && c.disk
-    ? "A request that continues a parked conversation gets its state back instead of reading it again. Long conversations are also saved on disk after a reply, step by step, so one that RAM lets go comes back from disk; the copies are kept across restarts, the least used leave first when the disk budget is full."
-    : c.enabled
-    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
-    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+  renderPrelude(c.prelude);
 }
 
 // --conversation-cache-disk: the disk level, where restored state came from, the disk writes, what RAM and disk gave
@@ -429,8 +425,8 @@ function niceMax(v) {   // a clean axis top in GB: 1, 2 or 5 times a power of te
   const p = 10 ** Math.floor(Math.log10(v));
   return [1, 2, 5, 10].map((m) => m * p).find((m) => m >= v);
 }
-function ccTip(plot, x, y, title, rows) {
-  const tip = $("cc-tip");
+function ccTip(plot, x, y, title, rows) {   // in the plot's own chart (the disk's or the preludes')
+  const chart = plot.closest(".cc-chart"), tip = chart.querySelector(".cc-tip");
   tip.replaceChildren();
   const head = document.createElement("div");
   head.textContent = title;
@@ -444,7 +440,7 @@ function ccTip(plot, x, y, title, rows) {
     tip.appendChild(row);
   }
   tip.hidden = false;
-  const box = $("cc-chart").getBoundingClientRect(), pb = plot.getBoundingClientRect();
+  const box = chart.getBoundingClientRect(), pb = plot.getBoundingClientRect();
   const left = Math.min(Math.max(0, pb.left - box.left + x + 12), box.width - tip.offsetWidth);
   tip.style.left = `${left}px`;
   tip.style.top = `${pb.top - box.top + Math.max(0, y - tip.offsetHeight - 8)}px`;
@@ -468,7 +464,7 @@ function niceTokens(v) {   // a clean axis top in tokens: 1, 2 or 5 times a powe
 // start again at an engine start: a drop counts from zero)
 function ccHours(d, now) {
   const h0 = Math.floor(now / 3600) * 3600 - 23 * 3600;
-  const out = Array.from({length: 24}, (_, k) => ({t: h0 + k * 3600, ram: 0, disk: 0, pre: 0, written: 0, nram: 0, ndisk: 0, npre: 0, seen: false}));
+  const out = Array.from({length: 24}, (_, k) => ({t: h0 + k * 3600, ram: 0, disk: 0, written: 0, nram: 0, ndisk: 0, seen: false}));
   const pts = d.history || [];
   const step = (a, b) => (b >= a ? b - a : b);
   for (let i = 1; i < pts.length; i++) {
@@ -476,8 +472,7 @@ function ccHours(d, now) {
     if (k < 0 || k > 23) continue;
     const o = out[k], p = pts[i - 1], x = pts[i];
     o.ram += step(p[1], x[1]); o.disk += step(p[2], x[2]); o.written += Math.max(0, x[3] - p[3]);
-    o.nram += step(p[4] || 0, x[4] || 0); o.ndisk += step(p[5] || 0, x[5] || 0);
-    o.pre += step(p[6] || 0, x[6] || 0); o.npre += step(p[7] || 0, x[7] || 0); o.seen = true;   // (the prelude cache)
+    o.nram += step(p[4] || 0, x[4] || 0); o.ndisk += step(p[5] || 0, x[5] || 0); o.seen = true;
   }
   return out;
 }
@@ -498,7 +493,7 @@ function ccColumns(svg, plot, w, h, pad, hours, parts, ymax, label, tip) {
       svgEl("text", {x: x + bw / 2, y: h - 4, "text-anchor": "middle"}, svg).textContent = new Date(o.t * 1000).toLocaleTimeString([], {hour: "2-digit"});
     const hit = svgEl("rect", {x: pad.l + k * slot, y: 0, width: slot, height: h, fill: "transparent", tabindex: "0"}, svg);
     const show = () => ccTip(plot, x + bw / 2, Math.min(y, base - 8), `${hhmm(o.t)}–${hhmm(o.t + 3600)}`, tip(o));
-    const hide = () => { $("cc-tip").hidden = true; };
+    const hide = () => { plot.closest(".cc-chart").querySelector(".cc-tip").hidden = true; };
     hit.addEventListener("pointerenter", show);
     hit.addEventListener("pointerleave", hide);
     hit.addEventListener("focus", show);
@@ -512,10 +507,9 @@ function ccSvg(id, plotId, fallbackH) {
   svg.replaceChildren();
   return {svg, plot, w, h, pad: {l: 38, r: 8, t: 8, b: 20}};
 }
-function renderGiven(d, hours) {   // prompt tokens given back each hour: from RAM (below), from disk, from the prelude cache (top)
+function renderGiven(d, hours) {   // prompt tokens given back each hour: from RAM (below), from disk (top)
   const {svg, plot, w, h, pad} = ccSvg("cc-usage", "cc-usage-plot", 160);
   const legend = [["Disk", "--cc-dsk"], ["RAM", "--cc-ram"]];
-  if (hours.some((o) => o.pre)) legend.unshift(["Preludes", "--cc-pre"]);   // only once the prelude cache has given some back
   $("cc-legend").replaceChildren(...legend.map(([name, color]) => {
     const span = document.createElement("span"), key = document.createElement("i");
     key.style.background = `var(${color})`;
@@ -526,19 +520,63 @@ function renderGiven(d, hours) {   // prompt tokens given back each hour: from R
     svgEl("text", {x: pad.l, y: h / 2}, svg).textContent = "Collecting: one sample a minute";
     return;
   }
-  const ymax = niceTokens(Math.max(...hours.map((o) => o.ram + o.disk + o.pre)));
+  const ymax = niceTokens(Math.max(...hours.map((o) => o.ram + o.disk)));
   ccFrame(svg, w, h, pad, ymax, [0, ymax / 2, ymax], tokfmt);
   const speed = d.prompt_tok_s;
-  ccColumns(svg, plot, w, h, pad, hours, [["ram", "--cc-ram"], ["disk", "--cc-dsk"], ["pre", "--cc-pre"]], ymax, tokfmt, (o) => {
-    const all = o.ram + o.disk + o.pre;
+  ccColumns(svg, plot, w, h, pad, hours, [["ram", "--cc-ram"], ["disk", "--cc-dsk"]], ymax, tokfmt, (o) => {
+    const all = o.ram + o.disk;
     const rows = [[`${tokfmt(o.disk)} tokens`, `from disk (${fmt(o.ndisk)} restores)`, "--cc-dsk"],
                   [`${tokfmt(o.ram)} tokens`, `from RAM (${fmt(o.nram)} restores)`, "--cc-ram"]];
-    if (o.pre) rows.unshift([`${tokfmt(o.pre)} tokens`, `from preludes (${fmt(o.npre)} restores)`, "--cc-pre"]);
     if (all) rows.push([`${fmt((100 * o.disk) / all)}%`, "from disk", null]);
-    if (all && o.pre) rows.push([`${fmt((100 * o.pre) / all)}%`, "from preludes", null]);
     if (speed && o.disk) rows.push([dur(o.disk / speed), "of reading saved by the disk", null]);
-    if (speed && o.pre) rows.push([dur(o.pre / speed), "of reading saved by the preludes", null]);
     return rows;
+  });
+}
+// --prelude-cache: the prompt tokens its preludes gave back each hour of the last day (its restores [time, tokens]),
+// with or without the disk tier
+function renderPrelude(p) {   // columns: tokens read back each hour; the line: tokens of the preludes saved each hour
+  $("cc-pre").hidden = !p;
+  if (!p) return;
+  const now = p.time || Date.now() / 1000, h0 = Math.floor(now / 3600) * 3600 - 23 * 3600;
+  const hours = Array.from({length: 24}, (_, k) => ({t: h0 + k * 3600, pre: 0, npre: 0, saved: 0, nsaved: 0}));
+  const uses = p.uses || [], saves = p.saves || [];
+  for (const [rows, key, n] of [[uses, "pre", "npre"], [saves, "saved", "nsaved"]])
+    for (const [t, tokens] of rows) {
+      const k = Math.floor((t - h0) / 3600);
+      if (k >= 0 && k < 24) { hours[k][key] += tokens; hours[k][n] += 1; }
+    }
+  const last = uses.length ? uses[uses.length - 1][0] : null;
+  $("cc-pre-sum").textContent = `${fmt(p.stored)} stored · ${fmt(uses.length)} read back, ${fmt(saves.length)} saved in 24 h` +
+                                (last ? ` · last read ${since(last)}` : "");
+  $("cc-pre-legend").replaceChildren(...[["Read back", "--cc-pre", false], ["Saved", "--cc-writes", true]].map(([name, color, line]) => {
+    const span = document.createElement("span"), key = document.createElement("i");
+    key.style.background = `var(${color})`;
+    if (line) key.className = "cc-key-line";
+    span.append(key, name);
+    return span;
+  }));
+  const {svg, plot, w, h, pad} = ccSvg("cc-pre-svg", "cc-pre-plot", 90);
+  if (!uses.length && !saves.length) {
+    svgEl("text", {x: pad.l, y: h / 2}, svg).textContent = "No prelude read back or saved in the last 24 hours";
+    return;
+  }
+  const ymax = niceTokens(Math.max(...hours.map((o) => Math.max(o.pre, o.saved))));
+  ccFrame(svg, w, h, pad, ymax, [0, ymax], tokfmt);
+  const speed = p.prompt_tok_s, plural = (n) => (n === 1 ? "" : "s");
+  ccColumns(svg, plot, w, h, pad, hours, [["pre", "--cc-pre"]], ymax, tokfmt, (o) => {
+    const rows = [[`${tokfmt(o.pre)} tokens`, `read back from ${fmt(o.npre)} prelude${plural(o.npre)}`, "--cc-pre"]];
+    if (o.saved) rows.push([`${tokfmt(o.saved)} tokens`, `saved in ${fmt(o.nsaved)} new prelude${plural(o.nsaved)}`, "--cc-writes"]);
+    if (speed && o.pre) rows.push([dur(o.pre / speed), "of reading saved", null]);
+    return rows;
+  });
+  // the saves' line over the columns, through the middle of each hour, a dot where one was saved (no pointer events:
+  // the columns' hover keeps the tooltip)
+  const slot = (w - pad.l - pad.r) / 24, base = h - pad.b, span = base - pad.t;
+  const pts = hours.map((o, k) => [pad.l + k * slot + slot / 2, base - (o.saved / ymax) * span]);
+  svgEl("path", {d: pts.map(([x, y], k) => `${k ? "L" : "M"}${x},${y}`).join(""),
+                 style: "fill:none;stroke:var(--cc-writes);stroke-width:2;stroke-linejoin:round;pointer-events:none"}, svg);
+  hours.forEach((o, k) => {
+    if (o.saved) svgEl("circle", {cx: pts[k][0], cy: pts[k][1], r: 3, style: "fill:var(--cc-writes);pointer-events:none"}, svg);
   });
 }
 function renderWrites(d, hours) {
@@ -564,28 +602,24 @@ function renderWrites(d, hours) {
     }
   }
 }
-function renderDiskTable(d) {   // the 10 copies read back most recently: conversations on disk and preludes (never read back: left out)
+function renderDiskTable(d) {   // the 10 conversations read back from disk most recently (never read back: left out)
   const table = $("cc-disk-table"), speed = d.prompt_tok_s;
-  const rows = [...(d.entries || []).map((e) => ({...e, from: "Disk"})),
-                ...(d.prelude_entries || []).map((e) => ({...e, from: "Prelude"}))]
-    .filter((e) => e.returns > 0).sort((a, b) => b.last_used - a.last_used).slice(0, 10);
+  const rows = (d.entries || []).filter((e) => e.returns > 0).sort((a, b) => b.last_used - a.last_used).slice(0, 10);
   table.replaceChildren();
   const s = d.since_start || {};
-  const pre = (d.prelude_entries || []).length;
-  $("cc-dsk-sum").textContent = `${fmt(d.disk.entries)} on disk${pre ? ` · ${fmt(pre)} preludes` : ""} · served ` +
-                                `${fmt(s.tokens)} tokens since start`;
+  $("cc-dsk-sum").textContent = `${fmt(d.disk.entries)} on disk · served ${fmt(s.tokens)} tokens since start`;
   if (!rows.length) {
     const td = table.insertRow().insertCell();
-    td.textContent = "None yet: no conversation on disk and no prelude has come back from it.";
+    td.textContent = "None yet: no conversation has come back from the disk.";
     return;
   }
-  const cols = [["Conversation", false], ["From", false], ["Tokens", true], ["Returns", true], ["Tokens served", true],
+  const cols = [["Conversation", false], ["Tokens", true], ["Returns", true], ["Tokens served", true],
                 ["Time saved", true], ["Last used", false]];
   const head = table.insertRow();
   for (const [text, num] of cols) { const th = document.createElement("th"); th.textContent = text; if (num) th.className = "num"; head.appendChild(th); }
   rows.forEach((e) => {
     const row = table.insertRow();
-    const cells = [`#${e.id.slice(-6)}`, e.from, fmt(e.tokens), fmt(e.returns), fmt(e.served_tokens),
+    const cells = [`#${e.id.slice(-6)}`, fmt(e.tokens), fmt(e.returns), fmt(e.served_tokens),
                    speed && e.served_tokens ? dur(e.served_tokens / speed) : "–", since(e.last_used)];
     cells.forEach((text, i) => {
       const td = row.insertCell();
@@ -602,7 +636,7 @@ function renderConvDisk(c) {
   if (!d) return;
   const now = d.time || Date.now() / 1000;
   const s = d.since_start || {};
-  const ram = c.tokens_ram || 0, dsk = s.tokens || 0, pre = c.tokens_prelude || 0, all = ram + dsk + pre;
+  const ram = c.tokens_ram || 0, dsk = s.tokens || 0, all = ram + dsk;
   const share = (n) => `${fmt(all ? (100 * n) / all : 0)}%`;
   const over = d.day_guide_bytes > 0 && d.written_today > d.day_guide_bytes;
   const warn = $("cc-disk-warn");
@@ -610,10 +644,8 @@ function renderConvDisk(c) {
   if (over) warn.innerHTML = `${icon("warning", "st-icon st-icon--sm")}<span>Over the daily guide: ${esc(tb(d.written_today))} written to disk today (guide ${esc(tb(d.day_guide_bytes, 0))}). Writing goes on.</span>`;
   const speed = d.prompt_tok_s;
   facts($("cc-disk-facts"), [
-    ["Restored from", `RAM ${fmt(c.restores)} · disk ${fmt(s.restores)}` +
-                      (c.restores_prelude ? ` · preludes ${fmt(c.restores_prelude)}` : "")],
-    ["Tokens given back", all ? `RAM ${share(ram)} · disk ${share(dsk)}` + (pre ? ` · preludes ${share(pre)}` : "") +
-                          ` (${fmt(all)} tokens)` : null],
+    ["Restored from", `RAM ${fmt(c.restores)} · disk ${fmt(s.restores)}`],
+    ["Tokens given back", all ? `RAM ${share(ram)} · disk ${share(dsk)} (${fmt(all)} tokens)` : null],
     ["Time saved by the disk", speed && dsk ? `about ${dur(dsk / speed)} of prompt reading (at ${fmt(speed)} tok/s)` : null],
     ["Written to disk", `today ${tb(d.written_today)} (guide ${tb(d.day_guide_bytes, 0)}) · since start ${tb(s.written)} · all time ${tb(d.written_all_time)}`],
     ["Saves", `${fmt(s.saves)} since start · ${tb(s.reused)} already on disk (not written again)`],
