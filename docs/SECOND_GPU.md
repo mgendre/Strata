@@ -110,6 +110,12 @@ its own share was done, and how many experts were swapped into the peer:
 strata serve: peer GPU: of N routed experts, A% on the main GPU's cache, B% on the peer GPU, C% over PCIe, D% on the CPU; the CPU pool waited W ms for the peer GPU (w ms per decode window), S experts swapped into it
 ```
 
+The peer's rows come back without a scatter step: its down kernel writes each entry's rows into the host rows as whole
+128-byte lines while it computes, and the host sends it the input already quantized to q8_1 (computed the way the
+device does it, AVX2 + F16C). Both give the same bits as before; `STRATA_PEER_DOWN_HOST=0` and `STRATA_PEER_HOST_Q8=0`
+turn them off, `STRATA_PEER_CHECK=1` compares every row with the old path, and `STRATA_PEER_TIMING=1` adds a line with
+where each layer's call goes (copies, quantization, experts, the CPU's wait).
+
 ## The resident RAM mode with the helper caches
 
 `--resident-experts` (the low-RAM mode) works with the helper caches. The experts a helper holds are left out of the RAM copy,
