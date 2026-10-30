@@ -449,6 +449,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         std::memcpy(h_x_, x, in_f32);
         if (!ck(cudaMemcpyAsync(d_meta_, h_meta_, kMetaBytes + in_f32, cudaMemcpyHostToDevice, s), "check input", err))
             return false;
+        if (f.had_gu) strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, H, f.had_block, d_sx_, s);
         strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
         strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
                                                d_scratch_, d_out_, s);
