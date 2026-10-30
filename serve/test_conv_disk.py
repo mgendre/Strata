@@ -8,9 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from serve.server import (CacheHistory, ConvCacheLog, ConvDiskStatus, conversation_cache_view, conversation_disk_dir,
-                          disk_written_since_boot, engine_extra_args, long_read_speed, prelude_cache_dir, PreludeUses,
-                          system_role_args)
+from serve.server import (ConvCacheLog, ConvDiskStatus, StoreUses, conversation_cache_view, conversation_disk_dir,
+                          engine_extra_args, long_read_speed, prelude_cache_dir, system_role_args)
 
 
 class Engine:
@@ -22,7 +21,7 @@ class ConvDiskServer(unittest.TestCase):
     RAM = "strata serve: conversation cache: restored 4000 tokens (live) in 30.0 ms; parked=2 bytes=209715200\n"
     DISK = ("strata serve: conversation cache: restored 90000 tokens from disk in 812.0 ms, read 1400 MiB (its return "
             "2); parked=1 bytes=104857600\n")
-    STORED = ("strata serve: conversation cache: disk saved 90000 tokens (after the reply, a step reached) in 650.0 ms: "
+    STORED = ("strata serve: conversation cache: disk saved 90000 tokens (left RAM) in 650.0 ms: "
               "wrote 1400 MiB (22 of 22 blocks new), 0 MiB already on disk; disk=1 (1400 MiB) written_today=1400 MiB\n")
 
     def test_ram_and_disk_restores_are_told_apart(self):
@@ -35,6 +34,14 @@ class ConvDiskServer(unittest.TestCase):
             log.write_text(self.DISK, encoding="utf-8")
             st = ConvCacheLog().poll(str(log), 0)
             self.assertEqual((st["restores"], st["restores_disk"], st["last_source"]), (0, 1, "disk"))
+            back, written = [], []
+            log.write_text(self.RAM + self.STORED + self.DISK + self.RAM, encoding="utf-8")
+            reader = ConvCacheLog()
+            reader.on_disk = lambda t, n: back.append(n)            # each restore from disk, once, for its time
+            reader.on_disk_saved = lambda t, n: written.append(n)   # ... and each conversation written to it
+            reader.poll(str(log), 0)
+            reader.poll(str(log), 0)
+            self.assertEqual((back, written), ([90000], [90000]))
 
     def test_prelude_restores_are_counted_apart(self):
         prelude = ("strata serve: prelude cache: restored a prelude of 8413 tokens in 187.0 ms, read 235 MiB (its use 1); "
@@ -116,23 +123,6 @@ class ConvDiskServer(unittest.TestCase):
             os.utime(p, ns=(1, 3_000_000_000_000_000_000))
             self.assertEqual(status.read(d)["disk"]["entries"], 2)
 
-    @unittest.skipUnless(os.path.exists("/sys/dev/block"), "Linux only")
-    def test_the_disk_under_the_folder(self):
-        with tempfile.TemporaryDirectory() as d:
-            dev = disk_written_since_boot(d)
-            if dev is not None:                                # (a tmpfs has no block device)
-                self.assertTrue(dev["device"] and dev["written"] >= 0)
-        self.assertIsNone(disk_written_since_boot(None))
-
-    def test_history_keeps_one_day(self):
-        h = CacheHistory()
-        for i in range(CacheHistory.KEEP + 5):
-            h.add(i, 2 * i, 3 * i, 4 * i, 5 * i, 6 * i, 7 * i, now=1000 + 60 * i)
-        v = h.view()
-        self.assertEqual(len(v), CacheHistory.KEEP)
-        k = CacheHistory.KEEP + 4
-        self.assertEqual(v[-1], [1000 + 60 * k, k, 2 * k, 3 * k, 4 * k, 5 * k, 6 * k, 7 * k])
-
     def test_the_saving_uses_long_reads_only(self):
         hist = [{"prompt_read": 30000, "prompt_ms": 15000.0}, {"prompt_read": 10000, "prompt_ms": 5000.0},
                 {"prompt_read": 40, "prompt_ms": 355.0}, {"prompt_read": None, "prompt_ms": None}]
@@ -140,45 +130,25 @@ class ConvDiskServer(unittest.TestCase):
         self.assertIsNone(long_read_speed([{"prompt_read": 500, "prompt_ms": 900.0}]))   # nothing long yet
         self.assertIsNone(long_read_speed([]))
 
-    def test_history_survives_a_restart(self):
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "history.json")
-            h = CacheHistory()
-            for i in range(5):
-                h.add(10 * i, 20 * i, 30 * i, i, i, now=100000 + 60 * i)
-            h.save(path)
-            again = CacheHistory()
-            again.load(path, now=100000 + 60 * 4)
-            self.assertEqual(again.view(), h.view())
-            later = CacheHistory()                            # a day and more later: nothing is that recent
-            later.load(path, now=100000 + 86400 + 600)
-            self.assertEqual(later.view(), [])
-            Path(path).write_text(json.dumps([[100000, 1, 2, 3, 4, 5]]), encoding="utf-8")   # an older server's sample
-            old = CacheHistory()
-            old.load(path, now=100000)
-            self.assertEqual(old.view(), [[100000, 1, 2, 3, 4, 5, 0, 0]])      # no prelude restores
-            Path(path).write_text("[[1, 2", encoding="utf-8")   # damaged: ignored
-            broken = CacheHistory()
-            broken.load(path)
-            self.assertEqual(broken.view(), [])
-            CacheHistory().load(os.path.join(d, "missing.json"))   # missing: ignored
-
-    def test_the_view_carries_the_preludes_apart_from_the_disk(self):
+    def test_the_view_carries_each_store_apart(self):
         info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3}   # no disk tier
         prelude = {"entries": [{"id": "p", "tokens": 8451, "returns": 2, "served_tokens": 16902, "last_used": 9}]}
         uses = {"uses": [[100, 8451]], "saves": [[40, 8451]]}
-        view = conversation_cache_view(info, [], {}, ConvCacheLog().state, None, None, None, prelude, uses)
+        view = conversation_cache_view(info, [], {}, ConvCacheLog().state, None, None, prelude, uses)
         self.assertNotIn("disk", view)
         self.assertEqual((view["prelude"]["uses"], view["prelude"]["saves"], view["prelude"]["stored"]),
                          ([[100, 8451]], [[40, 8451]], 1))
         self.assertNotIn("prelude", conversation_cache_view(info, [], {}, ConvCacheLog().state))   # no prelude cache
+        disk = {"entries": [{"id": "a"}, {"id": "b"}]}
+        view = conversation_cache_view(info, [], {}, ConvCacheLog().state, disk, {"uses": [[90, 30000]], "saves": []})
+        self.assertEqual((view["disk"]["uses"], view["disk"]["stored"]), ([[90, 30000]], 2))   # the preludes' shape
         self.assertEqual(prelude_cache_dir(Engine(["--prelude-cache", "pre"])), "/srv/strata/pre")
         self.assertIsNone(prelude_cache_dir(Engine(["--conversation-cache-disk", "d"])))
 
-    def test_prelude_uses_keep_the_last_day(self):
+    def test_store_uses_keep_the_last_day(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "uses.json")
-            u = PreludeUses()
+            u = StoreUses()
             u.add(1000, 9090)
             u.add_saved(900, 9090)
             u.add(1000 + 23 * 3600, 10564)
@@ -186,33 +156,29 @@ class ConvDiskServer(unittest.TestCase):
             self.assertEqual(u.view(now=1001 + 24 * 3600), {"uses": [[83800, 10564]], "saves": []})   # older than a day: gone
             u.add_saved(83900, 10564)
             u.save(path)
-            again = PreludeUses()
+            again = StoreUses()
             again.load(path, now=83900)
             self.assertEqual(again.view(now=83900), {"uses": [[83800, 10564]], "saves": [[83900, 10564]]})
             os.remove(path)
             again.save(path)                                    # nothing new since the load: no write
             self.assertFalse(os.path.exists(path))
             Path(path).write_text(json.dumps([[83800, 10564]]), encoding="utf-8")   # the first version's list: restores
-            first = PreludeUses()
+            first = StoreUses()
             first.load(path, now=83900)
             self.assertEqual(first.view(now=83900), {"uses": [[83800, 10564]], "saves": []})
             Path(path).write_text("[[1, 2", encoding="utf-8")   # damaged: ignored
-            broken = PreludeUses()
+            broken = StoreUses()
             broken.load(path)
             self.assertEqual(broken.view(), {"uses": [], "saves": []})
 
     def test_the_view(self):
-        info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3, "conversation_cache_disk": 1}
+        info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3}
         totals = {"reused": 100, "prompt_tokens": 2100, "prompt_ms": 1000}
         parked = ConvCacheLog().state
-        disk = {"disk": {"entries": 1, "bytes": 5, "budget": 10}, "entries": []}
         hist = [{"prompt_read": 20000, "prompt_ms": 10000.0}, {"prompt_read": 40, "prompt_ms": 350.0}]
-        v = conversation_cache_view(info, hist, totals, parked, disk, {"device": "nvme1n1", "written": 7}, [[1, 2, 3, 4, 5, 6]])
+        v = conversation_cache_view(info, hist, totals, parked, None, {"uses": [], "saves": []})
         self.assertEqual(v["disk"]["prompt_tok_s"], 2000.0)   # the long read only, not the short one
-        self.assertEqual((v["disk"]["device"]["device"], v["disk"]["history"]), ("nvme1n1", [[1, 2, 3, 4, 5, 6]]))
-        self.assertNotIn("disk", conversation_cache_view(info, [], totals, parked))
-        off = dict(info, conversation_cache_disk=0)              # the engine said its disk levels are off
-        self.assertNotIn("disk", conversation_cache_view(off, [], totals, parked, disk))
+        self.assertNotIn("disk", conversation_cache_view(info, [], totals, parked))   # no disk tier
 
 
 if __name__ == "__main__":
