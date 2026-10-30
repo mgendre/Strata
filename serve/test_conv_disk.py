@@ -46,12 +46,16 @@ class ConvDiskServer(unittest.TestCase):
             self.assertEqual((st["restores"], st["restores_disk"], st["restores_prelude"]), (1, 1, 2))
             self.assertEqual((st["tokens_ram"], st["tokens_prelude"]), (4000, 16826))
             self.assertEqual((st["last_event"], st["last_tokens"], st["last_source"]), ("restored", 8413, "prelude"))
-            seen = []
+            seen, saved = [], []
+            log.write_text(self.RAM + prelude + self.DISK + prelude +
+                           "strata serve: prelude cache: saved a prelude of 9090 tokens in 216.0 ms: wrote 244 MiB; "
+                           "preludes=6 (1496 MiB)\n", encoding="utf-8")
             reader = ConvCacheLog()
             reader.on_prelude = lambda t, n: seen.append(n)      # each prelude restore, once, for its time
+            reader.on_prelude_saved = lambda t, n: saved.append(n)   # ... and each one written to the store
             reader.poll(str(log), 0)
             reader.poll(str(log), 0)
-            self.assertEqual(seen, [8413, 8413])
+            self.assertEqual((seen, saved), ([8413, 8413], [9090]))
 
     def test_the_system_role_token_goes_with_the_prelude_cache(self):
         class Tok:
@@ -162,9 +166,11 @@ class ConvDiskServer(unittest.TestCase):
     def test_the_view_carries_the_preludes_apart_from_the_disk(self):
         info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3}   # no disk tier
         prelude = {"entries": [{"id": "p", "tokens": 8451, "returns": 2, "served_tokens": 16902, "last_used": 9}]}
-        view = conversation_cache_view(info, [], {}, ConvCacheLog().state, None, None, None, prelude, [[100, 8451]])
+        uses = {"uses": [[100, 8451]], "saves": [[40, 8451]]}
+        view = conversation_cache_view(info, [], {}, ConvCacheLog().state, None, None, None, prelude, uses)
         self.assertNotIn("disk", view)
-        self.assertEqual((view["prelude"]["uses"], view["prelude"]["stored"]), ([[100, 8451]], 1))
+        self.assertEqual((view["prelude"]["uses"], view["prelude"]["saves"], view["prelude"]["stored"]),
+                         ([[100, 8451]], [[40, 8451]], 1))
         self.assertNotIn("prelude", conversation_cache_view(info, [], {}, ConvCacheLog().state))   # no prelude cache
         self.assertEqual(prelude_cache_dir(Engine(["--prelude-cache", "pre"])), "/srv/strata/pre")
         self.assertIsNone(prelude_cache_dir(Engine(["--conversation-cache-disk", "d"])))
@@ -174,20 +180,26 @@ class ConvDiskServer(unittest.TestCase):
             path = os.path.join(d, "uses.json")
             u = PreludeUses()
             u.add(1000, 9090)
+            u.add_saved(900, 9090)
             u.add(1000 + 23 * 3600, 10564)
-            self.assertEqual(u.view(now=1000 + 23 * 3600), [[1000, 9090], [83800, 10564]])
-            self.assertEqual(u.view(now=1001 + 24 * 3600), [[83800, 10564]])   # older than a day: gone
+            self.assertEqual(u.view(now=1000 + 23 * 3600), {"uses": [[1000, 9090], [83800, 10564]], "saves": [[900, 9090]]})
+            self.assertEqual(u.view(now=1001 + 24 * 3600), {"uses": [[83800, 10564]], "saves": []})   # older than a day: gone
+            u.add_saved(83900, 10564)
             u.save(path)
             again = PreludeUses()
-            again.load(path, now=83800)
-            self.assertEqual(again.view(now=83800), [[83800, 10564]])
+            again.load(path, now=83900)
+            self.assertEqual(again.view(now=83900), {"uses": [[83800, 10564]], "saves": [[83900, 10564]]})
             os.remove(path)
             again.save(path)                                    # nothing new since the load: no write
             self.assertFalse(os.path.exists(path))
+            Path(path).write_text(json.dumps([[83800, 10564]]), encoding="utf-8")   # the first version's list: restores
+            first = PreludeUses()
+            first.load(path, now=83900)
+            self.assertEqual(first.view(now=83900), {"uses": [[83800, 10564]], "saves": []})
             Path(path).write_text("[[1, 2", encoding="utf-8")   # damaged: ignored
             broken = PreludeUses()
             broken.load(path)
-            self.assertEqual(broken.view(), [])
+            self.assertEqual(broken.view(), {"uses": [], "saves": []})
 
     def test_the_view(self):
         info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3, "conversation_cache_disk": 1}

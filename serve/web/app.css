@@ -157,6 +157,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .cc-legend { display: flex; gap: var(--st-s-3); font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
 .cc-legend span { display: inline-flex; align-items: center; gap: 5px; }
 .cc-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }   /* columns: square keys */
+.cc-legend i.cc-key-line { width: 12px; height: 2px; border-radius: 1px; }   /* a line series */
 .cc-plot { position: relative; }
 .cc-svg { display: block; width: 100%; height: 160px; overflow: visible; }
 .cc-svg--short { height: 96px; }

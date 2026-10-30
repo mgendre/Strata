@@ -534,30 +534,49 @@ function renderGiven(d, hours) {   // prompt tokens given back each hour: from R
 }
 // --prelude-cache: the prompt tokens its preludes gave back each hour of the last day (its restores [time, tokens]),
 // with or without the disk tier
-function renderPrelude(p) {
+function renderPrelude(p) {   // columns: tokens read back each hour; the line: tokens of the preludes saved each hour
   $("cc-pre").hidden = !p;
   if (!p) return;
   const now = p.time || Date.now() / 1000, h0 = Math.floor(now / 3600) * 3600 - 23 * 3600;
-  const hours = Array.from({length: 24}, (_, k) => ({t: h0 + k * 3600, pre: 0, npre: 0}));
-  for (const [t, tokens] of p.uses || []) {
-    const k = Math.floor((t - h0) / 3600);
-    if (k >= 0 && k < 24) { hours[k].pre += tokens; hours[k].npre += 1; }
-  }
-  const uses = p.uses || [], last = uses.length ? uses[uses.length - 1][0] : null;
-  $("cc-pre-sum").textContent = `${fmt(p.stored)} stored · ${fmt(uses.length)} read back in 24 h` +
-                                (last ? ` · last ${since(last)}` : "");
+  const hours = Array.from({length: 24}, (_, k) => ({t: h0 + k * 3600, pre: 0, npre: 0, saved: 0, nsaved: 0}));
+  const uses = p.uses || [], saves = p.saves || [];
+  for (const [rows, key, n] of [[uses, "pre", "npre"], [saves, "saved", "nsaved"]])
+    for (const [t, tokens] of rows) {
+      const k = Math.floor((t - h0) / 3600);
+      if (k >= 0 && k < 24) { hours[k][key] += tokens; hours[k][n] += 1; }
+    }
+  const last = uses.length ? uses[uses.length - 1][0] : null;
+  $("cc-pre-sum").textContent = `${fmt(p.stored)} stored · ${fmt(uses.length)} read back, ${fmt(saves.length)} saved in 24 h` +
+                                (last ? ` · last read ${since(last)}` : "");
+  $("cc-pre-legend").replaceChildren(...[["Read back", "--cc-pre", false], ["Saved", "--cc-writes", true]].map(([name, color, line]) => {
+    const span = document.createElement("span"), key = document.createElement("i");
+    key.style.background = `var(${color})`;
+    if (line) key.className = "cc-key-line";
+    span.append(key, name);
+    return span;
+  }));
   const {svg, plot, w, h, pad} = ccSvg("cc-pre-svg", "cc-pre-plot", 90);
-  if (!uses.length) {
-    svgEl("text", {x: pad.l, y: h / 2}, svg).textContent = "No prelude read back in the last 24 hours";
+  if (!uses.length && !saves.length) {
+    svgEl("text", {x: pad.l, y: h / 2}, svg).textContent = "No prelude read back or saved in the last 24 hours";
     return;
   }
-  const ymax = niceTokens(Math.max(...hours.map((o) => o.pre)));
+  const ymax = niceTokens(Math.max(...hours.map((o) => Math.max(o.pre, o.saved))));
   ccFrame(svg, w, h, pad, ymax, [0, ymax], tokfmt);
-  const speed = p.prompt_tok_s;
+  const speed = p.prompt_tok_s, plural = (n) => (n === 1 ? "" : "s");
   ccColumns(svg, plot, w, h, pad, hours, [["pre", "--cc-pre"]], ymax, tokfmt, (o) => {
-    const rows = [[`${tokfmt(o.pre)} tokens`, `from ${fmt(o.npre)} prelude${o.npre === 1 ? "" : "s"}`, "--cc-pre"]];
+    const rows = [[`${tokfmt(o.pre)} tokens`, `read back from ${fmt(o.npre)} prelude${plural(o.npre)}`, "--cc-pre"]];
+    if (o.saved) rows.push([`${tokfmt(o.saved)} tokens`, `saved in ${fmt(o.nsaved)} new prelude${plural(o.nsaved)}`, "--cc-writes"]);
     if (speed && o.pre) rows.push([dur(o.pre / speed), "of reading saved", null]);
     return rows;
+  });
+  // the saves' line over the columns, through the middle of each hour, a dot where one was saved (no pointer events:
+  // the columns' hover keeps the tooltip)
+  const slot = (w - pad.l - pad.r) / 24, base = h - pad.b, span = base - pad.t;
+  const pts = hours.map((o, k) => [pad.l + k * slot + slot / 2, base - (o.saved / ymax) * span]);
+  svgEl("path", {d: pts.map(([x, y], k) => `${k ? "L" : "M"}${x},${y}`).join(""),
+                 style: "fill:none;stroke:var(--cc-writes);stroke-width:2;stroke-linejoin:round;pointer-events:none"}, svg);
+  hours.forEach((o, k) => {
+    if (o.saved) svgEl("circle", {cx: pts[k][0], cy: pts[k][1], r: 3, style: "fill:var(--cc-writes);pointer-events:none"}, svg);
   });
 }
 function renderWrites(d, hours) {
