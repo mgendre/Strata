@@ -27,190 +27,115 @@
 ## Strata Experimental (this fork)
 
 This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). The branch `strata-experimental` is Strata
-plus the changes below; `main` follows upstream. Every new option is off by default. A few fixes are always on (marked
-"always" below); apart from those, Strata without the new options behaves as upstream does.
+plus the changes below; `main` follows upstream. Every new option is off by default: without them, Strata behaves as
+upstream does, apart from the few fixes marked "always".
 
-**The goal.** Agent tools (OpenCode, Claude Code, subagents) switch between several long conversations. Strata keeps
-a few of them in RAM. When RAM is full, the oldest one is dropped, and its next turn reads the whole prompt again: tens
-of seconds for a long conversation. This fork keeps those conversations on disk, makes each one smaller in RAM, and
-shows what both do in the Monitor, while keeping writes to the SSD low.
+**The goal.** Agent tools (OpenCode, Claude Code, subagents) switch between several long conversations and start many
+new chats with the same system prompt. Strata keeps a few conversations in RAM; one that leaves RAM, or a new chat of
+an agent whose prelude is gone, reads its whole prompt again: seconds to tens of seconds. This fork keeps those on an
+SSD without writing during normal work, makes parked conversations smaller in RAM, and speeds up a second GPU on a
+slow link.
 
-### What is new
+### What changes compared with Strata
 
-| Change | Options (default) |
+| Change | Option |
 | --- | --- |
-| **Conversation cache on disk.** A conversation that leaves RAM (the slots are full, RAM is low) is written to an SSD and comes back from there instead of being read again. Nothing is written while it is in RAM. | `--conversation-cache-disk DIR` (off), `--conversation-cache-disk-mib` (32768), `--conversation-cache-disk-min-tokens` (12288), `--conversation-cache-disk-day-gib` (200: a warning only) |
-| **Prelude cache.** The prelude of each agent (its system prompt and tools, up to the first turn) is saved once in a folder of its own. A new chat of that agent starts after it, also after a restart, instead of reading it again. | `--prelude-cache DIR` (off), `--prelude-cache-mib` (5120) |
-| **Smaller parked conversations in RAM.** A parked conversation keeps its last N checkpoints and its first one (the end of the system prompt) instead of all of them. Each checkpoint is about 118 MB on Qwen3.8-Flash-Next. | `--conversation-cache-park-checkpoints N` (0: all) |
-| **Clearer log.** One line for each write to disk, each restore from disk, and each conversation that leaves RAM, with whether it is on disk. | always, with the disk cache |
-| **Second GPU line.** With `--peer-device`, one line per request says where the experts ran: the main GPU's cache, the second GPU, over PCIe, or on the CPU. | always, with `--peer-device` |
-| **Second GPU refill by SM loads.** With `--peer-device`, the adaptive tier copies experts into the second GPU with the GPU's own loads instead of its copy engine. On the copy engine, each layer's work on that card waited until the whole round of copies had landed. | `--peer-refill-sm N` (0: the copy engine) |
-| **No expert on both GPUs.** The main GPU's adaptive tier no longer takes an expert that is still being copied into the second GPU, which left both cards holding it. | always, with `--peer-device` |
-| **Image encoder on the CPU, started on demand.** The vision section's `"elastic": true` now works for an encoder on the CPU, also with `--peer-device` (it no longer needs `"vram_elastic"`). | `"elastic": true`, `"elastic_idle_s"` (120) in the config's `vision` section |
-| **Monitor.** The Conversation cache card shows a small graph per store on disk (conversations, preludes): the prompt tokens it gave back each hour of the last day, and a line of what it wrote. A Disk write card sits next to Disk read. | always |
+| **Conversation cache on disk.** A long conversation that leaves RAM is written to an SSD and comes back from there instead of being read again. Nothing is written while it is in RAM. | `--conversation-cache-disk DIR` |
+| **Prelude cache.** Each agent's system prompt and tools are saved once; a new chat of that agent starts after them, also after a restart. | `--prelude-cache DIR` |
+| **Smaller parked conversations.** A conversation parked in RAM keeps only its last checkpoints and its first one. | `--conversation-cache-park-checkpoints N` |
+| **Second GPU refill by SM loads.** With `--peer-device`, the experts copied into the second GPU no longer hold back that card's work. | `--peer-refill-sm N` |
+| **Image encoder on the CPU, started on demand.** `"elastic": true` now works for a CPU encoder, also with `--peer-device`. | `"elastic": true` (config, `vision` section) |
+| **No expert on both GPUs.** The main GPU no longer takes an expert that is being copied into the second GPU. | always, with `--peer-device` |
+| **Second GPU line.** One log line per request: where the experts ran (main GPU, second GPU, PCIe, CPU) and how long the CPU waited for the second GPU. | always, with `--peer-device` |
+| **Monitor.** The Conversation cache card has a small graph per store on disk (conversations, preludes): the prompt tokens it gave back each hour of the last day, and a line of what it wrote. A Disk write card sits next to Disk read. | always |
 
-### The options, and what turning them on does
+### The settings
 
-Measured on the reference PC (Linux, Ryzen 7 5800X3D, 64 GB DDR4-3600, RTX 3080 Ti + RTX 3060 behind the X570
-chipset, a PCIe 4.0 NVMe SSD, Qwen3.8-Flash-Next IQ3\_S). Other PCs will see other numbers.
+Numbers from the reference PC: Linux, Ryzen 7 5800X3D, 64 GB DDR4-3600, RTX 3080 Ti + RTX 3060 behind the X570
+chipset (PCIe 4.0 x4), a PCIe 4.0 NVMe SSD, Qwen3.8-Flash-Next IQ3\_S. Other PCs will see other numbers.
 
-**`--conversation-cache-disk DIR`** (off). A conversation that leaves RAM (the slots or the budget are full, RAM is low)
-or that RAM cannot take is written to an SSD, and comes back from it instead of being read again. Nothing is written
-while a conversation is in RAM.
-- Gain: a returning conversation is restored in 0.2-0.26 s; a 13.6K-token one read its prompt in 0.96 s instead of
-  about 6.8 s.
-- Cost: SSD space up to `--conversation-cache-disk-mib`; the request that pushed a conversation out waits for its write
-  (0.26 s, 310 MiB for 13.6K tokens; only new 4K-token blocks are written).
-- Not written: a copy the disk already holds but its last 4K-token block, and an older copy of a conversation that is
-  still kept (the live one, or another parked copy holding all of it but its last block).
-- Use it when agents switch between more long conversations than the RAM cache's slots hold.
+**`--conversation-cache-disk DIR`** (off). The folder of the conversation cache on disk; put it on an SSD.
+- When: a conversation of `--conversation-cache-disk-min-tokens` or more is written when it leaves RAM (the slots or
+  the budget are full, RAM is low) or when RAM cannot take it. Only new 4K-token blocks are written; a copy the disk
+  already holds (all but its last block) or an older copy of a conversation still in RAM is not written.
+- Gain: the conversation comes back in 0.2-0.7 s (14K-84K tokens); a 13.6K-token one read its prompt in 0.96 s
+  instead of 6.8 s.
+- Cost: the request that pushed it out waits for the write (0.26 s, 310 MiB for 13.6K tokens), and disk space.
+- Use it when agents switch between more long conversations than the RAM cache holds (`--conversation-cache-slots`),
+  or when RAM is short. With a single long conversation it writes nothing.
 
-**`--conversation-cache-disk-mib N`** (32768). The disk budget. More keeps more conversations (on disk a conversation takes about 16-18 KB a
-token: about 2.5 GB at 150K tokens); it costs only disk space.
+**`--conversation-cache-disk-mib N`** (32768). The disk budget. A conversation takes about 16-18 KB a token (2.5 GB at
+150K tokens). When it is full, the copy that came back least often leaves first, then the oldest.
 
-**`--conversation-cache-disk-min-tokens N`** (12288). A conversation shorter than that is not written: reading it
-again costs a few seconds at most.
+**`--conversation-cache-disk-min-tokens N`** (12288). Shorter conversations are not written: reading them again costs
+a few seconds at most.
 
-**`--conversation-cache-disk-day-gib N`** (200). Only a warning in the Monitor past N GiB written in a day; nothing
-stops.
+**`--conversation-cache-disk-day-gib N`** (200). A warning in the log past N GiB written in a day; nothing stops.
+
+**`--prelude-cache DIR`** (off) and **`--prelude-cache-mib N`** (5120). The prelude is an agent's system turn (system
+prompt and tools, at least `--prompt-cache-root` tokens, 2,048 by default). It is saved once, right after the first
+reply that read it; a new chat that starts with it, and that RAM cannot resume further, starts after it.
+- Gain: an 8,413-token prelude came back in 0.19 s; the request read its prompt in 0.56 s instead of 7.4 s. RAM
+  already does this while one of the agent's conversations is parked; the prelude cache also covers the time after
+  they left RAM and after a restart.
+- Cost: one write per distinct system prompt (235 MiB for 8K tokens, 0.2 s). An agent whose system prompt changes
+  every session (a date, a folder) gets a new prelude each time; the least used leaves first when the budget is full.
+- The server passes the id of `system` to the engine (`--system-role-token`) by itself: nothing to set.
 
 **`--conversation-cache-park-checkpoints N`** (0: all). A conversation parked in RAM keeps its last N checkpoints and
-its first one instead of all of them (118 MB each on Qwen3.8-Flash-Next).
-- Gain: more conversations fit in the RAM budget (9 checkpoints took 807 MB with N = 3 instead of about 1.4 GB).
-- Cost: a request that branches off an older point of the conversation reads more again.
-
-**`--prelude-cache DIR`** (off) and **`--prelude-cache-mib N`** (5120). Saves each agent's prelude (its system turn:
-system prompt and tools, at least `--prompt-cache-root` tokens) once, in a store of its own.
-- Gain: a new chat of that agent starts after it, also after a restart: an 8,413-token prelude came back in 0.19 s
-  and the request read its prompt in 0.56 s instead of 7.4 s.
-- Cost: one write per distinct system prompt (235 MiB for 8K tokens, 0.2 s after the first reply) and disk space up
-  to N MiB. An agent that changes its system prompt every session (a date, a folder) gets a new prelude each time.
-- The server passes the id of `system` as `--system-role-token` by itself: a chat without a system prompt has no
-  prelude. Nothing to set.
+its first one (the end of the system prompt), instead of all of them; each is about 118 MB on Qwen3.8-Flash-Next.
+- Gain: more conversations fit in `--conversation-cache-mib` (9 checkpoints: 807 MB with N = 3 instead of 1.4 GB).
+- Cost: a request that goes back to an older point of a parked conversation reads more again. 3 is a good start.
 
 **`--peer-refill-sm N`** (0: the copy engine). With `--peer-device`, the adaptive tier copies experts into the second
-GPU with N blocks of that GPU's own loads instead of its copy engine.
-- Gain: decode 91.7 -> 97.0 tok/s on the reference PC; the CPU waited 1.5 ms a decode window for the second GPU
-  instead of 3.3 ms. On the copy engine, each layer's work on that card waited behind the whole round of copies.
-- Cost: during a round, N blocks of the second GPU copy (4 fill a PCIe 4.0 x4 link at 6 GB/s); a layer's work there
-  took 0.12 ms instead of 0.11 ms meanwhile. Experts outside registered memory keep the copy engine.
-- Use it with a second GPU on a slow link (a chipset or x4 slot). Measured only there.
+GPU with N blocks of that GPU's own loads. On the copy engine, the small copies that start each layer's work on that
+card waited behind the whole round (0.11 ms alone, 23 ms during a round of 72 copies).
+- Gain: decode 91.7 -> 97.0 tok/s; with `--adapt-decay 0.92 --peer-adapt-swaps 144` on top, 98.9 tok/s.
+- Cost: none measured (a layer's work there took 0.12 ms instead of 0.11 ms during a round). 4 fill a PCIe 4.0 x4 link.
+- Use it with a second GPU on a chipset or x4 slot; measured only there.
 
-**`"elastic": true`** in the config's `vision` section, with `"elastic_idle_s"` (120). The image encoder starts with
-the first picture and stops after that many seconds without one.
-- Gain: the CPU encoder's RAM (about 1 GB) is free while no picture comes.
-- Cost: the first picture after a stop waits for the encoder (2.0 s in all, the encoder started in 1.1 s); the next
-  ones as before (0.2 s).
+**`"elastic": true`** and **`"elastic_idle_s"`** (120) in the config's `vision` section. The image encoder starts with
+the first picture and stops after that many seconds without one. Gain: its RAM (about 1 GB on the CPU) is free between
+pictures. Cost: the first picture after a stop takes 2.0 s instead of 0.2 s.
 
-**Always on.** With `--peer-device`, the main GPU's tier no longer takes an expert still being copied into the second
-GPU (both cards held it before). The log lines, the second GPU's line and the Monitor cards need nothing either.
-
-### Settings that empty the disk caches
-
-The copies on disk are kept across restarts of the same engine version (and disk format) with the same model files and
-the same settings that change what the saved bytes mean. Changing one of these makes the next start drop every copy
-of both caches (they fill again as the conversations are read): the model, `--kv`, `--max-context`, `--kv-resident`,
-the draft layer's window, rope scaling, control vectors, `--vision`, and the experimental `--native-*` and `--no-*`
-switches. A rebuild of the same version keeps them.
-
-### Upstream settings tuned with these changes (reference PC)
-
-These options come from upstream Strata; the reference PC runs them with the fork, and each was measured there:
-
-| Setting | What it changed |
-| --- | --- |
-| `--kv-resident 20480` | The K/V lives in pinned RAM with 20,480 cells per layer in VRAM; the RTX 3080 Ti's expert cache went from 1,932 to 2,550 experts. Decode about +2.5%; 97-99.6% of the K/V reads still hit VRAM. Costs 1.33 GiB of pinned RAM at 112K tokens of context, 1.81 GiB at 150K. Empties the disk caches once. |
-| `STRATA_PARK_ASYNC=1`, `STRATA_CKPT_ASYNC=1`, `STRATA_CKPT_GATHER=1`, `STRATA_CKPT_POOL=1`, `STRATA_CKPT_POOL_READY=4` (env) | Parking a conversation and saving checkpoints move off the request's path. Two agents taking turns on ~10K-token conversations: a turn 1,542 -> 1,179 ms, a park 236 -> 7 ms. Costs 4 x 118 MB of RAM held from start. |
-| `--adapt-decay 0.92 --peer-adapt-swaps 144` | With `--peer-refill-sm`, the second GPU follows the text more closely: decode 97.0 -> 98.9 tok/s (about 2%, close to the noise between runs). Without the refill change the same settings made decode slower (79 tok/s). |
-| `--conversation-cache-min-tokens 2048` | With parks this cheap, conversations of 2K-6K tokens are parked too: the next turn of a 2.5K-token one took 0.37 s instead of 2.4 s. Not 0: the RAM cache has 4 slots, kept in least-recently-used order, and short side requests (session titles) would push agents' conversations out. |
-| `--max-context 153600` | 150K tokens of context (the model was trained on 262K). With `--kv-resident` it costs pinned RAM (+0.48 GiB) and 37 experts of the main GPU's cache. Empties the disk caches once. Agents compact by their own configured limit: raise it there too. |
-| `"vision": {"elastic": true, "elastic_idle_s": 60}` | The CPU image encoder's 1 GB of RAM free between pictures. |
-
-### How the disk cache works
-
-- Nothing is written while a conversation is in RAM. When RAM drops one of `--conversation-cache-disk-min-tokens` or
-  more (the slots or the budget are full, RAM is low), or cannot take it, it is written then; the request that pushed
-  it out waits for the write (0.26 s for 13.6K tokens).
-- Only what is new is written. The conversation is stored in blocks of 4K tokens named by their content, so a block
-  already on disk is never written again. Each write adds the new blocks and one snapshot of the model's state.
-- When the conversation comes back, its copy goes from the disk to the GPU, and only the tokens after its snapshot are
-  read again.
-- The copies are kept across restarts and rebuilds of the same engine version, with the same model and settings.
-  Another version, model or setting that changes the saved data starts with an empty cache.
-- When the cache is full, the conversation that came back least often leaves first, then the oldest.
-- To spare the SSD, files are written in large pieces and never rewritten, and nothing is flushed only for safety: a
-  file cut short by a crash fails its check and is deleted.
-
-To turn it on, add to the run config's `args` (the folder should be on an SSD):
+All of them on the reference PC (in the run config's `args`, and the `vision` section):
 
 ```json
 "--conversation-cache-disk", "/path/to/conversation-cache",
-"--conversation-cache-disk-mib", "32768",
+"--conversation-cache-disk-mib", "65536",
 "--conversation-cache-disk-min-tokens", "12288",
-"--conversation-cache-park-checkpoints", "3"
-```
-
-### Measured
-
-On one Linux PC with a PCIe 4 NVMe SSD, Qwen3.8-Flash-Next IQ3\_S, test conversations of 14K to 20K tokens:
-
-- A write when RAM let a 13.6K-token conversation go took 0.26 s (310 MiB).
-- A restore from disk took 0.2 to 0.26 s. The request then took 0.7 to 1.2 s, instead of about 7 s to read the prompt
-  again.
-- A conversation that grew by 6K tokens wrote 232 MiB and reused 178 MiB that was already on disk.
-- After a restore, every conversation still knew a code given at its very start. Five answers matched a fresh read
-  token for token.
-- A parked conversation with 9 checkpoints took 807 MB with `--conversation-cache-park-checkpoints 3`, instead of about
-  1.4 GB.
-
-### The prelude cache
-
-Agents send the same system prompt and tools at the start of every new chat: 7K to 10K tokens for the agents measured
-here. Strata already keeps that part in RAM while one of the agent's conversations is parked there. The prelude cache
-keeps it on disk too, so a new chat still starts after it once those conversations have left RAM or the engine has
-restarted.
-
-- The prelude ends at the first turn boundary after the system prompt, when it is at least `--prompt-cache-root`
-  tokens long (2,048 by default). It is saved right after the reply of the first chat that reads it, once. A chat that
-  does not start with a system prompt has no prelude (the server passes the id of `system` to the engine).
-- A new chat that starts with a saved prelude, and that RAM cannot resume further, comes back from it. The Monitor shows
-  these restores and the preludes written in a small graph of its own.
-- The folder keeps `--prelude-cache-mib` in all (5 GiB by default, about 20 preludes of 8K tokens). The prelude used
-  least leaves first. Like the disk cache, it is kept across restarts of the same engine version, model and settings.
-
-```json
+"--conversation-cache-park-checkpoints", "3",
 "--prelude-cache", "/path/to/prelude-cache",
-"--prelude-cache-mib", "5120"
-```
-
-Measured on the same PC with an 8,413-token system prompt: the save took 0.2 s (235 MiB). After a restart, the
-restore took 0.19 s and the request read its prompt in 0.56 s instead of 7.4 s. The answer (a code planted in the
-system prompt) was the same text.
-
-A conversation of 13.6K tokens written when RAM let it go took 310 MiB in 0.26 s; it came back from disk in 0.21 s and
-read its prompt in 0.96 s instead of about 6.8 s.
-
-### The second GPU's refill
-
-With `--peer-device`, the adaptive tier moves the experts the text uses into the second GPU while Strata writes an
-answer: up to `--peer-adapt-swaps` copies of about 2 MiB per round. On the copy engine, the small copies that start each
-layer's work on that card wait behind the whole round. Measured on an RTX 3060 behind the X570 chipset (PCIe 4.0 x4),
-one layer's work there took 0.11 ms alone and 23 ms during a round of 72 copies. With `--peer-refill-sm 4`, four
-blocks of the GPU copy the experts at the same 6 GB/s, and the layer's work took 0.12 ms.
-
-```json
+"--prelude-cache-mib", "10240",
 "--peer-refill-sm", "4"
 ```
 
-Decode on the same PC (RTX 3080 Ti + RTX 3060, four answers of 400 tokens, three rounds): 91.7 tok/s before, 97.0
-tok/s with `--peer-refill-sm 4`. The CPU waited 1.5 ms per decode window for the second GPU instead of 3.3 ms. Once
-these copies are cheap, the second GPU can follow the text more closely: `--adapt-decay 0.92 --peer-adapt-swaps 144`
-gave 98.9 tok/s (three runs; runs of the same settings differ by about 2%). Before the change, the same two settings
-made decode slower (79 tok/s), because each copy into the second GPU cost about 0.3 ms of every window. The copies move
-the same bytes, so the answers keep their quality.
+```json
+"vision": {"elastic": true, "elastic_idle_s": 60}
+```
 
-Not measured yet: days of real use, AMD (HIP), Intel (SYCL), Mac (Metal) and Windows. With a layer split across two
-GPUs (`--layer-split`) the disk cache and the prelude cache stay off.
+### Settings that empty the disk stores
+
+Both stores are kept across restarts and rebuilds of the same engine version with the same model and the settings that
+change what the saved bytes mean. Changing one of these makes the next start drop every copy (they fill again as they
+are used): the engine version, the model, `--kv`, `--max-context`, `--kv-resident`, the draft layer's window, rope
+scaling, control vectors, `--vision`, and the experimental `--native-*` and `--no-*` switches. A layer split
+(`--layer-split`) keeps both stores off.
+
+### Upstream settings tuned with these changes (reference PC)
+
+These options come from upstream Strata; each was measured on the reference PC with the fork:
+
+| Setting | What it changed |
+| --- | --- |
+| `--kv-resident 20480` | The K/V in pinned RAM with 20,480 cells per layer in VRAM: the RTX 3080 Ti holds about 600 more experts, decode about +2.5%. Costs 1.81 GiB of pinned RAM at 150K tokens of context. |
+| `--vram-reserve-mib 444` | Since 0.2.8, `--expert-cache auto` leaves the reserve plus 256 MiB for what loads after the cache; 444 keeps the 0.2.7 cache (2,511 experts instead of 2,385, about 1.5% of decode). Fine on Linux, where a nearly full card does not page to system RAM; keep the default on Windows. |
+| `STRATA_PARK_ASYNC=1`, `STRATA_CKPT_ASYNC=1`, `STRATA_CKPT_GATHER=1`, `STRATA_CKPT_POOL=1`, `STRATA_CKPT_POOL_READY=4` (env) | Parks and checkpoints off the request's path: two agents taking turns, a turn 1,542 -> 1,179 ms, a park 236 -> 7 ms. Costs 4 x 118 MB of RAM held from start. |
+| `--adapt-decay 0.92 --peer-adapt-swaps 144` | With `--peer-refill-sm`, the second GPU follows the text more closely (about +2%). Without it, slower. |
+| `--conversation-cache-min-tokens 2048` | With parks this cheap, 2K-6K-token conversations are parked too (a next turn 0.37 s instead of 2.4 s). Not 0: short side requests would take the slots. |
+| `--max-context 153600` | 150K tokens of context (the model was trained on 262K). Raise the agent's own context limit too. |
+
+Not measured yet: AMD (HIP), Intel (SYCL), Mac (Metal) and Windows.
 
 ## Models
 
