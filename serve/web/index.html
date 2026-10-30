@@ -182,6 +182,8 @@
             <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
         </div>
         <dl class="facts" id="cc-facts"></dl>
+        <!-- the two stores' graphs side by side (one below the other on a narrow window) -->
+        <div class="cc-charts">
         <div class="cc-chart" id="cc-dsk" hidden>
           <div class="cc-chart-head"><span class="cc-chart-title">Conversations on disk per hour (prompt tokens)</span>
             <span class="cc-legend" id="cc-dsk-legend"></span><span class="muted small" id="cc-dsk-sum"></span></div>
@@ -193,8 +195,9 @@
           <div class="cc-chart-head"><span class="cc-chart-title">Preludes per hour (prompt tokens)</span>
             <span class="cc-legend" id="cc-pre-legend"></span><span class="muted small" id="cc-pre-sum"></span></div>
           <div class="cc-plot" id="cc-pre-plot"><svg class="cc-svg" id="cc-pre-svg" role="img"
-            aria-label="Prompt tokens the prelude cache gave back (columns) and saved (line) each hour over the last 24 hours"></svg></div>
+            aria-label="Prompt tokens the prelude cache gave back (columns) and wrote (line) each hour over the last 24 hours"></svg></div>
           <div class="cc-tip" hidden></div>
+        </div>
         </div>
       </div>
 
