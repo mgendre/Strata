@@ -108,6 +108,9 @@ def popen(what: str, args: list, role: str = "engine", **kw):
 
 # How long close() gives the engine at each step of ending it (seconds). Module values so that a test can shorten them.
 ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 5, 20
+# --conversation-cache-disk: a clean stop writes the conversations only RAM holds (the engine gives it at most 30 s), so
+# QUIT gets this much longer; 20 + 25 + 5 stays under the 60 s a systemd unit commonly gives a stop
+ENGINE_DISK_STOP_WAIT_S = 25
 
 
 def rttime_limit_note() -> str:
@@ -2775,7 +2778,7 @@ class StrataEngine:
                     self.proc.stdin.write("STOP\nQUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
+                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S + (ENGINE_DISK_STOP_WAIT_S if conversation_disk_dir(self) else 0))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=ENGINE_TERM_WAIT_S)
