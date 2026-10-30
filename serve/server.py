@@ -4954,7 +4954,10 @@ class Service:
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
-                                       amd=getattr(self, "backend", None) == "hip")
+                                       amd=getattr(self, "backend", None) == "hip",
+                                       # the Disk write card's last day, kept beside the config across restarts
+                                       writes_path=(str(Path(self.config_path).with_suffix("")) + ".disk-writes.json"
+                                                    if getattr(self, "config_path", None) else None))
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)

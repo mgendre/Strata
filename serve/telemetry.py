@@ -13,7 +13,9 @@ Anything that cannot be read is None; nothing here can stop the server.
 from __future__ import annotations
 
 import collections
+import contextlib
 import ctypes
+import json
 import os
 import platform
 import re
@@ -528,8 +530,55 @@ class _CpuRamFallback:
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
+class DiskWrites:
+    """The bytes the PC wrote to its disks (all programs) over the last day, for the Monitor's Disk write card: one
+    reading a minute of the counter of bytes written since boot, kept across a restart of the server in `path` (the
+    config's name + .disk-writes.json).  A counter that went down (the PC restarted) counts from zero again."""
+    EVERY_S, KEEP_S, SAVE_S = 60, 24 * 3600, 600
+
+    def __init__(self, path=None):
+        self.path, self.rows, self.saved_at = path, collections.deque(), 0.0
+        if path:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    rows = json.load(f)
+                self.rows.extend([int(r[0]), int(r[1])] for r in rows if isinstance(r, list) and len(r) == 2
+                                 and all(isinstance(v, (int, float)) for v in r))
+            except (OSError, ValueError, TypeError):
+                pass
+
+    def add(self, t: float, written: int):
+        """A reading of the counter at time `t`: kept once a minute, the oldest past a day dropped, saved every 10 min."""
+        if self.rows and t - self.rows[-1][0] < self.EVERY_S:
+            return
+        self.rows.append([round(t), int(written)])
+        while len(self.rows) > 1 and self.rows[1][0] <= t - self.KEEP_S:
+            self.rows.popleft()                         # (the reading a day back stays: it is the start of the day)
+        if self.path and t - self.saved_at >= self.SAVE_S:
+            self.saved_at = t
+            tmp = f"{self.path}.tmp-{os.getpid()}"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(list(self.rows), f, separators=(",", ":"))
+                os.replace(tmp, self.path)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp)
+
+    def total(self) -> tuple:
+        """(bytes written since the first reading kept, the time of that reading): the last day once the server has
+        read the counter for a day, less before; (None, None) before two readings."""
+        if len(self.rows) < 2:
+            return None, None
+        out, prev = 0, self.rows[0][1]
+        for _, b in list(self.rows)[1:]:
+            out += b - prev if b >= prev else b
+            prev = b
+        return out, self.rows[0][0]
+
+
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, writes_path=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
@@ -538,6 +587,7 @@ class Telemetry:
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
+        self.writes = DiskWrites(writes_path)          # the Disk write card's last day
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
@@ -594,6 +644,7 @@ class Telemetry:
         if c is None:   # psutil found no disk (a gVisor container, Windows with its disk counters off)
             return None, None
         t = time.time()
+        self.writes.add(t, c.write_bytes)
         prev, self._disk_prev = self._disk_prev, (t, c.read_bytes, c.write_bytes)
         if prev is None or t <= prev[0]:
             return None, None
@@ -630,6 +681,7 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        s["disk_written_day"], s["disk_written_since"] = self.writes.total()
         if self.extra:
             try:
                 s.update(self.extra())
