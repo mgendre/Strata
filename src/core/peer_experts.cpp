@@ -430,10 +430,10 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
     if (f.had_d) { L.had_block = f.had_block; L.d_signs = d_sh_; }
     // the down rows straight into the host `out`, a block's 32 rows a 128-byte store, while the other blocks still
-    // compute (no scatter after the experts); --peer-slow-link only (without it, the scatter, as upstream)
+    // compute (no scatter after the experts); --peer-slow-link-optimizations only (without it, the scatter, as upstream)
     const bool down_host = slow_link_ && direct && strata::kernels::native_expert_down_host_ok(f.d_type, f.n_ff);
     // the input quantized on the host (quantize_q8_1_host: the same bytes; APR's rotation before it stays the device's);
-    // --peer-slow-link only
+    // --peer-slow-link-optimizations only
     const bool host_q8 = slow_link_ && cpu_avx2_f16c() && !f.had_gu;
     const size_t in_f32 = (size_t) (n_tok * H) * sizeof(float), in_q8 = (size_t) n_tok * (H / 32) * kQ8Block;
     if (peer_check() && (down_host || host_q8)) {
