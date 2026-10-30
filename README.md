@@ -1,32 +1,10 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
-  </picture>
-</p>
+# Strata Experimental
 
-<h3 align="center">Run powerful AI on your own computer.</h3>
-<p align="center">Chat, code and work with images, locally.</p>
+> A fork of **[Strata](https://github.com/Niko1221/Strata)**, created by **[Niko1221](https://github.com/Niko1221)**.
+> Strata itself (its engine and apps) is their work; this fork only adds the changes listed below.
+> The [original README](#the-original-strata-readme) follows, unchanged.
 
-<p align="center">
-  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
-  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
-</p>
-
-<p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
-</p>
-
-<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
-
-**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
-
-## Strata Experimental (this fork)
-
-This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). The branch `strata-experimental` is Strata
+The branch `strata-experimental` is Strata
 plus the changes below; `main` follows upstream. Every new option is off by default: without them, Strata behaves as
 upstream does, apart from the few fixes marked "always".
 
@@ -36,7 +14,7 @@ an agent whose prelude is gone, reads its whole prompt again: seconds to tens of
 SSD without writing during normal work, makes parked conversations smaller in RAM, and speeds up a second GPU on a
 slow link.
 
-### What changes compared with Strata
+## What changes compared with Strata
 
 | Change | Option |
 | --- | --- |
@@ -48,9 +26,19 @@ slow link.
 | **No expert on both GPUs.** The main GPU no longer takes an expert that is being copied into the second GPU. | always, with `--peer-device` |
 | **Second GPU rows straight to RAM, input quantized on the host.** The second GPU writes its expert rows into RAM as whole 128-byte lines while it computes, and gets its input already quantized (3.5x fewer bytes). The same bits; decode windows about 4% shorter. | always, with `--peer-device` (`STRATA_PEER_DOWN_HOST=0` / `STRATA_PEER_HOST_Q8=0` turn either off) |
 | **Second GPU line.** One log line per request: where the experts ran (main GPU, second GPU, PCIe, CPU) and how long the CPU waited for the second GPU. | always, with `--peer-device` |
-| **Monitor.** The Conversation cache card has a small graph per store on disk (conversations, preludes): the prompt tokens it gave back each hour of the last day, and a line of what it wrote. A Disk write card sits next to Disk read. | always |
+| **Prompt reads skip the experts no token uses** (taken from upstream PR [#4283](https://github.com/Niko1221/Strata/pull/4283), by Stefano Sinden; see below). A prompt chunk of 1,024 tokens or more no longer copies over PCIe the experts no token of the chunk routes to. The same bits. | `STRATA_PREFILL_ROUTED_STREAM=1` (env) |
+| **Monitor.** A widget per GPU under the tiles: its role (model, peer experts for the second GPU, layer split), load, VRAM, temperature, power, and PCIe traffic each way as a share of its link (Gen4 x16 about 30 GB/s each way, x4 about 7.5). The Conversation cache card has a small graph per store on disk (conversations, preludes): the prompt tokens it gave back each hour of the last day, and a line of what it wrote. A Disk write card sits next to Disk read, with what the disks took over the last 24 hours. | always |
 
-### The settings
+## Taken from upstream pull requests
+
+Open pull requests of [Niko1221/Strata](https://github.com/Niko1221/Strata/pulls) that this fork carries before they
+are merged upstream. Each keeps its author's commit; credit goes to them.
+
+| Upstream PR | Author | What it does | Here |
+| --- | --- | --- | --- |
+| [#4283](https://github.com/Niko1221/Strata/pull/4283) | Stefano Sinden ([@bitaccesscomau](https://github.com/bitaccesscomau)) | `STRATA_PREFILL_ROUTED_STREAM=1` (opt-in): a streamed prompt chunk publishes each layer's routing, and the copies not issued yet of the experts no token routes to are dropped. Routed experts go to the same ring slots, so the results are the same bits. | On in the reference config. Measured on agent follow-ups (after about 25K reused tokens): reads of 1-2K new tokens +16%, 2-4K +4%, 4-8K +6%. One conflict with upstream #4005 resolved: the switch stays off with `STRATA_PREFILL_COPY_EVENT_EVERY` > 1 or `STRATA_PREFILL_COPY_WAIT_DEDUPE`. |
+
+## The settings
 
 Numbers from the reference PC: Linux, Ryzen 7 5800X3D, 64 GB DDR4-3600, RTX 3080 Ti + RTX 3060 behind the X570
 chipset (PCIe 4.0 x4), a PCIe 4.0 NVMe SSD, Qwen3.8-Flash-Next IQ3\_S. Other PCs will see other numbers.
@@ -125,7 +113,7 @@ All of them on the reference PC (in the run config's `args`, and the `vision` se
 "vision": {"elastic": true, "elastic_idle_s": 60}
 ```
 
-### Settings that empty the disk stores
+## Settings that empty the disk stores
 
 Both stores are kept across restarts and rebuilds of the same engine version with the same model and the settings that
 change what the saved bytes mean. Changing one of these makes the next start drop every copy (they fill again as they
@@ -133,7 +121,7 @@ are used): the engine version, the model, `--kv`, `--max-context`, `--kv-residen
 scaling, control vectors, `--vision`, and the experimental `--native-*` and `--no-*` switches. A layer split
 (`--layer-split`) keeps both stores off.
 
-### Upstream settings tuned with these changes (reference PC)
+## Upstream settings tuned with these changes (reference PC)
 
 These options come from upstream Strata; each was measured on the reference PC with the fork:
 
@@ -147,6 +135,38 @@ These options come from upstream Strata; each was measured on the reference PC w
 | `--max-context 153600` | 150K tokens of context (the model was trained on 262K). Raise the agent's own context limit too. |
 
 Not measured yet: AMD (HIP), Intel (SYCL), Mac (Metal) and Windows.
+
+---
+
+# The original Strata README
+
+<sub>From [Niko1221/Strata](https://github.com/Niko1221/Strata), by Niko1221, kept as it is.</sub>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
+    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
+  </picture>
+</p>
+
+<h3 align="center">Run powerful AI on your own computer.</h3>
+<p align="center">Chat, code and work with images, locally.</p>
+
+<p align="center">
+  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
+  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
+  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
+  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
+</p>
+
+<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
+
+**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
 ## Models
 
