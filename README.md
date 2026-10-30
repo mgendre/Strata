@@ -25,7 +25,17 @@ slow link.
 | **Image encoder on the CPU, started on demand.** `"elastic": true` now works for a CPU encoder, also with `--peer-device`. | `"elastic": true` (config, `vision` section) |
 | **No expert on both GPUs.** The main GPU no longer takes an expert that is being copied into the second GPU. | always, with `--peer-device` |
 | **Second GPU line.** One log line per request: where the experts ran (main GPU, second GPU, PCIe, CPU) and how long the CPU waited for the second GPU. | always, with `--peer-device` |
+| **Prompt reads skip the experts no token uses** (taken from upstream PR [#4283](https://github.com/Niko1221/Strata/pull/4283), by Stefano Sinden; see below). A prompt chunk of 1,024 tokens or more no longer copies over PCIe the experts no token of the chunk routes to. The same bits. | `STRATA_PREFILL_ROUTED_STREAM=1` (env) |
 | **Monitor.** A widget per GPU under the tiles: its role (model, peer experts for the second GPU, layer split), load, VRAM, temperature, power, and PCIe traffic each way as a share of its link (Gen4 x16 about 30 GB/s each way, x4 about 7.5). The Conversation cache card has a small graph per store on disk (conversations, preludes): the prompt tokens it gave back each hour of the last day, and a line of what it wrote. A Disk write card sits next to Disk read, with what the disks took over the last 24 hours. | always |
+
+## Taken from upstream pull requests
+
+Open pull requests of [Niko1221/Strata](https://github.com/Niko1221/Strata/pulls) that this fork carries before they
+are merged upstream. Each keeps its author's commit; credit goes to them.
+
+| Upstream PR | Author | What it does | Here |
+| --- | --- | --- | --- |
+| [#4283](https://github.com/Niko1221/Strata/pull/4283) | Stefano Sinden ([@bitaccesscomau](https://github.com/bitaccesscomau)) | `STRATA_PREFILL_ROUTED_STREAM=1` (opt-in): a streamed prompt chunk publishes each layer's routing, and the copies not issued yet of the experts no token routes to are dropped. Routed experts go to the same ring slots, so the results are the same bits. | On in the reference config. Measured on agent follow-ups (after about 25K reused tokens): reads of 1-2K new tokens +16%, 2-4K +4%, 4-8K +6%. One conflict with upstream #4005 resolved: the switch stays off with `STRATA_PREFILL_COPY_EVENT_EVERY` > 1 or `STRATA_PREFILL_COPY_WAIT_DEDUPE`. |
 
 ## The settings
 
