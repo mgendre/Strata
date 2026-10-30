@@ -299,12 +299,17 @@ bool peer_timing() {   // STRATA_PEER_TIMING=1: PeerExperts::take_timing's sums 
     static const bool on = [] { const char* v = std::getenv("STRATA_PEER_TIMING"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
-bool peer_down_host() {   // with --peer-slow-link, STRATA_PEER_DOWN_HOST=0 leaves this half off (the device rows, then the scatter)
-    static const bool on = [] { const char* v = std::getenv("STRATA_PEER_DOWN_HOST"); return v == nullptr || std::atoi(v) != 0; }();
+// --peer-slow-link's two halves, each on with it unless set to 0 (to compare them, or if a problem shows):
+// STRATA_SECOND_GPU_RESULTS_TO_RAM=0: the second GPU's results computed into its own memory, then copied to RAM after
+// its experts (the scatter), as without the option
+bool peer_down_host() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SECOND_GPU_RESULTS_TO_RAM"); return v == nullptr || std::atoi(v) != 0; }();
     return on;
 }
-bool peer_host_q8_env() {   // with --peer-slow-link, STRATA_PEER_HOST_Q8=0 leaves this half off (floats in, quantized there)
-    static const bool on = [] { const char* v = std::getenv("STRATA_PEER_HOST_Q8"); return v == nullptr || std::atoi(v) != 0; }();
+// STRATA_SECOND_GPU_SMALLER_INPUT=0: the second GPU's input sent as floats and converted to q8_1 there, as without the
+// option (with it, the CPU converts it before it is sent: 3.5x fewer bytes, the same bytes as the GPU's conversion)
+bool peer_host_q8_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SECOND_GPU_SMALLER_INPUT"); return v == nullptr || std::atoi(v) != 0; }();
     return on;
 }
 bool cpu_avx2_f16c() {
