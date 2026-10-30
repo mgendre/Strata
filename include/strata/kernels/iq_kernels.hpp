@@ -54,8 +54,13 @@ struct NativeExpertLayout {
     bool gu_nib = false;                // STRATA_EXPERT_NIBBLE: gate/up as 4-bit codes (strata/core/expert_nibble.hpp's
                                         // slot); set only by native_expert_layout_nib
     const float* d_signs = nullptr;
+    // multi-GPU (the second GPU's rows): `out` is mapped host memory - the down kernel keeps a block's sums and writes
+    // each entry's rows as one store (32 rows: 128 bytes; the same values); only where native_expert_down_host_ok
+    bool out_host = false;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+/// Whether `NativeExpertLayout::out_host` is taken for this down type and n_ff (the down kernel's branch keeps its sums)
+bool native_expert_down_host_ok(int d_type, int64_t n_ff) noexcept;
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:
 /// up_off = the up rows' codes, down_off = kGuBytes, bytes = the slot), the GGUF down rows after them.  IQ2_S /
 /// IQ3_XXS / IQ3_S at n_embd 2560, n_ff 640 only, and only in a build with the kernels (`native_expert_nib_supported`).

@@ -910,8 +910,8 @@ def conversation_disk_dir(engine) -> str | None:
 
 
 class ConvDiskStatus:
-    """--conversation-cache-disk: the engine's <dir>/status.json (its levels, counters and one row per copy), read
-    again when it changes, and what the disk under it has written since the PC started (/sys/block/*/stat)."""
+    """A store on disk (--conversation-cache-disk, --prelude-cache): the engine's <dir>/status.json (its counters and
+    one row per copy), read again when it changes."""
 
     def __init__(self):
         self.path, self.mtime, self.data = None, None, None
