@@ -153,6 +153,27 @@ main { flex: 1; min-height: 0; display: flex; }
 .cc-tip b { color: var(--st-ink); font-weight: 600; font-variant-numeric: tabular-nums; }
 .cc-tip div { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .cc-tip i { display: inline-block; width: 10px; height: 2px; border-radius: 1px; }
+/* the GPU widgets: one card per GPU under the tiles - its load, VRAM and PCIe link each way (to the GPU: the info blue
+   of the PCIe tile; from it: purple) */
+.gpu-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); gap: var(--st-s-4); }
+.gpu-cards[hidden] { display: none; }
+.gpu-card { display: flex; flex-direction: column; gap: var(--st-s-1); padding: var(--st-s-4) var(--st-s-5); min-width: 0;
+  --gc-rx: var(--st-info); --gc-tx: #6250d6; }
+[data-theme="dark"] .gpu-card { --gc-tx: #9085e9; }
+.gpu-card__head { display: flex; align-items: center; gap: var(--st-s-2); min-width: 0; }
+.gpu-card__head .card-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.gpu-card__head .st-badge[hidden] { display: none; }
+.gpu-card__env { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.gpu-card__load { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: end; gap: var(--st-s-4);
+  margin: var(--st-s-2) 0 var(--st-s-1); }
+.gpu-card__load > div { display: flex; flex-direction: column; gap: 6px; }
+.gpu-card__pcie[hidden] { display: none; }
+.gpu-card .st-progress[data-tone="tx"] .st-progress__bar { background: var(--gc-tx); }
+.gpu-card__spark { display: block; width: 100%; height: 48px; margin-top: var(--st-s-2); overflow: visible; }
+.gpu-card__spark path { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.gpu-card__spark .rx { stroke: var(--gc-rx); }
+.gpu-card__spark .tx { stroke: var(--gc-tx); }
+.gpu-card__spark .grid { stroke: var(--st-line); stroke-width: 1; }   /* the link half full and full */
 
 .mcp-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
 .cfg-form { display: grid; grid-template-columns: minmax(min(180px, 100%), max-content) minmax(0, 1fr); gap: var(--st-s-3) var(--st-s-4);
