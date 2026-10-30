@@ -17724,6 +17724,8 @@ int main(int argc, char** argv) {
                              100.0 * (double) (req_look - req_hits) / all, wait,
                              dec_windows > 0 ? wait / (double) dec_windows : 0.0,
                              (long long) (peer.swaps() - peer_swaps0));
+                if (const std::string pt = peer.take_timing(); !pt.empty())   // STRATA_PEER_TIMING=1
+                    std::fprintf(stderr, "strata serve: %s\n", pt.c_str());
             }
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "

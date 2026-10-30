@@ -20,6 +20,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -91,6 +92,9 @@ public:
     /// Before `open`: the adaptive refill by `blocks` blocks of SM loads (0 = the copy engine, the default).
     void set_refill_sm(int blocks) { refill_sm_want_ = blocks; }
     double ms_wait = 0;                               ///< host time spent in finish() waiting for the peer
+    /// STRATA_PEER_TIMING=1 (a diagnostic): where a layer's peer call goes, summed since the last call and reset -
+    /// "" when off or nothing was launched
+    std::string take_timing();
 
 private:
     bool refill_jobs(const strata::kernels::CopyJob* jobs, size_t n, std::string& err);
@@ -120,6 +124,17 @@ private:
     std::vector<int32_t> row_of_;                     ///< compact row -> original entry
     int64_t launched_rows_ = 0;
     bool launched_direct_ = false;
+    // STRATA_PEER_CHECK=1: the rows of the faster path compared bit for bit with the launches it replaces (check_ref_:
+    // those rows; checked_ / mismatched_: rows compared / different)
+    std::vector<float> check_ref_;
+    int64_t checked_ = 0, mismatched_ = 0;
+    // STRATA_PEER_TIMING: device events around the copies, the kernels and the scatter; host clocks around launch()
+    // and finish(); sums in microseconds
+    cudaEvent_t tev_[5] = {};   // before the copies, after them, after the input's quantization, after the experts, after the scatter
+    std::chrono::steady_clock::time_point t_launch0_{};
+    double t_calls_ = 0, t_host_launch_ = 0, t_copies_ = 0, t_quant_ = 0, t_kernels_ = 0, t_scatter_ = 0, t_wait_ = 0, t_until_ = 0;
+    double t_rows_ = 0, t_groups_ = 0;
+    int64_t launched_groups_ = 0;
 };
 
 }  // namespace strata::core
