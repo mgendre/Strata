@@ -20,6 +20,22 @@
 gain comes from the fork's changes and the upstream settings tuned with them (both below); the fork's first sessions,
 before them, ran as fast as upstream.
 
+**The standard benchmark** (`strata bench run`, protocol `strata-qwen38-thinking-v1-draft.1`), the same PC on the same day,
+a freshly loaded engine each time: the upstream release **v0.2.8** (engine 0.1.54, the prebuilt CUDA 13 package) with the
+reference config minus the fork-only options, against this fork with the full reference config.
+
+| Case | Release v0.2.8 | This fork | Change |
+| --- | ---: | ---: | ---: |
+| Decode, short prompt | 88.0 tok/s | 99.5 tok/s | +13% |
+| Decode, 4K-token prompt | 82.9 tok/s | 97.6 tok/s | +18% |
+| Decode, 16K-token prompt | 83.9 tok/s | 101.0 tok/s | +20% |
+| Prompt read, 4K tokens | 1,959 tok/s | 2,089 tok/s | +7% |
+| Prompt read, 16K tokens | 2,719 tok/s | 2,705 tok/s | equal |
+| Sanity checks | 12 of 12 | 12 of 12 | |
+
+Medians of three runs each. Every benchmark request is a new conversation, so the disk and prelude caches do not show
+here; on real traffic they make prompt reads three times shorter (above).
+
 Made for agent tools (OpenCode, Claude Code, subagents) that switch between long conversations, and for a second GPU on
 a slow PCIe link. The branch `strata-experimental` is Strata plus these changes; `main` follows upstream. Every new
 option is off by default: without them, Strata behaves as upstream.
