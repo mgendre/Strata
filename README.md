@@ -130,9 +130,7 @@ link after the experts (x4: ~27 us a layer). Now its down kernel writes each ent
   experts, the CPU's wait).
 - Values: a switch, no number. Add `--peer-slow-link` to turn it on; without it the second GPU works as upstream
   (floats in, rows copied back after its experts). Turn it on for a second GPU on a narrow or shared link; on a fast
-  one it is harmless, but untested. It is the only setting: both
-  halves (the smaller input, the results straight to RAM) come with it, and both give the same results as without it,
-  so there is nothing to choose between them. Reference PC: on. The direct rows apply to two down-row
+  one it is harmless, but untested. Reference PC: on. The direct rows apply to two down-row
   formats at Qwen3.8-Flash-Next's expert width (IQ4_NL among them, the reference pack's); other formats keep the old
   path by themselves. `STRATA_PEER_CHECK=1` and `STRATA_PEER_TIMING=1` are diagnostics: off in normal use.
 
