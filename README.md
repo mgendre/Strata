@@ -36,7 +36,7 @@ the chipset), NVMe SSD, Qwen3.8-Flash-Next IQ3\_S.
 | `--prelude-cache-mib N` | 5120 | Space in MiB. About 28 KB a token: 245 MiB for a 9K-token prelude | 10240 |
 | `--prompt-cache-root N` (upstream) | 2048 | The shortest prelude saved, in tokens | 2048 |
 | `--conversation-cache-park-checkpoints N` | 0 (all) | Checkpoints kept per parked conversation, about 118 MB each. 2-3 for agents | 3 |
-| `--peer-refill-compute-units N` | 0 (copy engine) | How many of the second GPU's compute units (NVIDIA's SMs; an RTX 3060 has 28) do the copies. On a PCIe 4.0 x4 link: 1 is too slow, 2-4 are best, 8 takes units from the experts. A wider link may need more (not measured) | 4 |
+| `--peer-refill-compute-units N` | 0 (copy engine) | How many of the second GPU's compute units (NVIDIA's SMs; an RTX 3060 has 28) do the copies. On a PCIe 4.0 x4 link: 1 is too slow, 2-4 are best, 8 takes units from the experts. A wider link may need more (not measured) | 3 |
 | `--peer-slow-link-optimizations` | off | A switch, for a second GPU in an x4 or chipset slot | on |
 | `STRATA_PREFILL_ROUTED_STREAM` (env) | off | 1 = on | 1 |
 | `"elastic"`, `"elastic_idle_s"` (`vision`) | false, 120 | The encoder starts with the first picture and stops after N seconds without one | true, 60 |
@@ -50,7 +50,7 @@ The reference PC's run config:
 "--conversation-cache-park-checkpoints", "3",
 "--prelude-cache", "/path/to/prelude-cache",
 "--prelude-cache-mib", "10240",
-"--peer-refill-compute-units", "4",
+"--peer-refill-compute-units", "3",
 "--peer-slow-link-optimizations"
 ```
 
