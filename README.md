@@ -4,6 +4,22 @@
 > Strata itself (its engine and apps) is their work; this fork only adds the changes below.
 > The [original README](#the-original-strata-readme) follows, unchanged.
 
+**The result: +17-25% decode with two unlike cards, the second on a slow PCIe link.** On the reference PC (RTX 3080 Ti
++ RTX 3060 on PCIe 4.0 x4), with real agent traffic (OpenCode), against upstream Strata 0.1.52 on the same PC:
+
+| | Upstream Strata 0.1.52 | This fork |
+| --- | ---: | ---: |
+| Decode, conversations of 5-20K tokens | 86.5 tok/s | 108.4 tok/s (+25%) |
+| Decode, 20-40K tokens | 84.1 tok/s | 103.0 tok/s (+22%) |
+| Decode, 40-60K tokens | 82.0 tok/s | 97.9 tok/s (+19%) |
+| Decode, 60-100K tokens | 81.4 tok/s | 95.3 tok/s (+17%) |
+| Prompt read per request (average) | 3.46 s | 1.12 s (3x less) |
+| Prompt tokens reused | 88.5% | 97.4% |
+
+2,868 requests upstream (Oct 26-28) against 1,427 with the fork (Oct 30), each counted only at 5K tokens or more. The
+gain comes from the fork's changes and the upstream settings tuned with them (both below); the fork's first sessions,
+before them, ran as fast as upstream.
+
 Made for agent tools (OpenCode, Claude Code, subagents) that switch between long conversations, and for a second GPU on
 a slow PCIe link. The branch `strata-experimental` is Strata plus these changes; `main` follows upstream. Every new
 option is off by default: without them, Strata behaves as upstream.
