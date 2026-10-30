@@ -135,9 +135,9 @@ main { flex: 1; min-height: 0; display: flex; }
    disk neon pink, validated together in both themes: color-blind separation, 3:1 on the card; writes per hour: slot 7;
    preludes: neon green, light #00a83a / dark #00b140, validated all-pairs with the RAM blue and the disk pink) -
    with the copies on disk below; without the disk level the left side is the whole card */
-.cc-card { --cc-ram: #2a78d6; --cc-dsk: #d6249f; --cc-pre: #00a83a; --cc-writes: #6250d6;
+.cc-card { --cc-ram: #2a78d6; --cc-dsk: #d6249f; --cc-pre: var(--st-accent); --cc-writes: #6250d6;
   --cc-grid: var(--st-line-soft); --cc-axis: var(--st-line); }
-[data-theme="dark"] .cc-card { --cc-ram: #3987e5; --cc-dsk: #f0449e; --cc-pre: #00b140; --cc-writes: #9085e9; }
+[data-theme="dark"] .cc-card { --cc-ram: #3987e5; --cc-dsk: #f0449e; --cc-writes: #9085e9; }
 .cc-card:not(.cc-has-disk) .cc-disk-only { display: none; }
 .cc-split { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--st-s-6); align-items: start; }
 .cc-card.cc-has-disk .cc-split { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }

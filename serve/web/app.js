@@ -405,11 +405,6 @@ function renderConvCache(c) {
   ]);
   renderConvDisk(c);
   renderPrelude(c.prelude);
-  $("cc-note").textContent = c.enabled && c.disk
-    ? "A request that continues a parked conversation gets its state back instead of reading it again. Long conversations are also saved on disk after a reply, step by step, so one that RAM lets go comes back from disk; the copies are kept across restarts, the least used leave first when the disk budget is full."
-    : c.enabled
-    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
-    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
 }
 
 // --conversation-cache-disk: the disk level, where restored state came from, the disk writes, what RAM and disk gave
