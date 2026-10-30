@@ -58,20 +58,27 @@ the chipset), NVMe SSD, Qwen3.8-Flash-Next IQ3\_S.
 
 ## The settings
 
-| Option | Default | Values | Reference PC |
-| --- | --- | --- | --- |
-| `--conversation-cache-disk DIR` | off | A folder on an SSD (NVMe best) | a folder on its NVMe |
-| `--conversation-cache-disk-mib N` | 32768 | Disk space in MiB. About 17 KB a token: 2.5 GB for a 150K-token conversation | 65536 |
-| `--conversation-cache-disk-min-tokens N` | 12288 | The shortest conversation written. Below 4096 it saves nothing | 12288 |
-| `--conversation-cache-disk-day-gib N` | 200 | Daily writes before a warning in the log (nothing stops). Your SSD's TBW divided by the days it should last | 200 |
-| `--prelude-cache DIR` | off | A folder on an SSD | a folder on its NVMe |
-| `--prelude-cache-mib N` | 5120 | Space in MiB. About 28 KB a token: 245 MiB for a 9K-token prelude | 10240 |
-| `--prompt-cache-root N` (upstream) | 2048 | The shortest prelude saved, in tokens | 2048 |
-| `--conversation-cache-park-checkpoints N` | 0 (all) | Checkpoints kept per parked conversation, about 118 MB each. 2-3 for agents | 3 |
-| `--peer-refill-compute-units N` | 0 (copy engine) | How many of the second GPU's compute units (NVIDIA's SMs; an RTX 3060 has 28) do the copies. On a PCIe 4.0 x4 link: 1 is too slow, 2-4 are best, 8 takes units from the experts. A wider link may need more (not measured) | 3 |
-| `--peer-slow-link-optimizations` | off | A switch, for a second GPU in an x4 or chipset slot | on |
-| `STRATA_PREFILL_ROUTED_STREAM` (env) | off | 1 = on | 1 |
-| `"elastic"`, `"elastic_idle_s"` (`vision`) | false, 120 | The encoder starts with the first picture and stops after N seconds without one | true, 60 |
+**New**: only in this fork. **Changed**: an upstream option that behaves differently here (what changes is in the
+row). Every option not listed behaves as upstream.
+
+| Option | Status | Default | Values | Reference PC |
+| --- | --- | --- | --- | --- |
+| `--conversation-cache-disk DIR` | New | off | A folder on an SSD (NVMe best) | a folder on its NVMe |
+| `--conversation-cache-disk-mib N` | New | 32768 | Disk space in MiB. About 17 KB a token: 2.5 GB for a 150K-token conversation | 65536 |
+| `--conversation-cache-disk-min-tokens N` | New | 12288 | The shortest conversation written. Below 4096 it saves nothing | 12288 |
+| `--conversation-cache-disk-day-gib N` | New | 200 | Daily writes before a warning in the log (nothing stops). Your SSD's TBW divided by the days it should last | 200 |
+| `--prelude-cache DIR` | New | off | A folder on an SSD | a folder on its NVMe |
+| `--prelude-cache-mib N` | New | 5120 | Space in MiB. About 28 KB a token: 245 MiB for a 9K-token prelude | 10240 |
+| `--prompt-cache-root N` | Changed | 2048 | Upstream: where the root checkpoint goes. Here also: the shortest prelude the prelude cache saves, in tokens | 2048 |
+| `--conversation-cache-park-checkpoints N` | New | 0 (all) | Checkpoints kept per parked conversation, about 118 MB each. 2-3 for agents | 3 |
+| `--peer-refill-compute-units N` | New | 0 (copy engine) | How many of the second GPU's compute units (NVIDIA's SMs; an RTX 3060 has 28) do the copies. On a PCIe 4.0 x4 link: 1 is too slow, 2-4 are best, 8 takes units from the experts. A wider link may need more (not measured) | 3 |
+| `--peer-slow-link-optimizations` | New | off | A switch, for a second GPU in an x4 or chipset slot | on |
+| `STRATA_PREFILL_ROUTED_STREAM` (env) | New (upstream PR #4283) | off | 1 = on | 1 |
+| `"elastic"`, `"elastic_idle_s"` (`vision`) | Changed | false, 120 | The encoder starts with the first picture and stops after N seconds without one. Upstream: only with `"vram_elastic": true`, even for an encoder on the CPU. Here an encoder on the CPU, which needs no VRAM, does it without, also with `--peer-device` | true, 60 |
+
+Behaviour that changed with no option to set: a clean stop writes the conversations RAM holds to the disk store
+(with `--conversation-cache-disk`), and the server then waits up to 45 s instead of 20 for the engine to end; with
+`--peer-device`, the main GPU no longer takes an expert that is being copied into the second GPU.
 
 The reference PC's run config:
 
