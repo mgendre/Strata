@@ -955,11 +955,14 @@ class ConvCacheLog:
     # --prelude-cache: "prelude cache: restored a prelude of N tokens in ..." (a new chat that started after an agent's
     # system prompt read from its own store)
     PRELUDE = re.compile(r"prelude cache: restored a prelude of (\d+) tokens")
+    PRELUDE_SAVED = re.compile(r"prelude cache: saved a prelude of (\d+) tokens")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
         self.key, self.pos = None, 0
         self.lock = threading.Lock()                    # the monitor and the usage sampler both read on
+        self.on_prelude = None                          # called (time read, tokens) for each prelude restore
+        self.on_prelude_saved = None                    # ... and for each prelude written to the store
         self.reset()
 
     def reset(self):
@@ -1003,6 +1006,13 @@ class ConvCacheLog:
                 st["restores_prelude"] += 1
                 st["tokens_prelude"] += int(m.group(1))
                 st["last_event"], st["last_tokens"], st["last_at"], st["last_source"] = "restored", int(m.group(1)), now, "prelude"
+                if self.on_prelude is not None:
+                    self.on_prelude(now, int(m.group(1)))
+                continue
+            m = self.PRELUDE_SAVED.search(line) if "prelude cache:" in line else None
+            if m:
+                if self.on_prelude_saved is not None:
+                    self.on_prelude_saved(now, int(m.group(1)))
                 continue
             if "conversation cache:" not in line:
                 continue
@@ -1150,6 +1160,75 @@ class CacheHistory:
                 os.remove(tmp)
 
 
+class PreludeUses:
+    """--prelude-cache: when it gave a prelude back and when it saved one over the last day, [time, tokens] each,
+    for the Monitor's small graph.  The time is when the log reader saw the line (the sampler reads once a minute);
+    kept across a restart of the server in uses.json beside the prelude store's status.json."""
+    KEEP_S = 24 * 3600
+
+    def __init__(self):
+        self.uses, self.saves = collections.deque(), collections.deque()   # restores, saves
+        self.lock = threading.Lock()
+        self.dirty = False
+
+    def _trim(self, now: float):
+        for rows in (self.uses, self.saves):
+            while rows and rows[0][0] < now - self.KEEP_S:
+                rows.popleft()
+
+    def add(self, t: float, tokens: int, saved: bool = False):
+        """A prelude given back (or, with `saved`, written to the store) at time `t`."""
+        with self.lock:
+            (self.saves if saved else self.uses).append([round(t), int(tokens)])
+            self._trim(t)
+            self.dirty = True
+
+    def add_saved(self, t: float, tokens: int):
+        self.add(t, tokens, saved=True)
+
+    def view(self, now: float | None = None) -> dict:
+        with self.lock:
+            self._trim(now if now is not None else time.time())
+            return {"uses": [list(u) for u in self.uses], "saves": [list(u) for u in self.saves]}
+
+    def load(self, path: str, now: float | None = None):
+        """The restores and saves of the last day an earlier run wrote (a plain list: restores only, as the first
+        version wrote them); a missing or damaged file is ignored."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        cut = (now if now is not None else time.time()) - self.KEEP_S
+        if isinstance(data, list):
+            data = {"uses": data}
+        if not isinstance(data, dict):
+            return
+
+        def rows(key):
+            return collections.deque(
+                [int(r[0]), int(r[1])] for r in (data.get(key) if isinstance(data.get(key), list) else [])
+                if isinstance(r, list) and len(r) == 2 and all(isinstance(v, (int, float)) for v in r) and r[0] >= cut)
+        with self.lock:
+            self.uses, self.saves = rows("uses"), rows("saves")
+
+    def save(self, path: str):
+        """Writes the restores and saves when one came since the last write, under a temporary name first."""
+        with self.lock:
+            if not self.dirty:
+                return
+            data = {"uses": [list(u) for u in self.uses], "saves": [list(u) for u in self.saves]}
+            self.dirty = False
+        tmp = f"{path}.tmp-{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, separators=(",", ":"))
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+
+
 def conversation_slots(engine) -> int | None:
     """How many conversations the engine's cache holds: its --conversation-cache-slots argument, which is known
     before the engine has started (a lazy start has reported no INFO line yet), else the INFO line it reported."""
@@ -1179,12 +1258,13 @@ def long_read_speed(hist: list) -> float | None:
 
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, disk: dict | None = None,
                             device: dict | None = None, history: list | None = None,
-                            prelude: dict | None = None) -> dict:
+                            prelude: dict | None = None, prelude_uses: dict | None = None) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back.
     With --conversation-cache-disk: its levels, counters and copies (`disk`, the engine's status.json), the disk's
-    writes since boot (`device`) and the usage samples of the last day (`history`); with --prelude-cache, its
-    copies (`prelude`, its status.json) for the list of what came back.""" 
+    writes since boot (`device`) and the usage samples of the last day (`history`).  With --prelude-cache (on
+    whenever `prelude_uses` is given, with or without the disk tier): its restores and saves of the last day
+    (PreludeUses.view) and how many preludes its store holds (`prelude`, its status.json)."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
     view = {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
@@ -1198,9 +1278,11 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, 
                         # what reading a long prompt again costs, for the time a copy saved (tokens it gave back /
                         # speed): reads of LONG_READ tokens or more only - short reads are mostly a request's fixed
                         # cost and would make the saving look about twice as large
-                        "prompt_tok_s": long_read_speed(hist),
-                        # --prelude-cache: its copies too, for the card's list of what came back
-                        "prelude_entries": (prelude or {}).get("entries") or []}
+                        "prompt_tok_s": long_read_speed(hist)}
+    if prelude_uses is not None:
+        view["prelude"] = {"uses": prelude_uses.get("uses") or [], "saves": prelude_uses.get("saves") or [],
+                           "stored": len((prelude or {}).get("entries") or []),
+                           "prompt_tok_s": long_read_speed(hist), "time": time.time()}
     return view
 
 
@@ -4391,6 +4473,9 @@ class Service:
         self.conv_disk = ConvDiskStatus()               # --conversation-cache-disk: the engine's status.json
         self.prelude_disk = ConvDiskStatus()            # --prelude-cache: its status.json (the same format)
         self.cache_history = CacheHistory()             # ... and the usage samples of the last day (start_cache_history)
+        self.prelude_uses = PreludeUses()               # --prelude-cache: its restores of the last day
+        self.conv_log.on_prelude = self.prelude_uses.add
+        self.conv_log.on_prelude_saved = self.prelude_uses.add_saved
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -4785,13 +4870,18 @@ class Service:
 
     def start_cache_history(self):
         """--conversation-cache-disk: one sample a minute of what RAM and disk gave back and of the bytes written, for
-        the Monitor's graphs, whether the page is open or not."""
-        folder = conversation_disk_dir(self.engine)
-        if not folder:
+        the Monitor's graphs, whether the page is open or not.  --prelude-cache (with or without the disk tier): the
+        log is read once a minute too, so each prelude restore gets its time for the Monitor's prelude graph."""
+        folder, prelude = conversation_disk_dir(self.engine), prelude_cache_dir(self.engine)
+        if not folder and not prelude:
             return
 
-        saved = os.path.join(folder, "history.json")   # (a restart of the server keeps the last day's graph)
-        self.cache_history.load(saved)
+        saved = os.path.join(folder, "history.json") if folder else None   # (a restart keeps the last day's graphs)
+        uses = os.path.join(prelude, "uses.json") if prelude else None
+        if saved:
+            self.cache_history.load(saved)
+        if uses:
+            self.prelude_uses.load(uses)
 
         def loop():
             status = ConvDiskStatus()
@@ -4799,13 +4889,16 @@ class Service:
                 try:
                     parked = self.conv_log.poll(getattr(self.engine, "log_path", None),
                                                 getattr(self.engine, "log_start", None))
-                    disk = status.read(folder) or {}
-                    since = disk.get("since_start") or {}
-                    self.cache_history.add(parked.get("tokens_ram", 0), since.get("tokens", 0),
-                                           disk.get("written_all_time", 0), parked.get("restores", 0),
-                                           since.get("restores", 0), parked.get("tokens_prelude", 0),
-                                           parked.get("restores_prelude", 0))
-                    self.cache_history.save(saved)
+                    if saved:
+                        disk = status.read(folder) or {}
+                        since = disk.get("since_start") or {}
+                        self.cache_history.add(parked.get("tokens_ram", 0), since.get("tokens", 0),
+                                               disk.get("written_all_time", 0), parked.get("restores", 0),
+                                               since.get("restores", 0), parked.get("tokens_prelude", 0),
+                                               parked.get("restores_prelude", 0))
+                        self.cache_history.save(saved)
+                    if uses:
+                        self.prelude_uses.save(uses)
                 except Exception as e:                 # tried again in a minute; the thread keeps running
                     print(f"[strata] conversation cache: usage sample: {e}", flush=True)
                 time.sleep(CacheHistory.EVERY_S)
@@ -5230,11 +5323,13 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         folder = conversation_disk_dir(self.engine)
         disk = self.conv_disk.read(folder)
-        prelude = self.prelude_disk.read(prelude_cache_dir(self.engine))
+        pfolder = prelude_cache_dir(self.engine)
+        prelude = self.prelude_disk.read(pfolder)
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked, disk,
                                                               disk_written_since_boot(folder) if disk else None,
-                                                              self.cache_history.view() if disk else None, prelude),
+                                                              self.cache_history.view() if disk else None, prelude,
+                                                              self.prelude_uses.view() if pfolder else None),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}

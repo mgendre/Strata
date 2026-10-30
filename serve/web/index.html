@@ -183,6 +183,13 @@
             <p class="cc-warn small" id="cc-disk-warn" role="status" hidden></p>
             <dl class="facts" id="cc-facts"></dl>
             <dl class="facts cc-disk-only" id="cc-disk-facts"></dl>
+            <div class="cc-chart cc-pre" id="cc-pre" hidden>
+              <div class="cc-chart-head"><span class="cc-chart-title">Preludes per hour (prompt tokens)</span>
+                <span class="cc-legend" id="cc-pre-legend"></span><span class="muted small" id="cc-pre-sum"></span></div>
+              <div class="cc-plot" id="cc-pre-plot"><svg class="cc-svg cc-svg--pre" id="cc-pre-svg" role="img"
+                aria-label="Prompt tokens the prelude cache gave back (columns) and saved (line) each hour over the last 24 hours"></svg></div>
+              <div class="cc-tip" hidden></div>
+            </div>
           </div>
           <div class="cc-chart cc-disk-only" id="cc-chart">
             <div class="cc-chart-head"><span class="cc-chart-title">Given back per hour (prompt tokens)</span>
@@ -198,15 +205,13 @@
           </div>
         </div>
         <div class="cc-list cc-disk-only">
-          <div class="cc-chart-head"><span class="cc-chart-title">Read back from disk and preludes</span>
+          <div class="cc-chart-head"><span class="cc-chart-title">Read back from disk</span>
             <span class="muted small" id="cc-dsk-sum"></span></div>
           <div class="cc-table-wrap"><table class="cc-table" id="cc-disk-table"></table></div>
-          <p class="muted small cc-note">The 10 copies that came back most recently (by their last use): conversations
-            from the disk cache and agents' preludes (system prompt and tools) from the prelude cache. Returns: times it
-            came back. Tokens served: all those returns together. Time saved: those tokens at the speed of a long prompt
-            read.</p>
+          <p class="muted small cc-note">The 10 conversations that came back from the disk most recently (by their last
+            use). Returns: times it came back. Tokens served: all those returns together. Time saved: those tokens at the
+            speed of a long prompt read.</p>
         </div>
-        <p class="muted small cc-note" id="cc-note"></p>
       </div>
 
       <div class="st-card mcp-card" id="mcp-card" hidden>
