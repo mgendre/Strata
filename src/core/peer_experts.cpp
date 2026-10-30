@@ -10,6 +10,8 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/window_limits.hpp"
 
+#include <immintrin.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -29,7 +31,7 @@ namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
 constexpr int64_t CAP = strata::kernels::kWindowMaxT * 10;   // entries per layer: a window's rows x top-10
 
-struct Meta {                           // one block, uploaded with one copy per layer
+struct Meta {                           // one block, uploaded with the input rows behind it in one copy per layer
     unsigned long long ptr[CAP];
     int32_t start[CAP + 1];
     int32_t dst[CAP];
@@ -37,6 +39,9 @@ struct Meta {                           // one block, uploaded with one copy per
     int32_t count[4];                   // [0] groups, [1] entries
     int32_t out_row[CAP];               // multi-GPU: compact row -> entry row in the host `out`
 };
+
+// the plan, then the input rows (n_tok x H floats), in one host block and one device block: one copy per layer
+constexpr size_t kMetaBytes = (sizeof(Meta) + 255) & ~(size_t) 255;
 
 /// Switches the calling thread to `dev` and back.  The engine's own thread lives on device 0.
 struct On {
@@ -101,12 +106,12 @@ void PeerExperts::close() {
         if (stream_) cudaStreamSynchronize(stream_);
         if (refill_) cudaStreamSynchronize(refill_);
         cache_.close();
-        if (d_x_) cudaFree(d_x_);
         if (d_out_) cudaFree(d_out_);
         if (d_meta_) cudaFree(d_meta_);
         if (d_q8_) cudaFree(d_q8_);
         if (d_scratch_) cudaFree(d_scratch_);
-        if (h_x_) cudaFreeHost(h_x_);
+        for (cudaEvent_t& e : tev_)
+            if (e) { cudaEventDestroy(e); e = nullptr; }
         if (h_out_) cudaFreeHost(h_out_);
         if (h_meta_) cudaFreeHost(h_meta_);
         if (h_jobs_) cudaFreeHost(h_jobs_);
@@ -180,15 +185,16 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&
         ck(cudaEventCreateWithFlags(&refill_ev_, cudaEventDisableTiming), "event", err) &&
-        ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
         ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
-        ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
-        ck(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err) &&
+        ck(cudaHostAlloc(&h_meta_, kMetaBytes + (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped),
+           "plan and input staging", err) &&
         ck(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err) &&
-        ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
+        ck(cudaMalloc(&d_meta_, kMetaBytes + (size_t) CAP * H * sizeof(float)), "plan and input", err) &&
         ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
+    h_x_ = (float*) ((uint8_t*) h_meta_ + kMetaBytes);   // (inside the plan's blocks: freed with them)
+    d_x_ = (float*) ((uint8_t*) d_meta_ + kMetaBytes);
     if (strata::kernels::cpu::hadamard_spec().any()) {   // APR: this device's copies of the sign vectors
         d_sx_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) H), (int) H);
         d_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) ff), (int) ff);
@@ -288,8 +294,101 @@ bool PeerExperts::refill_jobs(const strata::kernels::CopyJob* jobs, size_t n, st
     return ck(cudaGetLastError(), "refill kernel", err);
 }
 
+namespace {
+bool peer_timing() {   // STRATA_PEER_TIMING=1: PeerExperts::take_timing's sums (a diagnostic, off by default)
+    static const bool on = [] { const char* v = std::getenv("STRATA_PEER_TIMING"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+bool peer_down_host() {   // STRATA_PEER_DOWN_HOST=0: the rows computed into the device, then scattered, as before
+    static const bool on = [] { const char* v = std::getenv("STRATA_PEER_DOWN_HOST"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+bool peer_host_q8_env() {   // STRATA_PEER_HOST_Q8=0: the input copied as floats and quantized on the second GPU
+    static const bool on = [] { const char* v = std::getenv("STRATA_PEER_HOST_Q8"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+bool cpu_avx2_f16c() {
+    static const bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c");
+    return ok;
+}
+
+// The input rows as q8_1 blocks, quantized on the host the way quantize_q8_1_kernel's q8_1_store does it on the device
+// (iq_kernels.cu, no fast math): the warp's butterfly sum (lane i adds lane i^16, then ^8, ^4, ^2, ^1 - float addition
+// is commutative, so every lane ends with this sum), amax, d = amax / 127 kept finite (q8_1_finite), the codes roundf(x
+// / d) clamped to +-127 (0 for an all-zero block), ds = {d, sum} as fp16 rounded to nearest even.  The same bytes, so
+// the second GPU gets 36 bytes a block instead of 128 and no quantization to run.  AVX2 + F16C only (else the device's).
+constexpr size_t kQ8Block = 36;
+__attribute__((target("avx2,f16c"))) void quantize_q8_1_host(const float* x, int64_t n_tok, int64_t n_cols, uint8_t* y) {
+    const __m256 sign = _mm256_set1_ps(-0.0f), half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f);
+    const __m256 lim = _mm256_set1_ps(127.0f), nlim = _mm256_set1_ps(-127.0f);
+    const int64_t blocks = n_tok * (n_cols / 32);
+    for (int64_t b = 0; b < blocks; ++b) {
+        const float* p = x + b * 32;
+        uint8_t* blk = y + b * kQ8Block;
+        const __m256 a[4] = {_mm256_loadu_ps(p), _mm256_loadu_ps(p + 8), _mm256_loadu_ps(p + 16), _mm256_loadu_ps(p + 24)};
+        const __m256 s8 = _mm256_add_ps(_mm256_add_ps(a[0], a[2]), _mm256_add_ps(a[1], a[3]));   // ^16, then ^8
+        const __m128 s4 = _mm_add_ps(_mm256_castps256_ps128(s8), _mm256_extractf128_ps(s8, 1));   // ^4
+        const __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));                                   // ^2
+        const float sum = _mm_cvtss_f32(_mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1)));                // ^1
+        const __m256 m8 = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, a[0]), _mm256_andnot_ps(sign, a[1])),
+                                        _mm256_max_ps(_mm256_andnot_ps(sign, a[2]), _mm256_andnot_ps(sign, a[3])));
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m8), _mm256_extractf128_ps(m8, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        const float amax = _mm_cvtss_f32(_mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1)));
+        const float d = std::fabs(amax / 127.0f) > 65504.0f ? std::copysign(65504.0f, amax / 127.0f) : amax / 127.0f;
+        int8_t* qs = (int8_t*) (blk + 4);
+        if (amax == 0.0f) {
+            std::memset(qs, 0, 32);
+        } else {
+            const __m256 dv = _mm256_set1_ps(d);
+            alignas(32) int32_t q[32];
+            for (int k = 0; k < 4; ++k) {
+                const __m256 v = _mm256_div_ps(a[k], dv);                                    // x / d (IEEE)
+                const __m256 t = _mm256_round_ps(v, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+                const __m256 frac = _mm256_andnot_ps(sign, _mm256_sub_ps(v, t));             // exact for |v| < 2^23
+                const __m256 step = _mm256_and_ps(_mm256_cmp_ps(frac, half, _CMP_GE_OQ),
+                                                  _mm256_or_ps(one, _mm256_and_ps(sign, v)));   // +-1 away from zero
+                const __m256 r = _mm256_min_ps(lim, _mm256_max_ps(nlim, _mm256_add_ps(t, step)));   // roundf, clamped
+                _mm256_store_si256((__m256i*) (q + 8 * k), _mm256_cvtps_epi32(r));
+            }
+            for (int i = 0; i < 32; ++i) qs[i] = (int8_t) q[i];
+        }
+        const float sf = std::fabs(sum) > 65504.0f ? std::copysign(65504.0f, sum) : sum;
+        const uint16_t dh = _cvtss_sh(d, _MM_FROUND_TO_NEAREST_INT), sh = _cvtss_sh(sf, _MM_FROUND_TO_NEAREST_INT);
+        std::memcpy(blk, &dh, 2);
+        std::memcpy(blk + 2, &sh, 2);
+    }
+}
+
+bool peer_check() {   // STRATA_PEER_CHECK=1: the rows compared bit for bit with the launches the faster path replaces
+    static const bool on = [] { const char* v = std::getenv("STRATA_PEER_CHECK"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+double us_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+}
+}  // namespace
+
+std::string PeerExperts::take_timing() {
+    if (t_calls_ == 0) return "";
+    const double n = t_calls_;
+    char buf[600];
+    std::snprintf(buf, sizeof buf,
+                  "peer timing: %.0f layer calls, per call: launch() on the host %.1f us, launch to done %.1f us; on the "
+                  "GPU: copies %.1f us, input quantization %.1f us, experts %.1f us, scatter %.1f us; finish() waited %.1f us; "
+                  "%.1f rows, %.1f experts%s",
+                  n, t_host_launch_ / n, t_until_ / n, t_copies_ / n, t_quant_ / n, t_kernels_ / n, t_scatter_ / n,
+                  t_wait_ / n, t_rows_ / n, t_groups_ / n,
+                  checked_ ? (" (checked " + std::to_string(checked_) + " rows: " + std::to_string(mismatched_) +
+                              " different)").c_str() : "");
+    t_calls_ = t_host_launch_ = t_copies_ = t_quant_ = t_groups_ = t_kernels_ = t_scatter_ = t_wait_ = t_until_ = t_rows_ = 0;
+    return buf;
+}
+
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
                          const int32_t* kind, std::string& err, float* out) {
+    const bool timing = peer_timing();
+    if (timing) t_launch0_ = std::chrono::steady_clock::now();
     static const bool direct_env = [] { const char* v = std::getenv("STRATA_PEER_DIRECT"); return v == nullptr || std::atoi(v) != 0; }();
     const bool direct = direct_env && out != nullptr;
     launched_direct_ = false;
@@ -327,37 +426,80 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     m.count[1] = rows;
     entries_ += rows;
     launched_rows_ = rows;
-    // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
-    if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
+    launched_groups_ = groups;
     On on(device_);
     const cudaStream_t s = stream_;
-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
-        !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
-        return false;
+    if (timing && tev_[0] == nullptr)
+        for (cudaEvent_t& e : tev_) cudaEventCreate(&e);
     Meta* dm = (Meta*) d_meta_;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    if (lay.native) {
-        const auto& f = lay.fmt[(size_t) layer];
+    if (!lay.native) { err = "peer experts: only native packs are supported"; return false; }
+    const auto& f = lay.fmt[(size_t) layer];
+    auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+    if (f.had_d) { L.had_block = f.had_block; L.d_signs = d_sh_; }
+    // the down rows straight into the host `out`, a block's 32 rows a 128-byte store, while the other blocks still
+    // compute (no scatter after the experts; STRATA_PEER_DOWN_HOST=0: the scatter, as before)
+    const bool down_host = direct && peer_down_host() && strata::kernels::native_expert_down_host_ok(f.d_type, f.n_ff);
+    // the input quantized on the host (quantize_q8_1_host: the same bytes; APR's rotation before it stays the device's)
+    const bool host_q8 = peer_host_q8_env() && cpu_avx2_f16c() && !f.had_gu;
+    const size_t in_f32 = (size_t) (n_tok * H) * sizeof(float), in_q8 = (size_t) n_tok * (H / 32) * kQ8Block;
+    if (peer_check() && (down_host || host_q8)) {
+        // STRATA_PEER_CHECK: the path these replace, first - the input as floats, the device's quantization, the rows
+        // into the device and back (h_out_) - for finish() to compare bit for bit
+        std::memcpy(h_x_, x, in_f32);
+        if (!ck(cudaMemcpyAsync(d_meta_, h_meta_, kMetaBytes + in_f32, cudaMemcpyHostToDevice, s), "check input", err))
+            return false;
+        if (f.had_gu) strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, H, f.had_block, d_sx_, s);
+        strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
+        strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
+                                               d_scratch_, d_out_, s);
+        if (!ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s), "check rows", err) ||
+            !ck(cudaStreamSynchronize(s), "check", err))
+            return false;
+        check_ref_.assign(h_out_, h_out_ + (size_t) rows * H);
+    }
+    const void* xq = d_q8_;
+    if (host_q8) {   // behind the plan, one copy for both
+        quantize_q8_1_host(x, n_tok, H, (uint8_t*) h_x_);
+        if (timing) cudaEventRecord(tev_[0], s);
+        if (!ck(cudaMemcpyAsync(d_meta_, h_meta_, kMetaBytes + in_q8, cudaMemcpyHostToDevice, s), "plan and input", err))
+            return false;
+        if (timing) { cudaEventRecord(tev_[1], s); cudaEventRecord(tev_[4], s); }
+        xq = d_x_;
+    } else {
+        std::memcpy(h_x_, x, in_f32);
+        if (timing) cudaEventRecord(tev_[0], s);
+        if (!ck(cudaMemcpyAsync(d_meta_, h_meta_, kMetaBytes + in_f32, cudaMemcpyHostToDevice, s), "plan and input", err))
+            return false;
+        if (timing) cudaEventRecord(tev_[1], s);
         // APR: Hadamard-folded gate/up take H (s * x); d_x_ is this device's private copy, rotated in place
         if (f.had_gu) strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, H, f.had_block, d_sx_, s);
         strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
-        auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-        if (f.had_d) { L.had_block = f.had_block; L.d_signs = d_sh_; }
-        strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
-                                               d_scratch_, d_out_, s);
-    } else {
-        err = "peer experts: only native packs are supported";
-        return false;
+        if (timing) cudaEventRecord(tev_[4], s);
     }
+    if (down_host) {
+        L.out_host = true;
+        strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->out_row, dm->tok, groups, rows, xq,
+                                               d_scratch_, out, s);
+        if (timing) { cudaEventRecord(tev_[2], s); cudaEventRecord(tev_[3], s); t_host_launch_ += us_since(t_launch0_); }
+        launched_direct_ = true;
+        return true;
+    }
+    strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, xq,
+                                           d_scratch_, d_out_, s);
+    if (timing) cudaEventRecord(tev_[2], s);
     if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
         try {
             strata::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
         } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
         launched_direct_ = true;
+        if (timing) { cudaEventRecord(tev_[3], s); t_host_launch_ += us_since(t_launch0_); }
         return true;
     }
-    return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),
-              "results", err);
+    const bool ok = ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),
+                       "results", err);
+    if (timing) { cudaEventRecord(tev_[3], s); t_host_launch_ += us_since(t_launch0_); }
+    return ok;
 }
 
 bool PeerExperts::finish(float* out, std::string& err) {
@@ -372,6 +514,25 @@ bool PeerExperts::finish(float* out, std::string& err) {
         if (!ck(e, "finish", err)) return false;
     }
     ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (peer_timing() && tev_[3] != nullptr) {
+        On on(device_);
+        float a = 0, b = 0, c = 0, q = 0;
+        cudaEventElapsedTime(&a, tev_[0], tev_[1]);
+        cudaEventElapsedTime(&q, tev_[1], tev_[4]);
+        cudaEventElapsedTime(&b, tev_[4], tev_[2]);
+        cudaEventElapsedTime(&c, tev_[2], tev_[3]);
+        t_copies_ += 1000.0 * a, t_quant_ += 1000.0 * q, t_kernels_ += 1000.0 * b, t_scatter_ += 1000.0 * c;
+        t_wait_ += us_since(t0), t_until_ += us_since(t_launch0_), t_rows_ += (double) launched_rows_, t_calls_ += 1;
+        t_groups_ += (double) launched_groups_;
+    }
+    if (launched_direct_ && !check_ref_.empty() && out != nullptr) {   // STRATA_PEER_CHECK: these rows vs the launches'
+        for (size_t r = 0; r < row_of_.size(); ++r) {
+            ++checked_;
+            if (std::memcmp(out + (size_t) row_of_[r] * H, check_ref_.data() + r * H, (size_t) H * sizeof(float)) != 0)
+                ++mismatched_;
+        }
+        check_ref_.clear();
+    }
     if (launched_direct_) { launched_rows_ = 0; return true; }
     for (size_t r = 0; r < row_of_.size(); ++r)
         std::memcpy(out + (size_t) row_of_[r] * H, h_out_ + r * H, (size_t) H * sizeof(float));

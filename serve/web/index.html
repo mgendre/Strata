@@ -136,6 +136,9 @@
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
       </div>
 
+      <!-- one widget per GPU, filled by app.js (renderGpuCards): its load, VRAM and PCIe link each way -->
+      <div class="gpu-cards" id="gpu-cards" hidden></div>
+
       <div class="monitor-row">
         <div class="st-card ctx-card">
           <span class="card-title">Context fill</span>

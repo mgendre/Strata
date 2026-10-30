@@ -24,6 +24,7 @@ slow link.
 | **Second GPU refill by SM loads.** With `--peer-device`, the experts copied into the second GPU no longer hold back that card's work. | `--peer-refill-sm N` |
 | **Image encoder on the CPU, started on demand.** `"elastic": true` now works for a CPU encoder, also with `--peer-device`. | `"elastic": true` (config, `vision` section) |
 | **No expert on both GPUs.** The main GPU no longer takes an expert that is being copied into the second GPU. | always, with `--peer-device` |
+| **Second GPU rows straight to RAM, input quantized on the host.** The second GPU writes its expert rows into RAM as whole 128-byte lines while it computes, and gets its input already quantized (3.5x fewer bytes). The same bits; decode windows about 4% shorter. | always, with `--peer-device` (`STRATA_PEER_DOWN_HOST=0` / `STRATA_PEER_HOST_Q8=0` turn either off) |
 | **Second GPU line.** One log line per request: where the experts ran (main GPU, second GPU, PCIe, CPU) and how long the CPU waited for the second GPU. | always, with `--peer-device` |
 | **Prompt reads skip the experts no token uses** (taken from upstream PR [#4283](https://github.com/Niko1221/Strata/pull/4283), by [@bitaccesscomau](https://github.com/bitaccesscomau); see below). A prompt chunk of 1,024 tokens or more no longer copies over PCIe the experts no token of the chunk routes to. The same bits. | `STRATA_PREFILL_ROUTED_STREAM=1` (env) |
 | **Monitor.** A widget per GPU under the tiles: its role (model, peer experts for the second GPU, layer split), load, VRAM, temperature, power, and PCIe traffic each way as a share of its link (Gen4 x16 about 30 GB/s each way, x4 about 7.5). The Conversation cache card has a small graph per store on disk (conversations, preludes): the prompt tokens it gave back each hour of the last day, and a line of what it wrote. A Disk write card sits next to Disk read, with what the disks took over the last 24 hours. | always |
@@ -106,6 +107,16 @@ card waited behind the whole round (0.11 ms alone, 23 ms during a round of 72 co
 - Values: 0 (the default) keeps the copy engine; N is the number of blocks of the second GPU's cores that do the
   copies. 4 reach the full speed of a PCIe 4.0 x4 link (6.0 GB/s), so more would only take cores from the experts. A
   wider link (x8, x16) may need more blocks; not measured. Reference PC: 4.
+
+**Always on with `--peer-device`: the second GPU's rows and input.** Its share of a layer's experts used to be copied in
+as floats, quantized there, computed into its memory, then scattered to RAM over its link (x4: ~27 us a layer, after the
+experts). Now its down kernel writes each entry's rows straight into RAM as one 128-byte store while the other blocks
+compute, and the host quantizes the input to q8_1 the way the device does (AVX2 + F16C; else the device's).
+- Gain: per layer 164-173 -> ~136 us, the CPU's wait for the second GPU 82-84 -> ~47 us; decode windows 17.2 -> 16.5
+  ms (about 4% at short context, about 3% at long context).
+- The same bits: `STRATA_PEER_CHECK=1` also runs the old path and compares every row (880,771 rows, 0 different).
+- `STRATA_PEER_TIMING=1` logs, per request, where a layer's call on the second GPU goes (copies, quantization,
+  experts, the CPU's wait).
 
 **`"elastic": true`** and **`"elastic_idle_s"`** (120) in the config's `vision` section. The image encoder starts with
 the first picture and stops after that many seconds without one. Gain: its RAM (about 1 GB on the CPU) is free between

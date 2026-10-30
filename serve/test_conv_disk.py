@@ -183,3 +183,35 @@ class ConvDiskServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopWait(unittest.TestCase):
+    """A clean stop writes what only RAM holds to the disk level (the engine's QUIT path, at most 30 s), so close() gives
+    QUIT ENGINE_DISK_STOP_WAIT_S more when the engine runs with --conversation-cache-disk, and the usual wait without."""
+
+    class Proc:
+        def __init__(self):
+            self.waits, self.ended, self.stdin, self.stdout = [], False, io.StringIO(), io.StringIO()
+
+        def poll(self):
+            return 0 if self.ended else None
+
+        def wait(self, timeout=None):
+            self.waits.append(timeout)
+            self.ended = True
+            return 0
+
+    def close_wait(self, args):
+        from serve import server
+        eng = object.__new__(server.StrataEngine)
+        eng.proc, eng.spawn, eng.pump, eng.log = self.Proc(), ("/bin/strata", args, "/srv", "x.log", {}, False, None), None, None
+        proc = eng.proc
+        eng.close()
+        return proc.waits[0]
+
+    def test_quit_waits_longer_with_the_disk_level(self):
+        from serve import server
+        self.assertEqual(self.close_wait(["--conversation-cache-disk", "/data/cc"]),
+                         server.ENGINE_QUIT_WAIT_S + server.ENGINE_DISK_STOP_WAIT_S)
+        self.assertEqual(self.close_wait(["--prompt-cache", "12"]), server.ENGINE_QUIT_WAIT_S)
+        self.assertLess(server.ENGINE_QUIT_WAIT_S + server.ENGINE_DISK_STOP_WAIT_S + server.ENGINE_TERM_WAIT_S, 60)

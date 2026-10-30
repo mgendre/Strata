@@ -528,6 +528,84 @@ function renderStore(p, id, noun) {
     if (o.saved) svgEl("circle", {cx: pts[k][0], cy: pts[k][1], r: 3, style: "fill:var(--cc-writes);pointer-events:none"}, svg);
   });
 }
+// the GPU widgets (one per card, under the tiles): its load, VRAM and PCIe link each way.  The PCIe values are the mean
+// of the last GPU_AVG readings (NVML's each covers 20 ms of the second, so one alone jumps); the share is of what one
+// direction of the link carries at its top generation.
+const GPU_AVG = 5;
+const meanLast = (v) => {
+  const x = (v || []).slice(-GPU_AVG).filter((n) => n != null);
+  return x.length ? x.reduce((a, b) => a + b, 0) / x.length : null;
+};
+const rate = (mb) => (mb == null ? "–" : mb >= 1000 ? `${fmt(mb / 1024, 1)} GB/s` : `${fmt(mb, mb < 10 ? 1 : 0)} MB/s`);
+let gpuCardsKey = "";
+function gpuCardHtml(i) {
+  const avg = `the mean of the last ${GPU_AVG} seconds, as a share of what the link carries each way`;
+  return `<div class="st-card gpu-card">
+    <div class="gpu-card__head"><span class="card-title" id="gc${i}-name"></span><span class="st-badge" id="gc${i}-role" hidden></span>
+      <span class="muted small gpu-card__env" id="gc${i}-env"></span></div>
+    <div class="gpu-card__load">
+      <div><span class="st-metric__value" id="gc${i}-util">–</span><span class="st-metric__sub">Load</span></div>
+      <svg class="st-metric__spark" id="gc${i}-sp" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true">
+        <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
+        stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>
+    </div>
+    <div class="bar-row"><span>VRAM</span><span class="muted" id="gc${i}-mem">–</span></div>
+    <div class="st-progress"><div class="st-progress__bar" id="gc${i}-mem-bar" style="width:0%"></div></div>
+    <div class="gpu-card__pcie" id="gc${i}-pcie">
+      <div class="bar-row" title="${avg}"><span>PCIe to GPU</span><span class="muted" id="gc${i}-rx">–</span></div>
+      <div class="st-progress" data-tone="info"><div class="st-progress__bar" id="gc${i}-rx-bar" style="width:0%"></div></div>
+      <div class="bar-row" title="${avg}"><span>PCIe from GPU</span><span class="muted" id="gc${i}-tx">–</span></div>
+      <div class="st-progress" data-tone="tx"><div class="st-progress__bar" id="gc${i}-tx-bar" style="width:0%"></div></div>
+      <svg class="gpu-card__spark" id="gc${i}-psp" viewBox="0 0 100 32" preserveAspectRatio="none" role="img"
+        aria-label="PCIe to and from the GPU over the last minute, as a share of the link"><path class="grid" d="M0,2H100M0,16H100"/>
+        <path class="rx"/><path class="tx"/></svg>
+    </div>
+  </div>`;
+}
+function gpuLines(svg, series, top) {   // the PCIe graph: one line per direction, on the same scale
+  for (const [cls, values] of series) {
+    const v = (values || []).map((x) => (x == null ? 0 : x)), path = svg.querySelector(`.${cls}`);
+    path.setAttribute("d", v.length < 2 ? "" : v.map((x, k) => `${k ? "L" : "M"}${((k / (v.length - 1)) * 100).toFixed(2)},` +
+                                                            `${(30 - Math.min(1, x / top) * 28).toFixed(2)}`).join(""));
+  }
+}
+function renderGpuCards(cards, h, roles) {
+  cards = cards || [];
+  $("gpu-cards").hidden = !cards.length;
+  const key = cards.map((c) => c.index).join(",");
+  if (key !== gpuCardsKey) {
+    gpuCardsKey = key;
+    $("gpu-cards").innerHTML = cards.map((c) => gpuCardHtml(c.index)).join("");
+  }
+  const pct = (v, top) => (v == null || !top ? null : (v / top) * 100);
+  for (const c of cards) {
+    const i = c.index, role = (roles || {})[String(i)];
+    $(`gc${i}-name`).textContent = `GPU ${i}${c.name ? ` · ${c.name}` : ""}`;
+    $(`gc${i}-role`).hidden = !role;
+    $(`gc${i}-role`).textContent = role || "";
+    // the header: temperature, power and the link (its top generation; an idle link drops to Gen1 to save power)
+    const gen = c.pcie_gen_max || c.pcie_gen, link = c.pcie_link_mb;
+    const linkText = gen && c.pcie_width ? `PCIe Gen${gen} x${c.pcie_width}` +
+      (c.pcie_gen && c.pcie_gen < gen ? ` (idle: Gen${c.pcie_gen})` : "") : null;
+    $(`gc${i}-env`).textContent = [c.temp == null ? null : `${fmt(c.temp)} °C`, c.power == null ? null : `${fmt(c.power)} W`, linkText]
+      .filter(Boolean).join(" · ");
+    $(`gc${i}-util`).innerHTML = c.util == null ? "–" : `${esc(fmt(c.util))}<small>%</small>`;
+    spark(`gc${i}-sp`, h[`gpu${i}_util`], 100);
+    $(`gc${i}-mem`).textContent = c.mem_used == null ? "–" : `${gb(c.mem_used)}${c.mem_total ? ` / ${gb(c.mem_total, 0)}` : ""} GB`;
+    $(`gc${i}-mem-bar`).style.width = `${c.mem_total ? Math.min(100, (c.mem_used / c.mem_total) * 100) : 0}%`;
+    // PCIe: none on a Mac (the GPU is on the die), the link alone where the traffic cannot be read (AMD)
+    $(`gc${i}-pcie`).hidden = !c.pcie_width && c.pcie_rx_mb == null;
+    for (const [dir, key] of [["rx", "pcie_rx_mb"], ["tx", "pcie_tx_mb"]]) {
+      const v = meanLast(h[`gpu${i}_${key}`]) ?? c[key], p = pct(v, link);
+      $(`gc${i}-${dir}`).textContent = v == null ? "–" : `${rate(v)}${p == null ? "" : ` · ${fmt(p, p < 10 ? 1 : 0)}%`}`;
+      $(`gc${i}-${dir}-bar`).style.width = `${p == null ? 0 : Math.min(100, p)}%`;
+    }
+    // the graph: both directions over the last minute as a share of the link (its top: the link full; no link known:
+    // their own peak)
+    const rx = h[`gpu${i}_pcie_rx_mb`] || [], tx = h[`gpu${i}_pcie_tx_mb`] || [];
+    gpuLines($(`gc${i}-psp`), [["rx", rx], ["tx", tx]], link || Math.max(1, ...rx, ...tx));
+  }
+}
 function renderTotals(t) {
   if (!t || !t.requests) return "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
@@ -637,6 +715,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
               big ? "GB/s" : "MB/s", `all disks${day}`);
   }
   spark("sp-diskw", h.disk_write_mb);
+  renderGpuCards(hw.gpu_cards, h, st.gpu_roles);   // the GPU widgets under the tiles
 
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;

@@ -17724,6 +17724,8 @@ int main(int argc, char** argv) {
                              100.0 * (double) (req_look - req_hits) / all, wait,
                              dec_windows > 0 ? wait / (double) dec_windows : 0.0,
                              (long long) (peer.swaps() - peer_swaps0));
+                if (const std::string pt = peer.take_timing(); !pt.empty())   // STRATA_PEER_TIMING=1
+                    std::fprintf(stderr, "strata serve: %s\n", pt.c_str());
             }
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
@@ -17891,6 +17893,45 @@ int main(int argc, char** argv) {
                 helper_blobs_before = blobs;
                 helper_bytes_before = bytes;
             }
+        }
+        // --conversation-cache-disk: a clean stop (QUIT, or the server closed stdin) writes what only RAM holds, as if
+        // it left RAM - the live conversation (only where it is whole: live_ok, as for a park), then the parked ones,
+        // the newest first - each when leave_due says so (an older copy a newer one holds is skipped, as on eviction).
+        // Within kDiskStopBudgetS: the server waits for the engine (ENGINE_QUIT_WAIT_S plus its disk allowance)
+        // before it ends it, and systemd ends the whole service after its own stop timeout.
+        if (disk.enabled() && stages.empty()) {
+            constexpr double kDiskStopBudgetS = 30.0;
+            const auto t0 = Clock::now();
+            auto spent_s = [&] { return std::chrono::duration<double>(Clock::now() - t0).count(); };
+            const uint64_t written0 = disk.written_today();
+            size_t looked = 0, late = 0;
+            try {
+                if (live_ok && !live.empty()) {
+                    ++looked;
+                    disk_save_session(live, live_imgs, cvec_cached, checks, ss, disk_draft, "clean stop", leave_due);
+                }
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr, "strata serve: conversation cache: disk write failed (%s)\n", ex.what());
+            }
+            conversations.each_newest_first([&](strata::core::SavedConversation& image) {
+                if (spent_s() >= kDiskStopBudgetS) {
+                    ++late;
+                    return;
+                }
+                ++looked;
+                try {
+                    disk_leave_image(image, "clean stop");
+                } catch (const std::exception& ex) {
+                    std::fprintf(stderr, "strata serve: conversation cache: disk write failed (%s)\n", ex.what());
+                }
+            });
+            const uint64_t written = disk.written_today() >= written0 ? disk.written_today() - written0 : 0;
+            std::fprintf(stderr, "strata serve: conversation cache: clean stop: %zu conversation%s checked for the disk in "
+                                 "%.1f s, %llu MiB written%s\n", looked, looked == 1 ? "" : "s", spent_s(),
+                         (unsigned long long) (written >> 20),
+                         late ? (", " + std::to_string(late) + " parked not checked (the stop's time budget was spent)").c_str()
+                              : "");
+            std::fflush(stderr);
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
 #if defined(STRATA_GPU_METAL)

@@ -577,6 +577,29 @@ class DiskWrites:
         return out, self.rows[0][0]
 
 
+# the Monitor's GPU widgets (one per card): what one direction of a PCIe link carries per lane after its line code
+# (8b/10b up to Gen2, 128b/130b from Gen3, FLIT from Gen6), in bytes a second
+PCIE_LANE_BYTES = {1: 250e6, 2: 500e6, 3: 8e9 * 128 / 130 / 8, 4: 16e9 * 128 / 130 / 8, 5: 32e9 * 128 / 130 / 8,
+                   6: 64e9 * 242 / 256 / 8}
+GPU_CARD_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max",
+                 "pcie_width", "pcie_rx_mb", "pcie_tx_mb")
+GPU_CARD_SERIES = ("util", "pcie_rx_mb", "pcie_tx_mb")   # each widget's small graphs (history gpu<N>_<key>)
+
+
+def pcie_link_mb(gen, width) -> float | None:
+    """The most one direction of a PCIe link carries, in the unit of the pcie_*_mb readings (NVML's KB/s / 1024), or
+    None when the generation or the width is unknown."""
+    lane = PCIE_LANE_BYTES.get(gen) if isinstance(gen, int) else None
+    return lane * width / 2**20 if lane and isinstance(width, int) and width > 0 else None
+
+
+def gpu_card(index, name, r: dict) -> dict:
+    """One card's own readings for its widget, and what its link carries at most at its top generation (an idle link
+    drops to Gen1 to save power, so the current one would make an idle card's few bytes look like a full link)."""
+    return {"index": index, "name": name, **{k: r.get(k) for k in GPU_CARD_KEYS},
+            "pcie_link_mb": pcie_link_mb(r.get("pcie_gen_max") or r.get("pcie_gen"), r.get("pcie_width"))}
+
+
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, writes_path=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
@@ -593,6 +616,7 @@ class Telemetry:
         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
+        self.card_names = [g.name() if g.ok() else None for _, g in self.gpus]   # the GPU widgets' titles
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -670,6 +694,8 @@ class Telemetry:
                               "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
+            # the Monitor's GPU widgets: each card's own readings (the cards above keep their totals)
+            s["gpu_cards"] = [gpu_card(i, name, r) for (i, r), name in zip(reads, self.card_names)]
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)
@@ -717,6 +743,10 @@ class Telemetry:
                           "disk_read_mb", "disk_write_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+                for c in s.get("gpu_cards") or []:           # each GPU widget's small graphs
+                    for k in GPU_CARD_SERIES:
+                        v = c.get(k)
+                        self.hist[f"gpu{c['index']}_{k}"].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)
 
     def snapshot(self):
