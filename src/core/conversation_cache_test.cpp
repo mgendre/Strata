@@ -130,6 +130,18 @@ int main() {
         check(cache.evict_oldest("slots") && seen == 4, "the oldest copy shares 4 tokens with its newer sibling");
         check(cache.evict_oldest("slots") && seen == 0, "the sibling shares nothing with the other conversation");
     }
+    {   // each_newest_first: a clean stop walks the parked conversations, the newest first, and leaves them parked
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(image({1, 2})) && cache.put(image({3, 4})) && cache.put(image({5, 6})), "park three");
+        std::vector<int32_t> firsts;
+        cache.each_newest_first([&](SavedConversation& s) { firsts.push_back(s.live.ids[0]); });
+        check(firsts == std::vector<int32_t>({5, 3, 1}), "the newest first");
+        check(cache.size() == 3 && cache.evictions() == 0, "the walk leaves every conversation parked");
+        ConversationCache empty(1 << 20, 4);
+        size_t calls = 0;
+        empty.each_newest_first([&](SavedConversation&) { ++calls; });
+        check(calls == 0, "an empty cache: no call");
+    }
     {
         ConversationCache cache(1024, 2);
         check(cache.put(image({1, 2, 3})), "park A");

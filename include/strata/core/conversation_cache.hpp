@@ -441,6 +441,11 @@ public:
     // --conversation-cache-disk: called with each conversation evict_oldest pushes out, before it is dropped (the
     // disk level keeps it).  Unset (the default): dropped as before.  It must not throw.
     void on_evict(std::function<void(SavedConversation&, const char*)> f) { on_evict_ = std::move(f); }
+    /// --conversation-cache-disk: each parked conversation, the newest first (put appends), left parked - a clean stop
+    /// writes them to the disk level.  `f` must not park, take or evict.
+    template <class F> void each_newest_first(F&& f) {
+        for (size_t i = entries_.size(); i-- > 0;) f(entries_[i]);
+    }
     /// The longest prefix of `out`'s live tokens that another entry (not `out` itself) holds in its live state: an
     /// older copy of a conversation whose newer copy is still parked (the client resent the history without the
     /// copy's last reply, so the newer one is a sibling, not a superset) shares all but that reply with it.
