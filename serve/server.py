@@ -766,7 +766,7 @@ class PromptHeads:
     """"prompt_heads": DIR (opt-in, a diagnostic): the system turn a request opens with - the agent's system prompt and
     tools as the template renders them, the part --prelude-cache keeps - one text file per distinct one, and
     index.json with its token count and how often and when it came.  Also divergences/: a conversation whose history
-    the client rewrote early (see divergence()).  Diff two files to see what an agent changes from
+    the client rewrote early (see divergence()), and tail-rewrites/: one whose previous prompt's end it re-rendered.  Diff two files to see what an agent changes from
     one session to the next (a date, a folder) and so why its next chat cannot start after the stored prelude.  At
     most `cap` text files; past that the index still counts."""
     TURN_ID = 248045                                    # <|im_start|> (the engine's --turn-token)
@@ -798,6 +798,7 @@ class PromptHeads:
     # the divergence check: prompts kept to compare with, their shortest, the margin before the recent prompt's end, the
     # ids of text written after the change, the window kept_later looks for
     RECENT, MIN_TOKENS, SLACK, CONTEXT, WINDOW = 8, 8192, 4096, 1200, 32
+    TAIL_CAP = 40                                       # tail-rewrites/: at most this many text files
 
     @staticmethod
     def common_prefix(a: bytes, b: bytes) -> int:
@@ -848,7 +849,11 @@ class PromptHeads:
         if best is None:
             return None
         old_len = len(best) // 4
-        if at < head_len or at + self.SLACK >= old_len:    # another agent, or the same conversation going on
+        if at < head_len:                                   # another agent
+            return None
+        if at + self.SLACK >= old_len:                      # the same conversation going on
+            if at < old_len:                                # ... with the end of its previous prompt rewritten
+                self.tail_rewrite(ids, best, at, head_len)
             return None
         if not self.kept_later(best, cur, at, self.WINDOW):  # another chat of the agent (a new subagent on the same task
             return None                                      # shares the first message's start, not the later turns)
@@ -871,6 +876,33 @@ class PromptHeads:
                                 "head": head_len, "file": name}) + "\n")
         print(f"[strata] prompt_heads: a conversation changed at id {at} of {old_len} (system turn {head_len}); "
               f"{'divergences/' + name if name else 'the file cap is reached'}", flush=True)
+        return name
+
+    def tail_rewrite(self, ids, old: bytes, at: int, head_len: int) -> str | None:
+        """A conversation that goes on but no longer holds the end of its previous prompt: the client re-rendered the
+        last turn (a reminder left out, a reasoning dropped), so the engine resumes at a checkpoint before `at` and
+        reads the previous reply again.  Writes tail-rewrites/<time>.txt with the previous prompt's end and this
+        prompt from the same id (at most TAIL_CAP files) and one line in tail-rewrites/index.jsonl; the file's name."""
+        old_ids = array.array("i")
+        old_ids.frombytes(old)
+        old_len = len(old_ids)
+        now = time.time()
+        name = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}-{at}.txt"
+        d = self.dir / "tail-rewrites"
+        d.mkdir(exist_ok=True)
+        if len(list(d.glob("*.txt"))) < self.TAIL_CAP:
+            before = lambda xs: self.tok.decode(list(xs[max(0, at - 200): at]))
+            (d / name).write_text(
+                f"A prompt of {len(ids)} ids holds the previous one of {old_len} up to id {at}, {old_len - at} ids before "
+                f"its end (system turn: {head_len}).\n\n===== the 200 ids before the change =====\n{before(ids)}\n\n"
+                f"===== the previous prompt, from the change to its end =====\n{self.tok.decode(list(old_ids[at:]))}\n\n"
+                f"===== this prompt, from the change =====\n{self.tok.decode(list(ids[at: at + self.CONTEXT]))}\n",
+                encoding="utf-8")
+        else:
+            name = None
+        with open(d / "index.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"time": round(now), "tokens": len(ids), "recent_tokens": old_len, "common": at,
+                                "back": old_len - at, "head": head_len, "file": name}) + "\n")
         return name
 
     def note(self, ids) -> str | None:

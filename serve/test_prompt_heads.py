@@ -63,9 +63,10 @@ class Divergences(unittest.TestCase):
             h = PromptHeads(d, Tok())
             first = list(range(100, 140))
             h.note(prompt([1, 2, 3], first))                          # (the system turn: T SYS 1 2 3 END, 6 ids)
-            h.note(prompt([1, 2, 3], first + [7, 7]))                 # the same conversation going on
+            h.note(prompt([1, 2, 3], first) + [7, 7])                 # the same conversation going on
             h.note(prompt([1, 2, 3], [500] * 40))                     # another chat of the same agent
             self.assertFalse((Path(d) / "divergences").exists())
+            self.assertFalse((Path(d) / "tail-rewrites").exists())
             changed = first[:5] + [999] + first[6:]                  # the client rewrote id 5 of the first message
             h.note(prompt([1, 2, 3], changed + [7, 7]))
             rows = [json.loads(l) for l in (Path(d) / "divergences" / "index.jsonl").read_text().splitlines()]
@@ -93,6 +94,35 @@ class Divergences(unittest.TestCase):
             h.note(prompt([1, 2, 3], [5] + later))                    # the tool output cleared: 41 ids
             rows = [json.loads(l) for l in (Path(d) / "divergences" / "index.jsonl").read_text().splitlines()]
             self.assertEqual([(r["tokens"], r["recent_tokens"], r["common"]) for r in rows], [(41, 80, 8)])
+
+    def test_a_re_rendered_end_of_the_previous_prompt_is_written_down(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = PromptHeads(d, Tok())
+            history = list(range(100, 140))
+            h.note(prompt([1, 2, 3], history + [50, 51]))             # a tool output, then a reminder (50 51)
+            h.note(prompt([1, 2, 3], history + [60, 7, 7]))           # the reminder left out, the reply, a new turn
+            self.assertFalse((Path(d) / "divergences").exists())      # (not an early rewrite)
+            rows = [json.loads(l) for l in (Path(d) / "tail-rewrites" / "index.jsonl").read_text().splitlines()]
+            self.assertEqual([(r["common"], r["back"], r["recent_tokens"]) for r in rows], [(48, 4, 52)])
+            text = (Path(d) / "tail-rewrites" / rows[0]["file"]).read_text()
+            self.assertIn("up to id 48, 4 ids before its end", text)
+            self.assertIn(f"===== the previous prompt, from the change to its end =====\n50 51 {END} {T}\n", text)
+            self.assertIn(f"===== this prompt, from the change =====\n60 7 7 {END} {T}\n", text)
+
+    def test_past_the_tail_cap_the_index_still_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = PromptHeads(d, Tok())
+            PromptHeads.TAIL_CAP, saved = 1, PromptHeads.TAIL_CAP
+            try:
+                history = list(range(100, 140))
+                for k in range(3):                                    # each turn re-renders the previous end
+                    h.note(prompt([1, 2, 3], history + [50 + k]))
+                    history += [60 + k, 7]
+            finally:
+                PromptHeads.TAIL_CAP = saved
+            rows = [json.loads(l) for l in (Path(d) / "tail-rewrites" / "index.jsonl").read_text().splitlines()]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(len(list((Path(d) / "tail-rewrites").glob("*.txt"))), 1)
 
     def test_a_new_subagent_on_the_same_task_is_not_a_rewrite(self):
         with tempfile.TemporaryDirectory() as d:
