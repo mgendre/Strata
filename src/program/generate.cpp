@@ -652,7 +652,7 @@ struct Options {
     int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
-    int peer_refill_sm = 0;   ///< --peer-refill-sm: SM blocks for the peer's adaptive copies (0 = the copy engine)
+    int peer_refill_sm = 0;   ///< --peer-refill-compute-units: the peer's compute units (SMs) doing its adaptive copies (0 = the copy engine)
     bool peer_slow_link = false;   ///< --peer-slow-link-optimizations: the peer's input quantized on the host, its rows straight to RAM
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
@@ -1122,9 +1122,10 @@ void usage() {
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
-                 "  --peer-refill-sm N    the peer cache's adaptive copies by N blocks of SM loads instead of the copy\n"
-                 "                       engine, which otherwise holds back every layer's launch on that card until the\n"
-                 "                       round has landed (default 0: the copy engine; 4 fills a PCIe 4.0 x4 link)\n"
+                 "  --peer-refill-compute-units N  the peer cache's adaptive copies done by N of that card's compute\n"
+                 "                       units (SMs) instead of its copy engine, which otherwise holds back every layer's\n"
+                 "                       launch on that card until the round has landed (default 0: the copy engine;\n"
+                 "                       2-4 for a PCIe 4.0 x4 link)\n"
                  "  --peer-slow-link-optimizations  for a peer on a slow link (x4, a chipset slot): its input is\n"
                  "                       quantized by the CPU before it is sent (3.5x fewer bytes) and its result rows go\n"
                  "                       straight to RAM while it computes; the same results (default off)\n"
@@ -3336,7 +3337,7 @@ int main(int argc, char** argv) {
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
-        else if (a == "--peer-refill-sm") o.peer_refill_sm = std::max(0, std::atoi(next("--peer-refill-sm")));
+        else if (a == "--peer-refill-compute-units") o.peer_refill_sm = std::max(0, std::atoi(next("--peer-refill-compute-units")));
         else if (a == "--peer-slow-link-optimizations") o.peer_slow_link = true;
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
@@ -7692,12 +7693,12 @@ int main(int argc, char** argv) {
                      std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
         if (peer.refill_sm() > 0)
-            std::fprintf(stderr, "strata generate: peer GPU %d: the adaptive tier's copies go by %d blocks of SM loads, "
-                                 "leaving the copy engine to each layer's launch (--peer-refill-sm)\n",
+            std::fprintf(stderr, "strata generate: peer GPU %d: the adaptive tier's copies done by %d of its compute units, "
+                                 "leaving the copy engine to each layer's launch (--peer-refill-compute-units)\n",
                          o.peer_device, peer.refill_sm());
         else
             std::fprintf(stderr, "strata generate: peer GPU %d: the adaptive tier's copies go by the copy engine "
-                                 "(--peer-refill-sm 4: by SM loads)\n", o.peer_device);
+                                 "(--peer-refill-compute-units 4: by its compute units)\n", o.peer_device);
         std::fprintf(stderr, "strata generate: peer GPU %d: %s\n", o.peer_device,
                      peer.slow_link() ? "its input quantized on the host and its rows straight to RAM (--peer-slow-link-optimizations)"
                                       : "its input sent as floats, its rows copied back after its experts (--peer-slow-link-optimizations "
