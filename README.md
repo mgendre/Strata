@@ -39,55 +39,40 @@ shows what both do in the Monitor, while keeping writes to the SSD low.
 
 | Change | Options (default) |
 | --- | --- |
-| **Conversation cache on disk.** Long conversations are saved on an SSD and come back from there instead of being read again. | `--conversation-cache-disk DIR` (off), `--conversation-cache-disk-mib` (32768), `--conversation-cache-disk-first-tokens` (32768), `--conversation-cache-disk-step-tokens` (16384), `--conversation-cache-disk-topup-tokens` (0: off), `--conversation-cache-disk-day-gib` (200: a warning only) |
+| **Conversation cache on disk.** A conversation that leaves RAM (the slots are full, RAM is low) is written to an SSD and comes back from there instead of being read again. Nothing is written while it is in RAM. | `--conversation-cache-disk DIR` (off), `--conversation-cache-disk-mib` (32768), `--conversation-cache-disk-min-tokens` (12288), `--conversation-cache-disk-day-gib` (200: a warning only) |
 | **Prelude cache.** The prelude of each agent (its system prompt and tools, up to the first turn) is saved once in a folder of its own. A new chat of that agent starts after it, also after a restart, instead of reading it again. | `--prelude-cache DIR` (off), `--prelude-cache-mib` (5120) |
-| **Spill.** A conversation below the first save step is written to disk when RAM lets it go, so only the ones RAM loses are saved. | `--conversation-cache-disk-spill-tokens N` (0: off) |
 | **Smaller parked conversations in RAM.** A parked conversation keeps its last N checkpoints and its first one (the end of the system prompt) instead of all of them. Each checkpoint is about 118 MB on Qwen3.8-Flash-Next. | `--conversation-cache-park-checkpoints N` (0: all) |
-| **Clearer log.** One line for each save to disk, each restore from disk, and each conversation that leaves RAM, with whether it is on disk. | always, with the disk cache |
+| **Clearer log.** One line for each write to disk, each restore from disk, and each conversation that leaves RAM, with whether it is on disk. | always, with the disk cache |
 | **Second GPU line.** With `--peer-device`, one line per request says where the experts ran: the main GPU's cache, the second GPU, over PCIe, or on the CPU. | always, with `--peer-device` |
 | **Second GPU refill by SM loads.** With `--peer-device`, the adaptive tier copies experts into the second GPU with the GPU's own loads instead of its copy engine. On the copy engine, each layer's work on that card waited until the whole round of copies had landed. | `--peer-refill-sm N` (0: the copy engine) |
 | **No expert on both GPUs.** The main GPU's adaptive tier no longer takes an expert that is still being copied into the second GPU, which left both cards holding it. | always, with `--peer-device` |
 | **Image encoder on the CPU, started on demand.** The vision section's `"elastic": true` now works for an encoder on the CPU, also with `--peer-device` (it no longer needs `"vram_elastic"`). | `"elastic": true`, `"elastic_idle_s"` (120) in the config's `vision` section |
-| **Prompt heads (a diagnostic).** Each distinct system turn a request opens with (an agent's system prompt and tools) is written to a folder once, with an index of how often and when it came, so a diff shows what an agent changes between sessions and why its next chat cannot start after the stored prelude. | `"prompt_heads": DIR` in the config (off) |
-| **Monitor.** The Conversation cache card shows the RAM and disk bars, where restored conversations came from, the prompt tokens given back per hour (RAM and disk), the disk writes per hour and today, and one row per conversation on disk. A Disk write card sits next to Disk read. | always |
+| **Monitor.** The Conversation cache card shows a small graph per store on disk (conversations, preludes): the prompt tokens it gave back each hour of the last day, and a line of what it wrote. A Disk write card sits next to Disk read. | always |
 
 ### The options, and what turning them on does
 
 Measured on the reference PC (Linux, Ryzen 7 5800X3D, 64 GB DDR4-3600, RTX 3080 Ti + RTX 3060 behind the X570
 chipset, a PCIe 4.0 NVMe SSD, Qwen3.8-Flash-Next IQ3\_S). Other PCs will see other numbers.
 
-**`--conversation-cache-disk DIR`** (off). Saves long conversations on an SSD, so they come back from it when RAM has
-let them go or after a restart.
-- Gain: a returning conversation is restored in 0.2-0.26 s; its request took 0.7-1.2 s instead of about 7 s to read
-  a 14K-20K-token prompt again.
-- Cost: SSD space up to `--conversation-cache-disk-mib`, and writes: about 0.3 s after a reply that reaches a save
-  step (only new 4K-token blocks are written: a conversation that grew by 6K tokens wrote 232 MiB). A request that
-  arrives during a save waits for it.
-- Use it when agents switch between long conversations, or when the engine restarts often.
+**`--conversation-cache-disk DIR`** (off). A conversation that leaves RAM (the slots or the budget are full, RAM is low)
+or that RAM cannot take is written to an SSD, and comes back from it instead of being read again. Nothing is written
+while a conversation is in RAM.
+- Gain: a returning conversation is restored in 0.2-0.26 s; a 13.6K-token one read its prompt in 0.96 s instead of
+  about 6.8 s.
+- Cost: SSD space up to `--conversation-cache-disk-mib`; the request that pushed a conversation out waits for its write
+  (0.26 s, 310 MiB for 13.6K tokens; only new 4K-token blocks are written).
+- Not written: a copy the disk already holds but its last 4K-token block, and an older copy of a conversation that is
+  still kept (the live one, or another parked copy holding all of it but its last block).
+- Use it when agents switch between more long conversations than the RAM cache's slots hold.
 
 **`--conversation-cache-disk-mib N`** (32768). The disk budget. More keeps more conversations (on disk a conversation takes about 16-18 KB a
 token: about 2.5 GB at 150K tokens); it costs only disk space.
 
-**`--conversation-cache-disk-first-tokens N`** (32768) and **`--conversation-cache-disk-step-tokens N`** (16384).
-A conversation is saved once it reaches N tokens, then again every step further. Lower values save more and fresher
-copies and write more. A 13-day replay of the reference PC's log: lowering the first step to 12K gave back 0.03
-minutes of prompt reading per GB written, less than the spill below (0.05).
-
-**`--conversation-cache-disk-topup-tokens N`** (0: off). When RAM pushes out, or cannot hold, a conversation N or
-more tokens past its copy, that gap is saved too. More writes, fresher copies.
+**`--conversation-cache-disk-min-tokens N`** (12288). A conversation shorter than that is not written: reading it
+again costs a few seconds at most.
 
 **`--conversation-cache-disk-day-gib N`** (200). Only a warning in the Monitor past N GiB written in a day; nothing
 stops.
-
-**`--conversation-cache-disk-spill-tokens N`** (0: off). A conversation of N tokens or more that RAM lets go, or
-cannot take, with no copy on disk is saved then, so the mid-size ones below the first step are not lost.
-- Gain: a 13.6K-token conversation came back from disk in 0.21 s and read its prompt in 0.96 s instead of about 6.8 s.
-- Cost: the request that pushed it out waits for the write (0.26 s, 310 MiB for 13.6K tokens).
-- A copy that leaves RAM while a newer copy of the same conversation is still kept (the live one, or another parked
-  copy holding all of it but its last few thousand tokens) is not spilled: agent clients that re-render the last
-  turn make the engine borrow from the old copy and park a new one, and only the newest is worth saving.
-- When a conversation is parked, the older copies of it that it covers (all but their last 4,096 tokens, and at least
-  three quarters of them) are dropped from RAM, so they do not take the slots other conversations need.
 
 **`--conversation-cache-park-checkpoints N`** (0: all). A conversation parked in RAM keeps its last N checkpoints and
 its first one instead of all of them (118 MB each on Qwen3.8-Flash-Next).
@@ -99,8 +84,7 @@ system prompt and tools, at least `--prompt-cache-root` tokens) once, in a store
 - Gain: a new chat of that agent starts after it, also after a restart: an 8,413-token prelude came back in 0.19 s
   and the request read its prompt in 0.56 s instead of 7.4 s.
 - Cost: one write per distinct system prompt (235 MiB for 8K tokens, 0.2 s after the first reply) and disk space up
-  to N MiB. An agent that changes its system prompt every session (a date, a folder) gets a new prelude each time;
-  `"prompt_heads"` below shows whether it does.
+  to N MiB. An agent that changes its system prompt every session (a date, a folder) gets a new prelude each time.
 - The server passes the id of `system` as `--system-role-token` by itself: a chat without a system prompt has no
   prelude. Nothing to set.
 
@@ -111,13 +95,6 @@ GPU with N blocks of that GPU's own loads instead of its copy engine.
 - Cost: during a round, N blocks of the second GPU copy (4 fill a PCIe 4.0 x4 link at 6 GB/s); a layer's work there
   took 0.12 ms instead of 0.11 ms meanwhile. Experts outside registered memory keep the copy engine.
 - Use it with a second GPU on a slow link (a chipset or x4 slot). Measured only there.
-
-**`"prompt_heads": DIR`** in the config (off). A diagnostic: each distinct system turn a request opens with is
-written to DIR once as text, with `index.json` counting how often and when it came. A diff of two files shows what an
-agent changes between sessions. It also writes `divergences/`: when a long prompt shares the system turn and part of
-the first message with a recent one but parts from it more than 4,096 tokens before that one's end (the client
-rewrote its history, so the engine can only resume before the change), both texts around the change. Cost: system
-prompts and those excerpts stored as plain text on the local disk (at most 200 files each).
 
 **`"elastic": true`** in the config's `vision` section, with `"elastic_idle_s"` (120). The image encoder starts with
 the first picture and stops after that many seconds without one.
@@ -151,14 +128,12 @@ These options come from upstream Strata; the reference PC runs them with the for
 
 ### How the disk cache works
 
-- A conversation is saved right after a reply, once it reaches 32K tokens, and again every 16K tokens more. The answer
-  is already sent: nobody waits for the save.
+- Nothing is written while a conversation is in RAM. When RAM drops one of `--conversation-cache-disk-min-tokens` or
+  more (the slots or the budget are full, RAM is low), or cannot take it, it is written then; the request that pushed
+  it out waits for the write (0.26 s for 13.6K tokens).
 - Only what is new is written. The conversation is stored in blocks of 4K tokens named by their content, so a block
-  already on disk is never written again. Each save adds the new blocks and one snapshot of the model's state.
-- When RAM drops a conversation, nothing is written: its copy is on disk already.
-- With `--conversation-cache-disk-spill-tokens N`, a conversation of N tokens or more that RAM drops with no copy on
-  disk is written then. The request that pushed it out waits for the write (0.26 s for 13.6K tokens).
-- When the conversation comes back, its copy goes from the disk to the GPU, and only the tokens since the last save are
+  already on disk is never written again. Each write adds the new blocks and one snapshot of the model's state.
+- When the conversation comes back, its copy goes from the disk to the GPU, and only the tokens after its snapshot are
   read again.
 - The copies are kept across restarts and rebuilds of the same engine version, with the same model and settings.
   Another version, model or setting that changes the saved data starts with an empty cache.
@@ -171,6 +146,7 @@ To turn it on, add to the run config's `args` (the folder should be on an SSD):
 ```json
 "--conversation-cache-disk", "/path/to/conversation-cache",
 "--conversation-cache-disk-mib", "32768",
+"--conversation-cache-disk-min-tokens", "12288",
 "--conversation-cache-park-checkpoints", "3"
 ```
 
@@ -178,7 +154,7 @@ To turn it on, add to the run config's `args` (the folder should be on an SSD):
 
 On one Linux PC with a PCIe 4 NVMe SSD, Qwen3.8-Flash-Next IQ3\_S, test conversations of 14K to 20K tokens:
 
-- A save after a reply took about 0.3 s.
+- A write when RAM let a 13.6K-token conversation go took 0.26 s (310 MiB).
 - A restore from disk took 0.2 to 0.26 s. The request then took 0.7 to 1.2 s, instead of about 7 s to read the prompt
   again.
 - A conversation that grew by 6K tokens wrote 232 MiB and reused 178 MiB that was already on disk.
@@ -197,8 +173,8 @@ restarted.
 - The prelude ends at the first turn boundary after the system prompt, when it is at least `--prompt-cache-root`
   tokens long (2,048 by default). It is saved right after the reply of the first chat that reads it, once. A chat that
   does not start with a system prompt has no prelude (the server passes the id of `system` to the engine).
-- A new chat that starts with a saved prelude, and that RAM cannot resume further, comes back from it. The Monitor counts
-  these restores and their tokens next to the RAM and disk ones.
+- A new chat that starts with a saved prelude, and that RAM cannot resume further, comes back from it. The Monitor shows
+  these restores and the preludes written in a small graph of its own.
 - The folder keeps `--prelude-cache-mib` in all (5 GiB by default, about 20 preludes of 8K tokens). The prelude used
   least leaves first. Like the disk cache, it is kept across restarts of the same engine version, model and settings.
 
@@ -211,7 +187,7 @@ Measured on the same PC with an 8,413-token system prompt: the save took 0.2 s (
 restore took 0.19 s and the request read its prompt in 0.56 s instead of 7.4 s. The answer (a code planted in the
 system prompt) was the same text.
 
-A conversation of 13.6K tokens spilled when RAM let it go wrote 310 MiB in 0.26 s; it came back from disk in 0.21 s and
+A conversation of 13.6K tokens written when RAM let it go took 310 MiB in 0.26 s; it came back from disk in 0.21 s and
 read its prompt in 0.96 s instead of about 6.8 s.
 
 ### The second GPU's refill

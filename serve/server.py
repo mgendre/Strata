@@ -27,7 +27,6 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
-import array
 import contextlib
 import collections
 import base64
@@ -774,177 +773,6 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
-class PromptHeads:
-    """"prompt_heads": DIR (opt-in, a diagnostic): the system turn a request opens with - the agent's system prompt and
-    tools as the template renders them, the part --prelude-cache keeps - one text file per distinct one, and
-    index.json with its token count and how often and when it came.  Also divergences/: a conversation whose history
-    the client rewrote early (see divergence()), and tail-rewrites/: one whose previous prompt's end it re-rendered.  Diff two files to see what an agent changes from
-    one session to the next (a date, a folder) and so why its next chat cannot start after the stored prelude.  At
-    most `cap` text files; past that the index still counts."""
-    TURN_ID = 248045                                    # <|im_start|> (the engine's --turn-token)
-
-    def __init__(self, folder, tok, cap: int = 200):
-        self.dir = Path(folder)
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self.tok, self.cap = tok, cap
-        role = tok.encode("system", parse_special=True)
-        self.system_id = role[0] if len(role) == 1 else None
-        self.lock = threading.Lock()
-        self.path = self.dir / "index.json"
-        try:
-            self.index = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            self.index = {}
-        self.saved_at = 0.0
-        self.recent: list[bytes] = []                   # the last RECENT long prompts' ids, for divergence()
-
-    def head(self, ids) -> list[int] | None:
-        """The system turn's ids (up to the next <|im_start|>), or None for a prompt that does not open with one."""
-        if self.system_id is None or len(ids) < 3 or ids[0] != self.TURN_ID or ids[1] != self.system_id:
-            return None
-        for i in range(2, len(ids)):
-            if ids[i] == self.TURN_ID:
-                return list(ids[:i])
-        return None
-
-    # the divergence check: prompts kept to compare with, their shortest, the margin before the recent prompt's end, the
-    # ids of text written after the change, the window kept_later looks for
-    RECENT, MIN_TOKENS, SLACK, CONTEXT, WINDOW = 8, 8192, 4096, 1200, 32
-    TAIL_CAP = 40                                       # tail-rewrites/: at most this many text files
-
-    @staticmethod
-    def common_prefix(a: bytes, b: bytes) -> int:
-        """The longest common prefix of two int32 id arrays (as bytes), in ids: a binary search over slice equality."""
-        lo, hi = 0, min(len(a), len(b)) // 4
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if a[:4 * mid] == b[:4 * mid]:
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo
-
-    @staticmethod
-    def kept_later(old: bytes, new: bytes, at: int, width: int = 32) -> bool:
-        """Whether `new` still holds parts of `old` from after id `at` (a 32-id window at half, four fifths and nineteen
-        twentieths of the way to old's end): a rewritten history keeps its later turns, another chat does not."""
-        n = len(old) // 4
-        for frac in (0.5, 0.8, 0.95):
-            pos = min(at + int((n - at) * frac), n - width)    # (the window fits in old)
-            if pos <= at:
-                continue
-            win = old[4 * pos: 4 * (pos + width)]
-            if len(win) < 4 * width:
-                continue
-            i = new.find(win)
-            while i >= 0 and i % 4:                          # an id boundary only
-                i = new.find(win, i + 1)
-            if i >= 0:
-                return True
-        return False
-
-    def divergence(self, ids, head_len: int) -> str | None:
-        """A conversation that changed early: this prompt (of any length) shares the system turn and still holds later
-        parts (kept_later) of a recent long prompt (MIN_TOKENS or more), but parts from it more than SLACK ids before that prompt's end (a client that rewrote its
-        history: the engine can then only resume at a checkpoint before the change).  Writes divergences/<time>.txt
-        with both texts around the change and one line in divergences/index.jsonl; the file's name, or None."""
-        cur = array.array("i", ids).tobytes()
-        best, at = None, -1
-        for old in reversed(self.recent):                   # the newest first: it wins a tie
-            c = self.common_prefix(cur, old)
-            if c > at:
-                best, at = old, c
-        if len(ids) >= self.MIN_TOKENS:                     # only long prompts are kept to compare with; any prompt is
-            self.recent.append(cur)                         # checked (a rewrite that clears an old tool output shrinks it)
-            if len(self.recent) > self.RECENT:
-                self.recent.pop(0)
-        if best is None:
-            return None
-        old_len = len(best) // 4
-        if at < head_len:                                   # another agent
-            return None
-        if at + self.SLACK >= old_len:                      # the same conversation going on
-            if at < old_len:                                # ... with the end of its previous prompt rewritten
-                self.tail_rewrite(ids, best, at, head_len)
-            return None
-        if not self.kept_later(best, cur, at, self.WINDOW):  # another chat of the agent (a new subagent on the same task
-            return None                                      # shares the first message's start, not the later turns)
-        old_ids = array.array("i")
-        old_ids.frombytes(best)
-        span = lambda xs: self.tok.decode(list(xs[max(0, at - 200): at + self.CONTEXT]))
-        now = time.time()
-        name = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}-{at}.txt"
-        d = self.dir / "divergences"
-        d.mkdir(exist_ok=True)
-        if len(list(d.glob("*.txt"))) < self.cap:
-            (d / name).write_text(
-                f"A prompt of {len(ids)} ids parted from a recent one of {old_len} at id {at} (system turn: "
-                f"{head_len}).\n\n===== the recent prompt, from 200 ids before the change =====\n{span(old_ids)}\n\n"
-                f"===== this prompt, from 200 ids before the change =====\n{span(ids)}\n", encoding="utf-8")
-        else:
-            name = None
-        with open(d / "index.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps({"time": round(now), "tokens": len(ids), "recent_tokens": old_len, "common": at,
-                                "head": head_len, "file": name}) + "\n")
-        print(f"[strata] prompt_heads: a conversation changed at id {at} of {old_len} (system turn {head_len}); "
-              f"{'divergences/' + name if name else 'the file cap is reached'}", flush=True)
-        return name
-
-    def tail_rewrite(self, ids, old: bytes, at: int, head_len: int) -> str | None:
-        """A conversation that goes on but no longer holds the end of its previous prompt: the client re-rendered the
-        last turn (a reminder left out, a reasoning dropped), so the engine resumes at a checkpoint before `at` and
-        reads the previous reply again.  Writes tail-rewrites/<time>.txt with the previous prompt's end and this
-        prompt from the same id (at most TAIL_CAP files) and one line in tail-rewrites/index.jsonl; the file's name."""
-        old_ids = array.array("i")
-        old_ids.frombytes(old)
-        old_len = len(old_ids)
-        now = time.time()
-        name = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}-{at}.txt"
-        d = self.dir / "tail-rewrites"
-        d.mkdir(exist_ok=True)
-        if len(list(d.glob("*.txt"))) < self.TAIL_CAP:
-            before = lambda xs: self.tok.decode(list(xs[max(0, at - 200): at]))
-            (d / name).write_text(
-                f"A prompt of {len(ids)} ids holds the previous one of {old_len} up to id {at}, {old_len - at} ids before "
-                f"its end (system turn: {head_len}).\n\n===== the 200 ids before the change =====\n{before(ids)}\n\n"
-                f"===== the previous prompt, from the change to its end =====\n{self.tok.decode(list(old_ids[at:]))}\n\n"
-                f"===== this prompt, from the change =====\n{self.tok.decode(list(ids[at: at + self.CONTEXT]))}\n",
-                encoding="utf-8")
-        else:
-            name = None
-        with open(d / "index.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps({"time": round(now), "tokens": len(ids), "recent_tokens": old_len, "common": at,
-                                "back": old_len - at, "head": head_len, "file": name}) + "\n")
-        return name
-
-    def note(self, ids) -> str | None:
-        """Count the request's system turn; its key, or None."""
-        head = self.head(ids)
-        if head is None:
-            return None
-        with self.lock:
-            self.divergence(ids, len(head))
-        key = hashlib.sha1(",".join(map(str, head)).encode()).hexdigest()[:16]
-        now = time.time()
-        with self.lock:
-            e = self.index.get(key)
-            new = e is None
-            if new:
-                e = self.index[key] = {"tokens": len(head), "first": round(now), "count": 0, "file": None}
-                if sum(1 for v in self.index.values() if v.get("file")) < self.cap:
-                    name = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}-{key}.txt"
-                    (self.dir / name).write_text(self.tok.decode(head), encoding="utf-8")
-                    e["file"] = name
-            e["count"] += 1
-            e["last"] = round(now)
-            if new or now - self.saved_at >= 30:
-                tmp = self.path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(self.index, indent=1), encoding="utf-8")
-                os.replace(tmp, self.path)
-                self.saved_at = now
-        return key
-
-
 class ConvCacheLog:
     """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
@@ -963,6 +791,8 @@ class ConvCacheLog:
         self.lock = threading.Lock()                    # the monitor and the usage sampler both read on
         self.on_prelude = None                          # called (time read, tokens) for each prelude restore
         self.on_prelude_saved = None                    # ... and for each prelude written to the store
+        self.on_disk = None                             # --conversation-cache-disk: (time, tokens) for each restore
+        self.on_disk_saved = None                       # ... and for each conversation written to it
         self.reset()
 
     def reset(self):
@@ -1028,11 +858,18 @@ class ConvCacheLog:
                         st["parks"] += 1
                     elif disk:
                         st["restores_disk"] += 1
+                        if self.on_disk is not None:
+                            self.on_disk(now, int(m.group(2)))
                     else:
                         st["restores"] += 1
                         st["tokens_ram"] += int(m.group(2))
                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
                     st["last_source"] = "disk" if disk else ("ram" if m.group(1) == "restored" else None)
+                continue
+            m = DISK_SAVED.search(line)
+            if m:
+                if self.on_disk_saved is not None:
+                    self.on_disk_saved(now, int(m.group(1)))
                 continue
             m = LEFT_RAM.search(line)
             if m:
@@ -1046,6 +883,7 @@ class ConvCacheLog:
 
 
 DISK_RESTORE = re.compile(r"restored \d+ tokens from disk\b")
+DISK_SAVED = re.compile(r"conversation cache: disk saved (\d+) tokens")
 LEFT_RAM = re.compile(r"conversation cache: left RAM \([^)]*\): \d+ tokens, (on disk|not on disk)")
 
 
@@ -1093,77 +931,11 @@ class ConvDiskStatus:
         return self.data
 
 
-def disk_written_since_boot(folder: str | None) -> dict | None:
-    """The disk that holds `folder`: its name and the bytes written to it since the PC started (all programs), from
-    /sys/block/<disk>/stat (sectors of 512 bytes, field 7).  None off Linux or when it cannot be read."""
-    if not folder:
-        return None
-    try:
-        dev = os.stat(folder).st_dev
-        node = os.path.realpath(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}")
-        if os.path.exists(os.path.join(node, "partition")):   # a partition: count its whole disk
-            node = os.path.dirname(node)
-        with open(os.path.join(node, "stat"), encoding="ascii") as f:
-            fields = f.read().split()
-        return {"device": os.path.basename(node), "written": int(fields[6]) * 512}
-    except (OSError, ValueError, IndexError, AttributeError):
-        return None
-
-
-class CacheHistory:
-    """How much the conversation cache gave back over the last day, for the Monitor's graphs: one sample a minute of the
-    counters [time, tokens restored from RAM, tokens restored from disk, bytes written to disk (all time), restores
-    from RAM, restores from disk, tokens restored from the prelude cache, restores from it].  The engine's counters
-    start again at each engine start; the page takes the differences between samples (a drop is a new start).  A
-    saved sample of an older server (six values) loads with no prelude restores."""
-    EVERY_S, KEEP = 60.0, 24 * 60
-
-    def __init__(self):
-        self.samples = collections.deque(maxlen=self.KEEP)
-        self.lock = threading.Lock()
-
-    def add(self, tokens_ram: int, tokens_disk: int, written: int, restores_ram: int = 0, restores_disk: int = 0,
-            tokens_prelude: int = 0, restores_prelude: int = 0, now: float | None = None):
-        with self.lock:
-            self.samples.append([round(now if now is not None else time.time()), int(tokens_ram), int(tokens_disk),
-                                 int(written), int(restores_ram), int(restores_disk), int(tokens_prelude),
-                                 int(restores_prelude)])
-
-    def view(self) -> list:
-        with self.lock:
-            return [list(x) for x in self.samples]
-
-    def load(self, path: str, now: float | None = None):
-        """The samples of the last day that an earlier run of the server saved (save), so a restart does not empty the
-        graph.  A missing or damaged file is ignored."""
-        try:
-            with open(path, encoding="utf-8") as f:
-                rows = json.load(f)
-        except (OSError, ValueError):
-            return
-        cut = (now if now is not None else time.time()) - self.KEEP * self.EVERY_S
-        with self.lock:
-            self.samples.clear()
-            for r in rows if isinstance(rows, list) else []:
-                if isinstance(r, list) and len(r) in (6, 8) and all(isinstance(v, (int, float)) for v in r) and r[0] >= cut:
-                    self.samples.append([int(v) for v in r] + [0, 0] * (len(r) == 6))
-
-    def save(self, path: str):
-        """Writes the samples beside the engine's status.json (~60 KB, once a minute), under a temporary name first."""
-        tmp = f"{path}.tmp-{os.getpid()}"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.view(), f, separators=(",", ":"))
-            os.replace(tmp, path)
-        except OSError:
-            with contextlib.suppress(OSError):
-                os.remove(tmp)
-
-
-class PreludeUses:
-    """--prelude-cache: when it gave a prelude back and when it saved one over the last day, [time, tokens] each,
-    for the Monitor's small graph.  The time is when the log reader saw the line (the sampler reads once a minute);
-    kept across a restart of the server in uses.json beside the prelude store's status.json."""
+class StoreUses:
+    """A store on disk (--prelude-cache, --conversation-cache-disk): when it gave a copy back and when it wrote one over
+    the last day, [time, tokens] each, for the Monitor's small graphs.  The time is when the log reader saw the line
+    (the sampler reads once a minute); kept across a restart of the server in uses.json beside the store's
+    status.json."""
     KEEP_S = 24 * 3600
 
     def __init__(self):
@@ -1177,7 +949,7 @@ class PreludeUses:
                 rows.popleft()
 
     def add(self, t: float, tokens: int, saved: bool = False):
-        """A prelude given back (or, with `saved`, written to the store) at time `t`."""
+        """A copy given back (or, with `saved`, written to the store) at time `t`."""
         with self.lock:
             (self.saves if saved else self.uses).append([round(t), int(tokens)])
             self._trim(t)
@@ -1256,15 +1028,20 @@ def long_read_speed(hist: list) -> float | None:
     return tokens / (ms / 1000) if ms > 0 else None
 
 
+def store_view(status: dict | None, uses: dict, hist: list) -> dict:
+    """A store's small graph (the preludes' or the disk's): its restores and writes of the last day (StoreUses.view),
+    how many copies it holds (its status.json) and the speed of a long prompt read (for the time a restore saved)."""
+    return {"uses": uses.get("uses") or [], "saves": uses.get("saves") or [],
+            "stored": len((status or {}).get("entries") or []), "prompt_tok_s": long_read_speed(hist), "time": time.time()}
+
+
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, disk: dict | None = None,
-                            device: dict | None = None, history: list | None = None,
-                            prelude: dict | None = None, prelude_uses: dict | None = None) -> dict:
+                            disk_uses: dict | None = None, prelude: dict | None = None,
+                            prelude_uses: dict | None = None) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back.
-    With --conversation-cache-disk: its levels, counters and copies (`disk`, the engine's status.json), the disk's
-    writes since boot (`device`) and the usage samples of the last day (`history`).  With --prelude-cache (on
-    whenever `prelude_uses` is given, with or without the disk tier): its restores and saves of the last day
-    (PreludeUses.view) and how many preludes its store holds (`prelude`, its status.json)."""
+    With --conversation-cache-disk (whenever `disk_uses` is given) and --prelude-cache (`prelude_uses`): each store's
+    small graph (store_view; `disk` / `prelude`: its status.json)."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
     view = {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
@@ -1273,16 +1050,10 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, 
             "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
             "last_reused": last.get("reused") if last else None,
             "last_prompt": last.get("prompt_tokens") if last else None}
-    if disk is not None and info.get("conversation_cache_disk", 1):
-        view["disk"] = {**disk, "device": device, "history": history or [],
-                        # what reading a long prompt again costs, for the time a copy saved (tokens it gave back /
-                        # speed): reads of LONG_READ tokens or more only - short reads are mostly a request's fixed
-                        # cost and would make the saving look about twice as large
-                        "prompt_tok_s": long_read_speed(hist)}
+    if disk_uses is not None:
+        view["disk"] = store_view(disk, disk_uses, hist)
     if prelude_uses is not None:
-        view["prelude"] = {"uses": prelude_uses.get("uses") or [], "saves": prelude_uses.get("saves") or [],
-                           "stored": len((prelude or {}).get("entries") or []),
-                           "prompt_tok_s": long_read_speed(hist), "time": time.time()}
+        view["prelude"] = store_view(prelude, prelude_uses, hist)
     return view
 
 
@@ -4472,10 +4243,10 @@ class Service:
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.conv_disk = ConvDiskStatus()               # --conversation-cache-disk: the engine's status.json
         self.prelude_disk = ConvDiskStatus()            # --prelude-cache: its status.json (the same format)
-        self.cache_history = CacheHistory()             # ... and the usage samples of the last day (start_cache_history)
-        self.prelude_uses = PreludeUses()               # --prelude-cache: its restores of the last day
-        self.conv_log.on_prelude = self.prelude_uses.add
-        self.conv_log.on_prelude_saved = self.prelude_uses.add_saved
+        self.disk_uses = StoreUses()                    # ... its restores and writes of the last day
+        self.prelude_uses = StoreUses()                 # --prelude-cache: the same
+        self.conv_log.on_disk, self.conv_log.on_disk_saved = self.disk_uses.add, self.disk_uses.add_saved
+        self.conv_log.on_prelude, self.conv_log.on_prelude_saved = self.prelude_uses.add, self.prelude_uses.add_saved
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -4560,7 +4331,6 @@ class Service:
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.
         self.prompts = None
-        self.prompt_heads: PromptHeads | None = None    # "prompt_heads": DIR (main)
         if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
             from strata_tokenizer import PromptEncoder
             # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
@@ -4869,39 +4639,25 @@ class Service:
             self.fifo.release()
 
     def start_cache_history(self):
-        """--conversation-cache-disk: one sample a minute of what RAM and disk gave back and of the bytes written, for
-        the Monitor's graphs, whether the page is open or not.  --prelude-cache (with or without the disk tier): the
-        log is read once a minute too, so each prelude restore gets its time for the Monitor's prelude graph."""
-        folder, prelude = conversation_disk_dir(self.engine), prelude_cache_dir(self.engine)
-        if not folder and not prelude:
+        """--conversation-cache-disk, --prelude-cache: the engine's log read once a minute, whether the Monitor is open or
+        not, so each restore and write of a store gets its time for the store's small graph (kept in its uses.json)."""
+        stores = [(os.path.join(folder, "uses.json"), uses)
+                  for folder, uses in ((conversation_disk_dir(self.engine), self.disk_uses),
+                                       (prelude_cache_dir(self.engine), self.prelude_uses)) if folder]
+        if not stores:
             return
-
-        saved = os.path.join(folder, "history.json") if folder else None   # (a restart keeps the last day's graphs)
-        uses = os.path.join(prelude, "uses.json") if prelude else None
-        if saved:
-            self.cache_history.load(saved)
-        if uses:
-            self.prelude_uses.load(uses)
+        for path, uses in stores:
+            uses.load(path)
 
         def loop():
-            status = ConvDiskStatus()
             while True:
                 try:
-                    parked = self.conv_log.poll(getattr(self.engine, "log_path", None),
-                                                getattr(self.engine, "log_start", None))
-                    if saved:
-                        disk = status.read(folder) or {}
-                        since = disk.get("since_start") or {}
-                        self.cache_history.add(parked.get("tokens_ram", 0), since.get("tokens", 0),
-                                               disk.get("written_all_time", 0), parked.get("restores", 0),
-                                               since.get("restores", 0), parked.get("tokens_prelude", 0),
-                                               parked.get("restores_prelude", 0))
-                        self.cache_history.save(saved)
-                    if uses:
-                        self.prelude_uses.save(uses)
+                    self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+                    for path, uses in stores:
+                        uses.save(path)
                 except Exception as e:                 # tried again in a minute; the thread keeps running
                     print(f"[strata] conversation cache: usage sample: {e}", flush=True)
-                time.sleep(CacheHistory.EVERY_S)
+                time.sleep(60)
         threading.Thread(target=loop, daemon=True).start()
 
     def start_vision_idle(self):
@@ -5327,8 +5083,7 @@ class Service:
         prelude = self.prelude_disk.read(pfolder)
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked, disk,
-                                                              disk_written_since_boot(folder) if disk else None,
-                                                              self.cache_history.view() if disk else None, prelude,
+                                                              self.disk_uses.view() if folder else None, prelude,
                                                               self.prelude_uses.view() if pfolder else None),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -5453,11 +5208,6 @@ class Service:
         else:
             ids = self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
                 self.tok.encode(prompt, parse_special=True)
-        if store and self.prompt_heads is not None:
-            try:
-                self.prompt_heads.note(ids)
-            except OSError as e:                # a diagnostic: a full disk never fails the request
-                print(f"[strata] prompt_heads: {e}", flush=True)
         return ids
 
     @contextlib.contextmanager
@@ -9575,10 +9325,6 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
-    if cfg.get("prompt_heads"):
-        svc.prompt_heads = PromptHeads(cfg["prompt_heads"], tok)
-        print(f"[strata] prompt_heads: each distinct system turn goes to {cfg['prompt_heads']} (index.json counts them)",
-              flush=True)
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
         # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
         # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.

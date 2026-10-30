@@ -489,37 +489,6 @@ public:
         superseded_ += dropped;
         return dropped;
     }
-    // A copy the outgoing conversation covers although it does not hold the copy's deepest checkpoint: an agent
-    // client re-rendered the end of the turn before (a system-reminder left out of the last user message, the
-    // reasoning dropped), so the engine borrowed the history from that copy, which stayed parked, and the copies of
-    // one conversation piled up in the slots until oldest-first eviction pushed other conversations out.  Dropped:
-    // a parked entry (same cvec, not the guarded donor) whose live tokens the outgoing ones share all of but the last
-    // `slack` (and at least three quarters of them), with the same pictures in that shared part.  Returns how many.
-    size_t drop_covered(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec,
-                        int64_t slack) {
-        size_t dropped = 0;
-        for (size_t i = 0; i < entries_.size();) {
-            const auto& e = entries_[i];
-            const size_t n = std::min(e.live.ids.size(), ids.size());
-            size_t k = 0;
-            while (k < n && e.live.ids[k] == ids[k]) ++k;
-            const int64_t len = (int64_t) e.live.ids.size(), common = (int64_t) k;
-            bool same_pictures = true;
-            for (const auto& im : e.live.imgs)
-                if (im.start < common &&
-                    std::find(images.begin(), images.end(), im) == images.end()) { same_pictures = false; break; }
-            if (e.cvec == cvec && len > 0 && common + slack >= len && 4 * common >= 3 * len && same_pictures &&
-                !e.pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) {
-                bytes_ -= e.bytes();
-                erase(i);
-                ++dropped;
-                continue;
-            }
-            ++i;
-        }
-        superseded_ += dropped;
-        return dropped;
-    }
     // A batch slot's chain holds one checkpoint (the one its admission copied in), while the main session's parked copy of the same
     // conversation keeps the whole chain - the root checkpoint at the end of an agent's system prompt and tools among them, the one its
     // next conversations borrow (borrows()).  Parking the slot (#2526) would drop that copy as superseded (#342: the slot's chain holds its
