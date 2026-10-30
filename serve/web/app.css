@@ -135,7 +135,8 @@ main { flex: 1; min-height: 0; display: flex; }
    back (the accent green of the bars) and a line of what it wrote */
 .cc-card { --cc-pre: var(--st-accent); --cc-writes: #6250d6; --cc-grid: var(--st-line-soft); --cc-axis: var(--st-line); }
 [data-theme="dark"] .cc-card { --cc-writes: #9085e9; }
-.cc-chart { position: relative; display: flex; flex-direction: column; gap: var(--st-s-2); }
+.cc-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: var(--st-s-5); }
+.cc-chart { position: relative; display: flex; flex-direction: column; gap: var(--st-s-2); min-width: 0; }
 .cc-chart[hidden] { display: none; }
 .cc-chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--st-s-3); flex-wrap: wrap; }
 .cc-chart-title { font-size: var(--st-fs-sm); font-weight: 600; color: var(--st-ink-soft); }

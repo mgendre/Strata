@@ -495,9 +495,13 @@ function renderStore(p, id, noun) {
       if (k >= 0 && k < 24) { hours[k][key] += tokens; hours[k][n] += 1; }
     }
   const last = uses.length ? uses[uses.length - 1][0] : null;
-  $(`${id}-sum`).textContent = `${fmt(p.stored)} stored · ${fmt(uses.length)} read back, ${fmt(saves.length)} saved in 24 h` +
+  // what the store spared over the day: the prompt tokens it gave back, and the time reading them would have taken at
+  // this server's speed on long reads (prompt_tok_s; none before the first long read)
+  const speed = p.prompt_tok_s, back = uses.reduce((a, [, tokens]) => a + tokens, 0);
+  const spared = back ? `${tokfmt(back)} tokens${speed ? ` (${dur(back / speed)})` : ""} saved · ` : "";
+  $(`${id}-sum`).textContent = `${spared}${fmt(p.stored)} stored · ${fmt(uses.length)} read back, ${fmt(saves.length)} written in 24 h` +
                                 (last ? ` · last read ${since(last)}` : "");
-  $(`${id}-legend`).replaceChildren(...[["Read back", "--cc-pre", false], ["Saved", "--cc-writes", true]].map(([name, color, line]) => {
+  $(`${id}-legend`).replaceChildren(...[["Read back", "--cc-pre", false], ["Written", "--cc-writes", true]].map(([name, color, line]) => {
     const span = document.createElement("span"), key = document.createElement("i");
     key.style.background = `var(${color})`;
     if (line) key.className = "cc-key-line";
@@ -506,15 +510,15 @@ function renderStore(p, id, noun) {
   }));
   const {svg, plot, w, h, pad} = ccSvg(`${id}-svg`, `${id}-plot`, 90);
   if (!uses.length && !saves.length) {
-    svgEl("text", {x: pad.l, y: h / 2}, svg).textContent = `No ${noun} read back or saved in the last 24 hours`;
+    svgEl("text", {x: pad.l, y: h / 2}, svg).textContent = `No ${noun} read back or written in the last 24 hours`;
     return;
   }
   const ymax = niceTokens(Math.max(...hours.map((o) => Math.max(o.pre, o.saved))));
   ccFrame(svg, w, h, pad, ymax, [0, ymax], tokfmt);
-  const speed = p.prompt_tok_s, plural = (n) => (n === 1 ? "" : "s");
+  const plural = (n) => (n === 1 ? "" : "s");
   ccColumns(svg, plot, w, h, pad, hours, [["pre", "--cc-pre"]], ymax, tokfmt, (o) => {
     const rows = [[`${tokfmt(o.pre)} tokens`, `read back from ${fmt(o.npre)} ${noun}${plural(o.npre)}`, "--cc-pre"]];
-    if (o.saved) rows.push([`${tokfmt(o.saved)} tokens`, `saved in ${fmt(o.nsaved)} ${noun}${plural(o.nsaved)}`, "--cc-writes"]);
+    if (o.saved) rows.push([`${tokfmt(o.saved)} tokens`, `written in ${fmt(o.nsaved)} ${noun}${plural(o.nsaved)}`, "--cc-writes"]);
     if (speed && o.pre) rows.push([dur(o.pre / speed), "of reading saved", null]);
     return rows;
   });
