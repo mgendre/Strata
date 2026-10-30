@@ -91,6 +91,10 @@ public:
     int refill_sm() const { return refill_sm_; }      ///< SM blocks of the adaptive refill (0 = the copy engine)
     /// Before `open`: the adaptive refill by `blocks` blocks of SM loads (0 = the copy engine, the default).
     void set_refill_sm(int blocks) { refill_sm_want_ = blocks; }
+    /// --peer-slow-link-optimizations (off by default): for a peer on a narrow link, its input is quantized on the host (3.5x fewer
+    /// bytes in) and its down rows go straight to the host rows while it computes (no scatter after); the same bits
+    void set_slow_link(bool on) { slow_link_ = on; }
+    bool slow_link() const { return slow_link_; }
     double ms_wait = 0;                               ///< host time spent in finish() waiting for the peer
     /// STRATA_PEER_TIMING=1 (a diagnostic): where a layer's peer call goes, summed since the last call and reset -
     /// "" when off or nothing was launched
@@ -108,6 +112,7 @@ private:
     std::vector<uint8_t> incoming_;                      ///< [n_layers * n_expert] -> 1 while in pending_
     int refill_sm_ = 0;                               ///< adaptive refill: SM copy blocks (0 = the copy engine)
     int refill_sm_want_ = 0;                          ///< asked for (set_refill_sm), kept across close()
+    bool slow_link_ = false;                          ///< --peer-slow-link-optimizations (set_slow_link), kept across close()
     void* h_jobs_ = nullptr;                          ///< its job table (pinned, mapped), `jobs_cap_` entries
     void* d_jobs_ = nullptr;
     size_t jobs_cap_ = 0;

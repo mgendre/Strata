@@ -299,14 +299,6 @@ bool peer_timing() {   // STRATA_PEER_TIMING=1: PeerExperts::take_timing's sums 
     static const bool on = [] { const char* v = std::getenv("STRATA_PEER_TIMING"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
-bool peer_down_host() {   // STRATA_PEER_DOWN_HOST=0: the rows computed into the device, then scattered, as before
-    static const bool on = [] { const char* v = std::getenv("STRATA_PEER_DOWN_HOST"); return v == nullptr || std::atoi(v) != 0; }();
-    return on;
-}
-bool peer_host_q8_env() {   // STRATA_PEER_HOST_Q8=0: the input copied as floats and quantized on the second GPU
-    static const bool on = [] { const char* v = std::getenv("STRATA_PEER_HOST_Q8"); return v == nullptr || std::atoi(v) != 0; }();
-    return on;
-}
 bool cpu_avx2_f16c() {
     static const bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c");
     return ok;
@@ -438,10 +430,11 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
     if (f.had_d) { L.had_block = f.had_block; L.d_signs = d_sh_; }
     // the down rows straight into the host `out`, a block's 32 rows a 128-byte store, while the other blocks still
-    // compute (no scatter after the experts; STRATA_PEER_DOWN_HOST=0: the scatter, as before)
-    const bool down_host = direct && peer_down_host() && strata::kernels::native_expert_down_host_ok(f.d_type, f.n_ff);
-    // the input quantized on the host (quantize_q8_1_host: the same bytes; APR's rotation before it stays the device's)
-    const bool host_q8 = peer_host_q8_env() && cpu_avx2_f16c() && !f.had_gu;
+    // compute (no scatter after the experts); --peer-slow-link-optimizations only (without it, the scatter, as upstream)
+    const bool down_host = slow_link_ && direct && strata::kernels::native_expert_down_host_ok(f.d_type, f.n_ff);
+    // the input quantized on the host (quantize_q8_1_host: the same bytes; APR's rotation before it stays the device's);
+    // --peer-slow-link-optimizations only
+    const bool host_q8 = slow_link_ && cpu_avx2_f16c() && !f.had_gu;
     const size_t in_f32 = (size_t) (n_tok * H) * sizeof(float), in_q8 = (size_t) n_tok * (H / 32) * kQ8Block;
     if (peer_check() && (down_host || host_q8)) {
         // STRATA_PEER_CHECK: the path these replace, first - the input as floats, the device's quantization, the rows
