@@ -18,7 +18,7 @@ the chipset), NVMe SSD, Qwen3.8-Flash-Next IQ3\_S.
 | **Conversations on disk.** A long conversation that leaves RAM is written to an SSD and comes back from there. Nothing is written while it is in RAM; a clean stop writes what RAM holds. | `--conversation-cache-disk DIR` | Back in 0.2-0.7 s instead of being read again (13.6K tokens: 0.96 s instead of 6.8 s) |
 | **Prelude cache.** Each agent's system prompt and tools are saved once; its new chats start after them, also after a restart. | `--prelude-cache DIR` | 0.56 s instead of 7.4 s for an 8.4K-token prelude |
 | **Smaller parked conversations.** A parked conversation keeps only its last checkpoints. | `--conversation-cache-park-checkpoints N` | More conversations fit in RAM |
-| **Second GPU: copies by its own cores.** Experts copied into the second GPU no longer hold back its work. | `--peer-refill-sm N` | Decode +6% |
+| **Second GPU: copies by its own compute units.** Experts copied into the second GPU no longer hold back its work. | `--peer-refill-compute-units N` | Decode +6% |
 | **Second GPU: less waiting on a slow link.** The data sent to it is 3.5 times smaller, and its results come back while it computes. Same results. | `--peer-slow-link-optimizations` | Decode +4% |
 | **Prompt reads skip unused experts** (upstream [#4283](https://github.com/Niko1221/Strata/pull/4283), by [@bitaccesscomau](https://github.com/bitaccesscomau)). Same results. | `STRATA_PREFILL_ROUTED_STREAM=1` (env) | Follow-up reads of 1-2K tokens +16% |
 | **Image encoder on the CPU, on demand.** | `"elastic": true` (config, `vision`) | About 1 GB of RAM free between pictures |
@@ -36,7 +36,7 @@ the chipset), NVMe SSD, Qwen3.8-Flash-Next IQ3\_S.
 | `--prelude-cache-mib N` | 5120 | Space in MiB. About 28 KB a token: 245 MiB for a 9K-token prelude | 10240 |
 | `--prompt-cache-root N` (upstream) | 2048 | The shortest prelude saved, in tokens | 2048 |
 | `--conversation-cache-park-checkpoints N` | 0 (all) | Checkpoints kept per parked conversation, about 118 MB each. 2-3 for agents | 3 |
-| `--peer-refill-sm N` | 0 (copy engine) | How many of the second GPU's compute units do the copies. 4 already reach a PCIe 4.0 x4 link's full speed (6 GB/s); more only take units from the experts. A wider link may need more (not measured) | 4 |
+| `--peer-refill-compute-units N` | 0 (copy engine) | How many of the second GPU's compute units (NVIDIA's SMs; an RTX 3060 has 28) do the copies. 2 and 4 measured the same on a PCIe 4.0 x4 link; more only take units from the experts. A wider link may need more (not measured) | 4 |
 | `--peer-slow-link-optimizations` | off | A switch, for a second GPU in an x4 or chipset slot | on |
 | `STRATA_PREFILL_ROUTED_STREAM` (env) | off | 1 = on | 1 |
 | `"elastic"`, `"elastic_idle_s"` (`vision`) | false, 120 | The encoder starts with the first picture and stops after N seconds without one | true, 60 |
@@ -50,7 +50,7 @@ The reference PC's run config:
 "--conversation-cache-park-checkpoints", "3",
 "--prelude-cache", "/path/to/prelude-cache",
 "--prelude-cache-mib", "10240",
-"--peer-refill-sm", "4",
+"--peer-refill-compute-units", "4",
 "--peer-slow-link-optimizations"
 ```
 
@@ -81,7 +81,7 @@ upstream. Each keeps its author's commit; credit goes to them.
 | `--kv-resident 20480` | About 600 more experts on the RTX 3080 Ti, decode +2.5% (1.8 GiB of pinned RAM) |
 | `--vram-reserve-mib 444` | About 130 more experts on the 3080 Ti, decode +1.5% (Linux only) |
 | `STRATA_PARK_ASYNC=1` and `STRATA_CKPT_ASYNC=1`, `_GATHER=1`, `_POOL=1`, `_POOL_READY=4` (env) | An agent switch 1.5 s to 1.2 s |
-| `--adapt-decay 0.92 --peer-adapt-swaps 144` | Decode +2%, with `--peer-refill-sm` |
+| `--adapt-decay 0.92 --peer-adapt-swaps 144` | Decode +2%, with `--peer-refill-compute-units` |
 | `--conversation-cache-min-tokens 2048` | Conversations of 2K-6K tokens are kept in RAM too |
 | `--peer-reserve-mib 280 --peer-prefill-rows 0` | 166 more experts on the headless RTX 3060 (128 fails at start; keep 600 if a desktop uses that card) |
 | `--max-context 153600` | 150K tokens of context |

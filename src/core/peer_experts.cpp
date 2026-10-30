@@ -250,7 +250,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         return false;
     }
     resident_ = (int64_t) pick.size();
-    // the adaptive refill by SM loads (set_refill_sm, --peer-refill-sm; 0 = the copy engine): only where this card
+    // the adaptive refill by SM loads (set_refill_sm, --peer-refill-compute-units; 0 = the copy engine): only where this card
     // reads registered memory by its host address; tried once here on the first slot (rewritten with its own bytes)
     {
         int want = refill_sm_want_;
