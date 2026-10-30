@@ -48,7 +48,7 @@ the chipset), NVMe SSD, Qwen3.8-Flash-Next IQ3\_S.
 | Change | Option | Gain on the reference PC |
 | --- | --- | --- |
 | **Conversations on disk.** A long conversation that leaves RAM is written to an SSD and comes back from there. Nothing is written while it is in RAM; a clean stop writes what RAM holds. | `--conversation-cache-disk DIR` | Back in 0.2-0.7 s instead of being read again (13.6K tokens: 0.96 s instead of 6.8 s) |
-| **Prelude cache.** Each agent's system prompt and tools are saved once; its new chats start after them, also after a restart. | `--prelude-cache DIR` | 0.56 s instead of 7.4 s for an 8.4K-token prelude |
+| **Prelude cache.** Each agent's system prompt and tools are saved once; its new chats start after them, also after a restart. A new system prompt that starts like a saved one (the next day's date, another agent with the same tools) also saves the start they share, and later chats resume from there. Same results. | `--prelude-cache DIR` | 0.56 s instead of 7.4 s for an 8.4K-token prelude; 3.8 s instead of 7.1 s for a 10.5K-token one whose date changed |
 | **Smaller parked conversations.** A parked conversation keeps only its last checkpoints. | `--conversation-cache-park-checkpoints N` | More conversations fit in RAM |
 | **Second GPU: copies by its own compute units.** Experts copied into the second GPU no longer hold back its work. | `--peer-refill-compute-units N` | Decode +6% |
 | **Second GPU: less waiting on a slow link.** The data sent to it is 3.5 times smaller, and its results come back while it computes. Same results. | `--peer-slow-link-optimizations` | Decode +4% |
@@ -69,6 +69,7 @@ row). Every option not listed behaves as upstream.
 | `--conversation-cache-disk-day-gib N` | New | 200 | Daily writes before a warning in the log (nothing stops). Your SSD's TBW divided by the days it should last | 200 |
 | `--prelude-cache DIR` | New | off | A folder on an SSD | a folder on its NVMe |
 | `--prelude-cache-mib N` | New | 5120 | Space in MiB. About 28 KB a token: 245 MiB for a 9K-token prelude | 10240 |
+| `--prelude-cache-common-start 0\|1` | New | 1 | 1 = also save the start a new prelude shares with saved ones, in steps of the prompt chunk (8192 tokens on the reference PC) so the answers keep their bits; about 120 MB each | 1 |
 | `--prompt-cache-root N` | Changed | 2048 | Upstream: where the root checkpoint goes. Here also: the shortest prelude the prelude cache saves, in tokens | 2048 |
 | `--conversation-cache-park-checkpoints N` | New | 0 (all) | Checkpoints kept per parked conversation, about 118 MB each. 2-3 for agents | 3 |
 | `--peer-refill-compute-units N` | New | 0 (copy engine) | How many of the second GPU's compute units (NVIDIA's SMs; an RTX 3060 has 28) do the copies. On a PCIe 4.0 x4 link: 1 is too slow, 2-4 are best, 8 takes units from the experts. A wider link may need more (not measured) | 3 |
