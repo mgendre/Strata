@@ -1057,6 +1057,25 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, 
     return view
 
 
+def gpu_card_roles(cfg: dict, order: list[int], main: int | None, cards: list[int]) -> dict[str, str]:
+    """The Monitor's GPU widgets: what each card does, keyed by its number as nvidia-smi numbers it - every card of a
+    layer split ("layer split"), else the engine's own card (`main`: "model") and --peer-device N's card (the engine's
+    Nth, which `order` - visible_device_order - maps to nvidia-smi's number: "peer experts").  A card none of these
+    name has no label."""
+    if layer_split_of(cfg):
+        return {str(i): "layer split" for i in cards}
+    roles = {str(main): "model"} if main is not None else {}
+    args = [str(a) for a in (cfg.get("args") or [])]
+    if "--peer-device" in args[:-1]:
+        try:
+            n = int(args[args.index("--peer-device") + 1])
+        except ValueError:
+            n = -1
+        if 0 <= n < len(order):
+            roles[str(order[n])] = "peer experts"
+    return roles
+
+
 _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
 
 
@@ -5079,6 +5098,7 @@ class Service:
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
+        tel["static"]["gpu_roles"] = getattr(self, "gpu_card_roles", None) or {}   # the GPU widgets' labels
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         folder = conversation_disk_dir(self.engine)
         disk = self.conv_disk.read(folder)
@@ -9482,6 +9502,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         svc.gpu_indices = [split["prefill_gpu"], split["decode_gpu"]]
         svc.gpu_index = split["decode_gpu"]
     svc.terminal_visibility_order = visible_device_order(env, cfg.get("backend")) if a.engine == "strata" else []
+    # the Monitor's GPU widgets: what each card does (no replicas or split serving: those cards stay unlabelled)
+    if a.engine == "strata" and not groups and not split:
+        svc.gpu_card_roles = gpu_card_roles(cfg, svc.terminal_visibility_order, svc.gpu_index, svc.gpu_indices)
     svc.terminal_topology_mode = ("replicas (configured)" if a.engine == "strata" and groups
                                   else "split serve (configured)" if a.engine == "strata" and split
                                   else "layer split (configured)" if a.engine == "strata" and layer_split_of(cfg)
