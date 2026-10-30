@@ -160,6 +160,8 @@ main { flex: 1; min-height: 0; display: flex; }
 .cc-plot { position: relative; }
 .cc-svg { display: block; width: 100%; height: 160px; overflow: visible; }
 .cc-svg--short { height: 96px; }
+.cc-pre[hidden] { display: none; }
+.cc-card .cc-svg.cc-svg--pre, .cc-card.cc-has-disk .cc-svg.cc-svg--pre { height: 90px; }   /* a small graph, disk or not */
 .cc-svg text { font-size: 11px; fill: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
 .cc-tip { position: absolute; z-index: 2; pointer-events: none; background: var(--st-surface); border: 1px solid var(--st-line);
   border-radius: var(--st-r-sm); box-shadow: var(--st-sh-card); padding: 6px 8px; font-size: var(--st-fs-xs);
