@@ -711,10 +711,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   spark("sp-disk", h.disk_read_mb);
   if (hw.disk_write_mb == null) {
     setMetric("diskw", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
-  } else {   // all disks, and what they took over the last day (or since the server first read the counter)
-    const big = hw.disk_write_mb >= 1000;
+  } else {   // all disks, and what they took over the server's period (8 h; an older server: 24 h), or since it first read the counter
+    const big = hw.disk_write_mb >= 1000, period = hw.disk_written_period_s || 86400;
     const day = hw.disk_written_day == null ? "" : ` · ${gb(hw.disk_written_day, 1)} GB ` +
-      (Date.now() / 1000 - hw.disk_written_since >= 23.5 * 3600 ? "in 24 h" : `since ${hhmm(hw.disk_written_since)}`);
+      (Date.now() / 1000 - hw.disk_written_since >= period - 1800 ? `in the last ${fmt(period / 3600)} h` : `since ${hhmm(hw.disk_written_since)}`);
     setMetric("diskw", big ? fmt(hw.disk_write_mb / 1024, 2) : fmt(hw.disk_write_mb, hw.disk_write_mb < 10 ? 1 : 0),
               big ? "GB/s" : "MB/s", `all disks${day}`);
   }
