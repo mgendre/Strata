@@ -54,7 +54,7 @@ the chipset), NVMe SSD, Qwen3.8-Flash-Next IQ3\_S.
 | **Second GPU: less waiting on a slow link.** The data sent to it is 3.5 times smaller, and its results come back while it computes. Same results. | `--peer-slow-link-optimizations` | Decode +4% |
 | **Prompt reads skip unused experts** (upstream [#4283](https://github.com/Niko1221/Strata/pull/4283), by [@bitaccesscomau](https://github.com/bitaccesscomau)). Same results. | `STRATA_PREFILL_ROUTED_STREAM=1` (env) | Follow-up reads of 1-2K tokens +16% |
 | **Image encoder on the CPU, on demand.** | `"elastic": true` (config, `vision`) | About 1 GB of RAM free between pictures |
-| **Always on:** no expert on both GPUs; a log line per request on the second GPU; the Monitor's GPU widgets, store graphs (with the time they saved) and Disk write card. | — | — |
+| **Always on:** no expert on both GPUs; a log line per request on the second GPU; the Monitor's GPU widgets, store graphs (with the time they saved), a table per cache of its 15 latest restores (RAM, disk, preludes) and Disk write card. | — | — |
 
 ## The settings
 

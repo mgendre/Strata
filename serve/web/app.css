@@ -147,6 +147,11 @@ main { flex: 1; min-height: 0; display: flex; }
 .cc-plot { position: relative; }
 .cc-svg { display: block; width: 100%; height: 90px; overflow: visible; }
 .cc-svg text { font-size: 11px; fill: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
+/* each cache's latest restores: compact rows on one line, so the stores' tables fit beside each other */
+.cc-rows { display: flex; flex-direction: column; gap: var(--st-s-2); min-width: 0; }
+.cc-rows[hidden] { display: none; }
+.cc-table { font-size: var(--st-fs-sm); }
+.cc-table th, .cc-table td { white-space: nowrap; padding: 6px 8px; }
 .cc-tip { position: absolute; z-index: 2; pointer-events: none; background: var(--st-surface); border: 1px solid var(--st-line);
   border-radius: var(--st-r-sm); box-shadow: var(--st-sh-card); padding: 6px 8px; font-size: var(--st-fs-xs);
   color: var(--st-ink-muted); min-width: 120px; }
