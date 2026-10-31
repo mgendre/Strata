@@ -253,6 +253,32 @@ int main(int argc, char** argv) {
         check(json.find("\"keep\":") != std::string::npos, "status.json rows carry the keep value");
     }
 
+    // --prelude-cache-half-life-h: with 3 hours, a copy that came back 7 times and has not been used for 12 hours
+    // leaves before one saved now (its keep 8 x 2^-4 = 0.5 < 1); with the conversations' day it stays (8 x 2^-0.5 = 5.7)
+    for (const double half_life : {3.0 * 3600, 86400.0}) {
+        int64_t clock = 1000000;
+        ConversationDiskOptions probe = options((root / "probe-hl").string());
+        ConversationDisk dp;
+        Conv p0 = conv(90, 100);
+        check(dp.open(probe, id, 2, sizes, note, error) && dp.save(write_of(p0), st, error), "half-life: measure one copy");
+        const uint64_t one = dp.usage().bytes;
+        ConversationDiskOptions o = options((root / (half_life < 86400 ? "hl3" : "hl24")).string());
+        o.clock = [&clock] { return clock; };
+        o.budget_bytes = 2 * one + 10;                     // room for two copies of this size
+        o.half_life_s = half_life;
+        ConversationDisk d;
+        Conv old = conv(91, 100), fresh = conv(92, 100), next = conv(93, 100);
+        check(d.open(o, id, 2, sizes, note, error) && d.save(write_of(old, 7.0), st, error), "half-life: a popular copy");
+        clock += 12 * 3600;
+        check(d.save(write_of(fresh), st, error) && d.save(write_of(next), st, error) && d.usage().entries == 2,
+              "half-life: 12 hours later, two more copies, two kept");
+        const bool old_kept = (bool) d.best(extend(old.ids, 1), {}, true);
+        const bool fresh_kept = (bool) d.best(extend(fresh.ids, 1), {}, true);
+        check(half_life < 86400 ? (!old_kept && fresh_kept) : (old_kept && !fresh_kept),
+              half_life < 86400 ? "half-life 3 h: the stale popular copy leaves, the fresh one stays"
+                                : "half-life 1 day: the stale popular copy stays, the fresh one leaves");
+    }
+
     // a damaged block: the load fails and the copy is not offered again
     {
         ConversationDisk d3;

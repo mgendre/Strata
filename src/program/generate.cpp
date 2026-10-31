@@ -844,6 +844,11 @@ struct Options {
     /// neither the live session nor RAM resumes further comes back from it.  "" = off.
     std::string prelude_cache;
     int64_t prelude_cache_mib = 5120;
+    /// --prelude-cache-half-life-h N: when the store is full, a prelude's usage score halves every N hours from its
+    /// last use (the conversations' disk tier: a day).  A prelude comes back within hours (the same agents of the same
+    /// session, at most 3.2 h after its save on the reference PC; the next day's system prompt has another date), so
+    /// one used a lot a few hours ago leaves before a fresh one: 7 uses, 9 hours after the last.
+    double prelude_cache_half_life_h = 3.0;
     /// --prelude-cache-common-start 0|1: a new prelude that starts like stored ones (the same tools, then another
     /// agent list or another set of tools shown, or another date) also stores that common start, down to the prompt
     /// chunks' grid so the answers keep their bits, which the next preludes sharing it resume from (1, the default;
@@ -3225,6 +3230,16 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-disk") o.conversation_cache_disk = next("--conversation-cache-disk");
         else if (a == "--prelude-cache") o.prelude_cache = next("--prelude-cache");
+        else if (a == "--prelude-cache-half-life-h") {
+            const std::string v = next("--prelude-cache-half-life-h");
+            char* end = nullptr;
+            const double h = std::strtod(v.c_str(), &end);
+            if (v.empty() || end != v.c_str() + v.size() || !(h > 0) || h > 24.0 * 365) {
+                std::fprintf(stderr, "--prelude-cache-half-life-h needs a number of hours above 0\n");
+                return 2;
+            }
+            o.prelude_cache_half_life_h = h;
+        }
         else if (a == "--prelude-cache-common-start") {
             const std::string v = next("--prelude-cache-common-start");
             if (v != "0" && v != "1") {
@@ -10617,15 +10632,16 @@ int main(int argc, char** argv) {
                 popt.min_tokens = o.prompt_cache_root;
                 popt.refresh_tokens = 1;
                 popt.keep_shorter = o.prelude_common;
-                popt.half_life_s = kScoreHalfLife;
+                popt.half_life_s = o.prelude_cache_half_life_h * 3600.0;
                 popt.day_guide_bytes = (uint64_t) o.conversation_cache_disk_day_gib << 30;
                 std::string note;
                 if (prelude.open(popt, did, layers, disk_sizes, note, why))
                     std::fprintf(stderr, "strata serve: prelude cache: at %s: %lld MiB, the preludes (system prompt and tools) "
-                                         "of %lld tokens or more%s%s; %s\n",
+                                         "of %lld tokens or more%s%s, scores halved every %g h; %s\n",
                                  o.prelude_cache.c_str(), (long long) o.prelude_cache_mib, (long long) o.prompt_cache_root,
                                  o.system_role_token >= 0 ? ", system turns only" : "",
-                                 o.prelude_common ? ", and the starts they share" : "", note.c_str());
+                                 o.prelude_common ? ", and the starts they share" : "", o.prelude_cache_half_life_h,
+                                 note.c_str());
             }
             if (!prelude.enabled()) std::fprintf(stderr, "strata serve: prelude cache: off (%s)\n", why.c_str());
         }

@@ -69,6 +69,7 @@ row). Every option not listed behaves as upstream.
 | `--conversation-cache-disk-day-gib N` | New | 200 | Daily writes before a warning in the log (nothing stops). Your SSD's TBW divided by the days it should last | 200 |
 | `--prelude-cache DIR` | New | off | A folder on an SSD | a folder on its NVMe |
 | `--prelude-cache-mib N` | New | 5120 | Space in MiB. About 28 KB a token: 245 MiB for a 9K-token prelude | 10240 |
+| `--prelude-cache-half-life-h N` | New | 3 | When the folder is full, a prelude's usage score halves every N hours from its last use, so a prelude used a lot hours ago (or yesterday: another date in the system prompt) leaves before a fresh one. A prelude came back within 3.2 h of its save on the reference PC. The conversations' disk folder keeps a day | 3 |
 | `--prelude-cache-common-start 0\|1` | New | 1 | 1 = also save the start a new prelude shares with saved ones, in steps of the prompt chunk (8192 tokens on the reference PC) so the answers keep their bits; about 120 MB each | 1 |
 | `--prompt-cache-root N` | Changed | 2048 | Upstream: where the root checkpoint goes. Here also: the shortest prelude the prelude cache saves, in tokens | 2048 |
 | `--conversation-cache-park-checkpoints N` | New | 0 (all) | Checkpoints kept per parked conversation, about 118 MB each. 2-3 for agents | 3 |
