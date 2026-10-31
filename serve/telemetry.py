@@ -531,10 +531,11 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class DiskWrites:
-    """The bytes the PC wrote to its disks (all programs) over the last day, for the Monitor's Disk write card: one
-    reading a minute of the counter of bytes written since boot, kept across a restart of the server in `path` (the
-    config's name + .disk-writes.json).  A counter that went down (the PC restarted) counts from zero again."""
-    EVERY_S, KEEP_S, SAVE_S = 60, 24 * 3600, 600
+    """The bytes the PC wrote to its disks (all programs) over the last KEEP_S (8 hours), for the Monitor's Disk write
+    card: one reading a minute of the counter of bytes written since boot, kept across a restart of the server in
+    `path` (the config's name + .disk-writes.json).  A counter that went down (the PC restarted) counts from zero
+    again."""
+    EVERY_S, KEEP_S, SAVE_S = 60, 8 * 3600, 600
 
     def __init__(self, path=None):
         self.path, self.rows, self.saved_at = path, collections.deque(), 0.0
@@ -548,12 +549,12 @@ class DiskWrites:
                 pass
 
     def add(self, t: float, written: int):
-        """A reading of the counter at time `t`: kept once a minute, the oldest past a day dropped, saved every 10 min."""
+        """A reading of the counter at time `t`: kept once a minute, the oldest past KEEP_S dropped, saved every 10 min."""
         if self.rows and t - self.rows[-1][0] < self.EVERY_S:
             return
         self.rows.append([round(t), int(written)])
         while len(self.rows) > 1 and self.rows[1][0] <= t - self.KEEP_S:
-            self.rows.popleft()                         # (the reading a day back stays: it is the start of the day)
+            self.rows.popleft()                         # (the reading KEEP_S back stays: it is the period's start)
         if self.path and t - self.saved_at >= self.SAVE_S:
             self.saved_at = t
             tmp = f"{self.path}.tmp-{os.getpid()}"
@@ -566,8 +567,8 @@ class DiskWrites:
                     os.remove(tmp)
 
     def total(self) -> tuple:
-        """(bytes written since the first reading kept, the time of that reading): the last day once the server has
-        read the counter for a day, less before; (None, None) before two readings."""
+        """(bytes written since the first reading kept, the time of that reading): the last KEEP_S once the server
+        has read the counter that long, less before; (None, None) before two readings."""
         if len(self.rows) < 2:
             return None, None
         out, prev = 0, self.rows[0][1]
@@ -610,7 +611,7 @@ class Telemetry:
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
-        self.writes = DiskWrites(writes_path)          # the Disk write card's last day
+        self.writes = DiskWrites(writes_path)          # the Disk write card's last 8 hours
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
@@ -707,7 +708,9 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        # (the key keeps its first name, "day"; the period is disk_written_period_s)
         s["disk_written_day"], s["disk_written_since"] = self.writes.total()
+        s["disk_written_period_s"] = DiskWrites.KEEP_S
         if self.extra:
             try:
                 s.update(self.extra())
