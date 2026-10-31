@@ -22,6 +22,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -63,6 +64,9 @@ struct ConversationDiskOptions {
     int64_t min_tokens = 32768;                ///< shorter conversations are not stored
     int64_t refresh_tokens = 1;                ///< a copy fewer tokens behind than this is kept as it is
     int64_t block_tokens = 4096;
+    /// a copy that extends a stored one is stored beside it, not in its place (--prelude-cache-common-start: a common
+    /// start stays there for the other preludes that share it)
+    bool keep_shorter = false;
     double half_life_s = 86400.0;
     uint64_t day_guide_bytes = 200ull << 30;   ///< written per day above which the monitor warns (nothing stops)
     std::function<int64_t()> clock;            ///< unix seconds (tests); unset: the system clock
@@ -114,6 +118,21 @@ public:
             if (e.cvec != cvec) continue;
             const int64_t n = conversation_prefix(e.meta, prompt, images);
             if (n > m.tokens) m = {e.id, n};
+        }
+        return m;
+    }
+    /// --prelude-cache-common-start: how far `prompt` (its first `upto` tokens) runs along a stored copy before the two
+    /// part - the longest start it has in common with any copy, pictures not counted (a copy with pictures gives 0).
+    template<class Token>
+    int64_t common_start(const std::vector<Token>& prompt, int64_t upto, bool cvec) const {
+        const size_t lim = std::min(prompt.size(), (size_t) std::max<int64_t>(0, upto));
+        int64_t m = 0;
+        for (const Entry& e : entries_) {
+            if (e.cvec != cvec || !e.meta.imgs.empty()) continue;
+            const size_t k = std::min(lim, e.meta.ids.size());
+            size_t i = 0;
+            while (i < k && (int64_t) e.meta.ids[i] == (int64_t) prompt[i]) ++i;
+            m = std::max(m, (int64_t) i);
         }
         return m;
     }

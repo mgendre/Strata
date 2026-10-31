@@ -169,6 +169,15 @@ int main(int argc, char** argv) {
     check(!disk.best(a.ids, {}, true), "the copy must be shorter than the prompt");
     check(!disk.best(prompt, {}, false), "another steering mode never matches");
     check(!disk.best(prompt, {{5, 1}}, true), "a picture the copy does not have never matches");
+    {   // --prelude-cache-common-start: where a prompt leaves the stored copies
+        std::vector<int32_t> other(a.ids.begin(), a.ids.begin() + 70);
+        other.push_back(a.ids[70] + 1);
+        other = extend(other, 20);
+        check(disk.common_start(other, 1000, true) == 70, "a prompt that leaves the copy at 70: 70 in common");
+        check(disk.common_start(other, 50, true) == 50, "counted up to `upto` only");
+        check(disk.common_start(prompt, 1000, true) == 100, "a prompt that continues it: the whole copy");
+        check(disk.common_start(other, 1000, false) == 0, "another steering mode: nothing in common");
+    }
 
     Target t(100);
     ConversationCheckpoint state;
@@ -265,6 +274,25 @@ int main(int argc, char** argv) {
         check(json.find("\"disk\":{") != std::string::npos && json.find("\"written_all_time\":") != std::string::npos &&
               json.find("\"entries\":[") != std::string::npos, "status.json carries usage, counters and rows");
         check(d3.clear() >= 1 && d3.usage().entries == 0, "clear drops every copy");
+    }
+
+    // keep_shorter (--prelude-cache-common-start): a copy that extends a stored one is stored beside it
+    {
+        ConversationDiskOptions ko = options((root / "keep-shorter").string());
+        ko.keep_shorter = true;
+        ko.budget_bytes = 4 << 20;
+        ConversationDisk dk;
+        Conv common = conv(81, 70);
+        Conv whole = longer(common, 81, 40);
+        check(dk.open(ko, id, 2, sizes, note, error) && dk.save(write_of(common), st, error) && !st.skipped,
+              "keep_shorter: the common start stored");
+        check(dk.save(write_of(whole), st, error) && !st.skipped && dk.usage().entries == 2 && st.reused > 0,
+              "keep_shorter: the whole prelude is stored beside it, its full blocks named, not written");
+        std::vector<int32_t> sibling(common.ids);
+        sibling.push_back(77000);
+        sibling = extend(sibling, 30);
+        check(dk.best(sibling, {}, true).tokens == 70 && dk.best(extend(whole.ids, 3), {}, true).tokens == 110,
+              "keep_shorter: a sibling resumes from the common start, the same prelude from its whole copy");
     }
 
     // another engine build: the copies are dropped, no stray file stays
