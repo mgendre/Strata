@@ -403,8 +403,59 @@ function renderConvCache(c) {
                             : c.evictions ? ` · ${fmt(c.evictions)} evicted` : "") : null],
     ["Last switch", c.enabled ? event : null],
   ]);
+  // the RAM's table with the parked conversations only (an older server sends no rows: no table)
+  renderRestores("cc-ram-rows", c.enabled ? c.recoveries : null, c.prompt_tok_s, "ram");
   renderStore(c.disk, "cc-dsk", "conversation");   // --conversation-cache-disk
   renderStore(c.prelude, "cc-pre", "prelude");      // --prelude-cache
+}
+
+// each cache's latest restores, the newest first (the server keeps 15): when, the tokens it gave back, the prompt
+// tokens read after them, the MiB read from disk, how long the restore took, the copy's how-many-th return (disk) or
+// use (prelude), and the time it saved - those tokens read again at `speed` (a long prompt read's tokens per second
+// on this server), less the restore's own time.  `kind`: "ram", "disk" or "prelude".
+const RESTORE_EMPTY = {ram: "No conversation restored from RAM since the engine started",
+                       disk: "No conversation restored from disk yet", prelude: "No prelude restored yet"};
+const secs = (s) => (s == null ? "–" : s < 10 ? `${fmt(s, 1)} s` : dur(s));
+const mibs = (m) => (m == null ? "–" : m >= 1024 ? `${fmt(m / 1024, 1)} GiB` : `${fmt(m)} MiB`);
+function restoreSaved(r, speed) {
+  return speed ? Math.max(0, r.tokens / speed - (r.ms || 0) / 1000) : null;
+}
+function restoreTime(t) {   // the time of day; the day too when it is not today's
+  const d = new Date(t * 1000);
+  if (d.toDateString() === new Date().toDateString())
+    return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+  return `${d.toLocaleDateString([], {month: "short", day: "numeric"})} ${d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
+}
+function renderRestores(id, rows, speed, kind) {
+  $(id).hidden = !rows;
+  if (!rows) return;
+  const store = kind !== "ram";
+  const cols = [["Time", "", ""],
+                [kind === "prelude" ? "Prelude" : "Restored", "num", "Prompt tokens the cache gave back"],
+                ["Then read", "num", "Prompt tokens read after them: the rest of the prompt (the time it took on hover)"],
+                ...(store ? [["Read", "num", "What the restore read from disk"]] : []),
+                ["Took", "num", "How long the restore took"],
+                ...(store ? [[kind === "prelude" ? "Use" : "Return", "num",
+                              kind === "prelude" ? "The prelude's how-many-th use" : "The conversation's how-many-th return from disk"]] : []),
+                ["Saved", "num", speed ? `Reading the restored tokens again at ${fmt(speed)} tok/s (this server's long prompt reads), less the restore's time`
+                                       : "Known after the first long prompt read (8,192 tokens or more)"]];
+  $(`${id}-head`).innerHTML = `<tr>${cols.map(([name, cls, tip]) => `<th${cls ? ` class="${cls}"` : ""}${tip ? ` title="${esc(tip)}"` : ""}>${esc(name)}</th>`).join("")}</tr>`;
+  const body = $(`${id}-body`);
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="${cols.length}" class="muted">${esc(RESTORE_EMPTY[kind])}</td></tr>`;
+  } else {
+    body.innerHTML = rows.map((r) => {
+      const share = r.prompt ? ` title="${esc(`${fmt(r.tokens)} of a ${fmt(r.prompt)}-token prompt (${fmt((100 * r.tokens) / r.prompt)}%)`)}"` : "";
+      const then = r.pending ? `<span class="muted">reading…</span>`
+        : r.read == null ? "–" : `<span title="${esc(`read in ${secs(r.read_ms / 1000)}`)}">${fmt(r.read)}</span>`;
+      const took = r.ms == null ? "–" : r.ms < 1000 ? `${fmt(r.ms)} ms` : `${fmt(r.ms / 1000, 1)} s`;
+      return `<tr><td title="${esc(since(r.t))}">${esc(restoreTime(r.t))}</td><td class="num"${share}>${fmt(r.tokens)}</td>
+        <td class="num">${then}</td>${store ? `<td class="num">${mibs(r.mib)}</td>` : ""}<td class="num">${took}</td>
+        ${store ? `<td class="num">${r.nth == null ? "–" : fmt(r.nth)}</td>` : ""}<td class="num">${secs(restoreSaved(r, speed))}</td></tr>`;
+    }).join("");
+  }
+  const saved = speed ? rows.reduce((a, r) => a + restoreSaved(r, speed), 0) : 0;
+  $(`${id}-sum`).textContent = rows.length ? `${fmt(rows.length)} latest${saved ? ` · ${secs(saved)} saved` : ""}` : "";
 }
 
 // the stores on disk (--conversation-cache-disk, --prelude-cache): a small graph each of the last day, hour by hour
@@ -486,6 +537,7 @@ function ccSvg(id, plotId, fallbackH) {
 function renderStore(p, id, noun) {
   $(id).hidden = !p;
   if (!p) return;
+  renderRestores(`${id}-rows`, p.recoveries || null, p.prompt_tok_s, id === "cc-dsk" ? "disk" : "prelude");
   const now = p.time || Date.now() / 1000, h0 = Math.floor(now / 3600) * 3600 - 23 * 3600;
   const hours = Array.from({length: 24}, (_, k) => ({t: h0 + k * 3600, pre: 0, npre: 0, saved: 0, nsaved: 0}));
   const uses = p.uses || [], saves = p.saves || [];

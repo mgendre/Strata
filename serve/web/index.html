@@ -182,6 +182,12 @@
             <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
         </div>
         <dl class="facts" id="cc-facts"></dl>
+        <!-- each cache's latest restores, the newest first (15 at most): RAM here, the disk's and the preludes' under their graphs -->
+        <div class="cc-rows" id="cc-ram-rows" hidden>
+          <div class="cc-chart-head"><span class="cc-chart-title">Latest restores from RAM</span><span class="muted small" id="cc-ram-rows-sum"></span></div>
+          <div class="table-wrap"><table class="st-table cc-table" aria-label="The latest conversations restored from RAM">
+            <thead id="cc-ram-rows-head"></thead><tbody id="cc-ram-rows-body"></tbody></table></div>
+        </div>
         <!-- the two stores' graphs side by side (one below the other on a narrow window) -->
         <div class="cc-charts">
         <div class="cc-chart" id="cc-dsk" hidden>
@@ -189,6 +195,11 @@
             <span class="cc-legend" id="cc-dsk-legend"></span><span class="muted small cc-chart-sum" id="cc-dsk-sum"></span></div>
           <div class="cc-plot" id="cc-dsk-plot"><svg class="cc-svg" id="cc-dsk-svg" role="img"
             aria-label="Prompt tokens the disk gave back (columns) and wrote (line) each hour over the last 24 hours"></svg></div>
+          <div class="cc-rows" id="cc-dsk-rows" hidden>
+            <div class="cc-chart-head"><span class="cc-chart-title">Latest restores from disk</span><span class="muted small" id="cc-dsk-rows-sum"></span></div>
+            <div class="table-wrap"><table class="st-table cc-table" aria-label="The latest conversations restored from disk">
+              <thead id="cc-dsk-rows-head"></thead><tbody id="cc-dsk-rows-body"></tbody></table></div>
+          </div>
           <div class="cc-tip" hidden></div>
         </div>
         <div class="cc-chart" id="cc-pre" hidden>
@@ -196,6 +207,11 @@
             <span class="cc-legend" id="cc-pre-legend"></span><span class="muted small cc-chart-sum" id="cc-pre-sum"></span></div>
           <div class="cc-plot" id="cc-pre-plot"><svg class="cc-svg" id="cc-pre-svg" role="img"
             aria-label="Prompt tokens the prelude cache gave back (columns) and wrote (line) each hour over the last 24 hours"></svg></div>
+          <div class="cc-rows" id="cc-pre-rows" hidden>
+            <div class="cc-chart-head"><span class="cc-chart-title">Latest prelude restores</span><span class="muted small" id="cc-pre-rows-sum"></span></div>
+            <div class="table-wrap"><table class="st-table cc-table" aria-label="The latest preludes restored">
+              <thead id="cc-pre-rows-head"></thead><tbody id="cc-pre-rows-body"></tbody></table></div>
+          </div>
           <div class="cc-tip" hidden></div>
         </div>
         </div>

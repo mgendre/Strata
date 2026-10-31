@@ -259,6 +259,11 @@ class ConversationCacheCard(unittest.TestCase):
         for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-dsk", "cc-pre"):
             self.assertIn(f'id="{el}"', html)
             self.assertIn(f'"{el}"', js)
+        for table in ("cc-ram-rows", "cc-dsk-rows", "cc-pre-rows"):   # each cache's latest restores
+            for part in ("", "-head", "-body", "-sum"):
+                self.assertIn(f'id="{table}{part}"', html)
+        self.assertIn('renderRestores("cc-ram-rows"', js)
+        self.assertIn("renderRestores(`${id}-rows`", js)
 
 
 if __name__ == "__main__":

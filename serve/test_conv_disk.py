@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from serve.server import (ConvCacheLog, ConvDiskStatus, StoreUses, conversation_cache_view, conversation_disk_dir,
-                          engine_extra_args, long_read_speed, prelude_cache_dir, system_role_args)
+                          engine_extra_args, long_read_speed, prelude_cache_dir, restore_rows, system_role_args)
 
 
 class Engine:
@@ -92,6 +92,60 @@ class ConvDiskServer(unittest.TestCase):
                 self.assertEqual(engine_extra_args(dict(prelude, effort_position="end"), str(exe), Tok()),
                                  (["--tail-role-token", "8948", "--system-role-token", "8948"], True))
 
+    PROMPT = ("strata serve: prompt {} tokens = {} reused + {} read in {} ms (620.9 tok/s), 428 generated in 4351 ms "
+              "(98.4 tok/s), drafts accepted 245 of 311, 2 checkpoints\n")
+    PRELUDE = ("strata serve: prelude cache: restored a prelude of 8413 tokens in 187.0 ms, read 235 MiB (its use 3); "
+               "preludes=2\n")
+
+    def test_each_restore_gets_a_row_with_its_prompt(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(self.RAM + self.PROMPT.format(4500, 4000, 500, 700) + self.DISK +
+                           self.PROMPT.format(91567, 90000, 1567, 2668) + self.PRELUDE, encoding="utf-8")
+            reader, disk, prelude = ConvCacheLog(), [], []
+            reader.on_row = {"disk": disk.append, "prelude": prelude.append}
+            st = reader.poll(str(log), 0)
+            ram = st["ram_rows"]
+            self.assertEqual(len(ram), 1)
+            self.assertEqual({k: ram[0][k] for k in ("tokens", "ms", "mib", "nth", "prompt", "read", "read_ms")},
+                             {"tokens": 4000, "ms": 30.0, "mib": None, "nth": None, "prompt": 4500, "read": 500,
+                              "read_ms": 700})
+            self.assertEqual([(r["tokens"], r["ms"], r["mib"], r["nth"], r["prompt"], r["read"]) for r in disk],
+                             [(90000, 812.0, 1400, 2, 91567, 1567)])
+            self.assertEqual(prelude, [])                     # its prompt line has not come yet: in progress
+            self.assertEqual({k: st["pending"][k] for k in ("source", "tokens", "ms", "mib", "nth", "read")},
+                             {"source": "prelude", "tokens": 8413, "ms": 187.0, "mib": 235, "nth": 3, "read": None})
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(self.PROMPT.format(9000, 8413, 587, 900))
+            st = reader.poll(str(log), 0)
+            self.assertIsNone(st["pending"])
+            self.assertEqual([(r["tokens"], r["read"], r["read_ms"]) for r in prelude], [(8413, 587, 900)])
+            with open(log, "a", encoding="utf-8") as f:   # a restore whose request stopped before its prompt line
+                f.write(self.DISK + self.RAM + self.PROMPT.format(4100, 4000, 100, 90))
+            st = reader.poll(str(log), 0)
+            self.assertEqual([(r["tokens"], r["read"]) for r in disk], [(90000, 1567), (90000, None)])
+            self.assertEqual([r["read"] for r in st["ram_rows"]], [500, 100])
+            self.assertEqual(ConvCacheLog().poll(str(log), 0)["ram_rows"][-1]["read"], 100)   # read again from the start
+
+    def test_the_tables_keep_the_latest_fifteen_newest_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text("".join(
+                f"strata serve: conversation cache: restored {1000 + k} tokens (live) in 30.0 ms; parked=1 bytes=1\n" +
+                self.PROMPT.format(1100 + k, 1000 + k, 100, 50) for k in range(20)), encoding="utf-8")
+            st = ConvCacheLog().poll(str(log), 0)
+            info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 3}
+            view = conversation_cache_view(info, [], {}, st)
+            self.assertEqual([r["tokens"] for r in view["recoveries"]], list(range(1019, 1004, -1)))
+            self.assertNotIn("ram_rows", view)
+            self.assertNotIn("pending", view)
+        pending = {"source": "disk", "t": 5.0, "tokens": 7, "read": None}
+        rows = restore_rows([{"t": 1.0, "tokens": 1}, {"t": 2.0, "tokens": 2}], pending, "disk")
+        self.assertEqual([(r["tokens"], r.get("pending")) for r in rows], [(7, True), (2, None), (1, None)])
+        self.assertNotIn("source", rows[0])
+        self.assertEqual([r["tokens"] for r in restore_rows([{"t": 1.0, "tokens": 1}], pending, "prelude")], [1])
+        self.assertEqual(restore_rows(None, None, "ram"), [])
+
     def test_conversations_that_left_ram(self):
         lines = ("strata serve: conversation cache: left RAM (budget full): 59529 tokens, on disk 3100 behind\n"
                  "strata serve: conversation cache: left RAM (slots full): 9000 tokens, not on disk (below the first save step)\n"
@@ -142,6 +196,11 @@ class ConvDiskServer(unittest.TestCase):
         disk = {"entries": [{"id": "a"}, {"id": "b"}]}
         view = conversation_cache_view(info, [], {}, ConvCacheLog().state, disk, {"uses": [[90, 30000]], "saves": []})
         self.assertEqual((view["disk"]["uses"], view["disk"]["stored"]), ([[90, 30000]], 2))   # the preludes' shape
+        self.assertEqual(view["disk"]["recoveries"], [])        # no rows yet
+        row = {"t": 95.0, "tokens": 30000, "ms": 400.0, "mib": 500, "nth": 1, "prompt": 31000, "read": 1000, "read_ms": 900}
+        view = conversation_cache_view(info, [], {}, ConvCacheLog().state, disk, {"uses": [], "saves": [], "recent": [row]},
+                                       prelude, {"uses": [], "saves": []})
+        self.assertEqual((view["disk"]["recoveries"], view["prelude"]["recoveries"]), ([row], []))
         self.assertEqual(prelude_cache_dir(Engine(["--prelude-cache", "pre"])), "/srv/strata/pre")
         self.assertIsNone(prelude_cache_dir(Engine(["--conversation-cache-disk", "d"])))
 
@@ -166,6 +225,23 @@ class ConvDiskServer(unittest.TestCase):
             first = StoreUses()
             first.load(path, now=83900)
             self.assertEqual(first.view(now=83900), {"uses": [[83800, 10564]], "saves": []})
+            row = {"t": 83850.5, "tokens": 10564, "ms": 180.0, "mib": 266, "nth": 4, "prompt": 11000, "read": 436,
+                   "read_ms": 600}
+            again.add_row(row)
+            again.save(path)
+            rows = StoreUses()
+            rows.load(path, now=83900)
+            self.assertEqual(rows.rows(), [row])                # the table's rows come back after a restart
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            data["recent"] = [{"t": 1, "tokens": 2, "ms": "x", "mib": True}, {"tokens": 5}, "junk"]
+            Path(path).write_text(json.dumps(data), encoding="utf-8")
+            odd = StoreUses()
+            odd.load(path, now=83900)                           # a row without its time or tokens is left out;
+            self.assertEqual(odd.rows(), [{"t": 1.0, "tokens": 2, "ms": None, "mib": None, "nth": None, "prompt": None,
+                                           "read": None, "read_ms": None}])   # an odd value is unknown
+            for k in range(20):
+                odd.add_row(dict(row, tokens=k))
+            self.assertEqual([r["tokens"] for r in odd.rows()], list(range(5, 20)))   # 15 at most
             Path(path).write_text("[[1, 2", encoding="utf-8")   # damaged: ignored
             broken = StoreUses()
             broken.load(path)
