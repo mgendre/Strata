@@ -10,8 +10,14 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/window_limits.hpp"
 
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#define STRATA_PEER_HOST_Q8 1   // --peer-slow-link-optimizations: the input quantized on the host (quantize_q8_1_host)
+#include <immintrin.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -29,7 +35,7 @@ namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
 constexpr int64_t CAP = strata::kernels::kWindowMaxT * 10;   // entries per layer: a window's rows x top-10
 
-struct Meta {                           // one block, uploaded with one copy per layer
+struct Meta {                           // one block, uploaded with one copy per layer (with the input behind it: below)
     unsigned long long ptr[CAP];
     int32_t start[CAP + 1];
     int32_t dst[CAP];
@@ -37,6 +43,59 @@ struct Meta {                           // one block, uploaded with one copy per
     int32_t count[4];                   // [0] groups, [1] entries
     int32_t out_row[CAP];               // multi-GPU: compact row -> entry row in the host `out`
 };
+
+// --peer-slow-link-optimizations: the plan's blocks also hold the input as q8_1 blocks behind it (one copy per layer)
+constexpr size_t kMetaBytes = (sizeof(Meta) + 255) & ~(size_t) 255;
+constexpr size_t kQ8Block = 36;   // a q8_1 block: fp16 d, fp16 sum, 32 int8 codes
+
+#ifdef STRATA_PEER_HOST_Q8
+// The input rows as q8_1 blocks, quantized on the host the way quantize_q8_1_kernel's q8_1_store does it on the device
+// (iq_kernels.cu, no fast math): the warp's butterfly sum (lane i adds lane i^16, then ^8, ^4, ^2, ^1 - float addition is
+// commutative, so every lane ends with this sum), amax, d = amax / 127 kept finite (q8_1_finite), the codes roundf(x / d)
+// clamped to +-127 (0 for an all-zero block), ds = {d, sum} as fp16 rounded to nearest even.  The same bytes, so the peer
+// gets 36 bytes a block instead of 128 and runs no quantization.  AVX2 + F16C only (else the device's).
+__attribute__((target("avx2,f16c"))) void quantize_q8_1_host(const float* x, int64_t n_tok, int64_t n_cols, uint8_t* y) {
+    const __m256 sign = _mm256_set1_ps(-0.0f), half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f);
+    const __m256 lim = _mm256_set1_ps(127.0f), nlim = _mm256_set1_ps(-127.0f);
+    const int64_t blocks = n_tok * (n_cols / 32);
+    for (int64_t b = 0; b < blocks; ++b) {
+        const float* p = x + b * 32;
+        uint8_t* blk = y + b * kQ8Block;
+        const __m256 a[4] = {_mm256_loadu_ps(p), _mm256_loadu_ps(p + 8), _mm256_loadu_ps(p + 16), _mm256_loadu_ps(p + 24)};
+        const __m256 s8 = _mm256_add_ps(_mm256_add_ps(a[0], a[2]), _mm256_add_ps(a[1], a[3]));   // ^16, then ^8
+        const __m128 s4 = _mm_add_ps(_mm256_castps256_ps128(s8), _mm256_extractf128_ps(s8, 1));   // ^4
+        const __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));                                   // ^2
+        const float sum = _mm_cvtss_f32(_mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1)));                // ^1
+        const __m256 m8 = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, a[0]), _mm256_andnot_ps(sign, a[1])),
+                                        _mm256_max_ps(_mm256_andnot_ps(sign, a[2]), _mm256_andnot_ps(sign, a[3])));
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m8), _mm256_extractf128_ps(m8, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        const float amax = _mm_cvtss_f32(_mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1)));
+        const float d = std::fabs(amax / 127.0f) > 65504.0f ? std::copysign(65504.0f, amax / 127.0f) : amax / 127.0f;
+        int8_t* qs = (int8_t*) (blk + 4);
+        if (amax == 0.0f) {
+            std::memset(qs, 0, 32);
+        } else {
+            const __m256 dv = _mm256_set1_ps(d);
+            alignas(32) int32_t q[32];
+            for (int k = 0; k < 4; ++k) {
+                const __m256 v = _mm256_div_ps(a[k], dv);                                    // x / d (IEEE)
+                const __m256 t = _mm256_round_ps(v, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+                const __m256 frac = _mm256_andnot_ps(sign, _mm256_sub_ps(v, t));             // exact for |v| < 2^23
+                const __m256 step = _mm256_and_ps(_mm256_cmp_ps(frac, half, _CMP_GE_OQ),
+                                                  _mm256_or_ps(one, _mm256_and_ps(sign, v)));   // +-1 away from zero
+                const __m256 r = _mm256_min_ps(lim, _mm256_max_ps(nlim, _mm256_add_ps(t, step)));   // roundf, clamped
+                _mm256_store_si256((__m256i*) (q + 8 * k), _mm256_cvtps_epi32(r));
+            }
+            for (int i = 0; i < 32; ++i) qs[i] = (int8_t) q[i];
+        }
+        const float sf = std::fabs(sum) > 65504.0f ? std::copysign(65504.0f, sum) : sum;
+        const uint16_t dh = _cvtss_sh(d, _MM_FROUND_TO_NEAREST_INT), sh = _cvtss_sh(sf, _MM_FROUND_TO_NEAREST_INT);
+        std::memcpy(blk, &dh, 2);
+        std::memcpy(blk + 2, &sh, 2);
+    }
+}
+#endif
 
 /// Switches the calling thread to `dev` and back.  The engine's own thread lives on device 0.
 struct On {
@@ -171,16 +230,18 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
     const size_t scratch = std::max<size_t>((size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, ff),
                                             strata::kernels::native_expert_scratch_bytes(CAP, ff));
+    // --peer-slow-link-optimizations: the plan's blocks hold the input as q8_1 behind it
+    const size_t meta_bytes = slow_link_ ? kMetaBytes + (size_t) CAP * (H / 32) * kQ8Block : sizeof(Meta);
     const bool alloc_ok =
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&
         ck(cudaEventCreateWithFlags(&refill_ev_, cudaEventDisableTiming), "event", err) &&
         ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
         ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
-        ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
+        ck(cudaHostAlloc(&h_meta_, meta_bytes, cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
         ck(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err) &&
         ck(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err) &&
-        ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
+        ck(cudaMalloc(&d_meta_, meta_bytes), "plan", err) &&
         ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
@@ -242,6 +303,15 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     return true;
 }
 
+bool PeerExperts::host_q8_available() {
+#ifdef STRATA_PEER_HOST_Q8
+    static const bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c");
+    return ok;
+#else
+    return false;
+#endif
+}
+
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
                          const int32_t* kind, std::string& err, float* out) {
     static const bool direct_env = [] { const char* v = std::getenv("STRATA_PEER_DIRECT"); return v == nullptr || std::atoi(v) != 0; }();
@@ -281,23 +351,49 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     m.count[1] = rows;
     entries_ += rows;
     launched_rows_ = rows;
-    // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
-    if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    // --peer-slow-link-optimizations: the input quantized on the host (not for APR's Hadamard-folded gate/up: the device
+    // rotates the floats first), and the down rows straight into the host `out` where the down kernel keeps its sums
+    const auto* fmt = lay.native ? &lay.fmt[(size_t) layer] : nullptr;
+    const bool host_q8 = slow_link_ && fmt != nullptr && !fmt->had_gu && host_q8_available();
+    const bool down_host = slow_link_ && fmt != nullptr && direct &&
+                           strata::kernels::native_expert_down_host_ok(fmt->d_type, fmt->n_ff);
     On on(device_);
     const cudaStream_t s = stream_;
-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
-        !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
-        return false;
+    const void* xq = d_q8_;
+    if (host_q8) {   // the input as q8_1 behind the plan: one copy for both
+#ifdef STRATA_PEER_HOST_Q8
+        quantize_q8_1_host(x, n_tok, H, (uint8_t*) h_meta_ + kMetaBytes);
+#endif
+        if (!ck(cudaMemcpyAsync(d_meta_, h_meta_, kMetaBytes + (size_t) n_tok * (H / 32) * kQ8Block, cudaMemcpyHostToDevice, s),
+                "plan and input", err))
+            return false;
+        xq = (const uint8_t*) d_meta_ + kMetaBytes;
+    } else {
+        // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
+        if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
+        if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
+            !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
+            return false;
+    }
     Meta* dm = (Meta*) d_meta_;
-    const auto& lay = strata::kernels::cpu::expert_layout();
     if (lay.native) {
         const auto& f = lay.fmt[(size_t) layer];
-        // APR: Hadamard-folded gate/up take H (s * x); d_x_ is this device's private copy, rotated in place
-        if (f.had_gu) strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, H, f.had_block, d_sx_, s);
-        strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
+        if (!host_q8) {
+            // APR: Hadamard-folded gate/up take H (s * x); d_x_ is this device's private copy, rotated in place
+            if (f.had_gu) strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, H, f.had_block, d_sx_, s);
+            strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
+        }
         auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
         if (f.had_d) { L.had_block = f.had_block; L.d_signs = d_sh_; }
-        strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
+        if (down_host) {   // each entry's rows into the host `out` as whole lines while the other blocks compute
+            L.out_host = true;
+            strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->out_row, dm->tok, groups, rows, xq,
+                                                   d_scratch_, out, s);
+            launched_direct_ = true;
+            return true;
+        }
+        strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, xq,
                                                d_scratch_, d_out_, s);
     } else {
         err = "peer experts: only native packs are supported";

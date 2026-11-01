@@ -80,6 +80,15 @@ public:
     int64_t entries() const { return entries_; }      ///< routed entries the peer computed
     int64_t experts() const { return experts_; }      ///< distinct (layer, expert) the peer computed
     int64_t swaps() const { return swaps_; }
+    /// Before `open`: --peer-slow-link-optimizations (off by default), for a peer on a narrow link.  Its input is
+    /// quantized to q8_1 on the host (3.5x fewer bytes in, the same bytes the device would make) and sent behind the
+    /// plan in one copy; its down rows go straight to the host rows as whole lines while it computes (no scatter
+    /// after).  The same bits either way.
+    void set_slow_link(bool on) { slow_link_ = on; }
+    bool slow_link() const { return slow_link_; }
+    /// Whether this build and CPU quantize the input on the host (x86 with AVX2 + F16C, a GCC or Clang build);
+    /// elsewhere --peer-slow-link-optimizations keeps the device's quantization.
+    static bool host_q8_available();
     double ms_wait = 0;                               ///< host time spent in finish() waiting for the peer
 
 private:
@@ -90,6 +99,7 @@ private:
     ExpertSource* src_ = nullptr;
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
+    bool slow_link_ = false;                          ///< --peer-slow-link-optimizations (set_slow_link), kept across close()
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;
