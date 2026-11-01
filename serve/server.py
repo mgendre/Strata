@@ -108,6 +108,9 @@ def popen(what: str, args: list, role: str = "engine", **kw):
 
 # How long close() gives the engine at each step of ending it (seconds). Module values so that a test can shorten them.
 ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 5, 20
+# --conversation-cache-disk: a clean stop writes the conversations only RAM holds (the engine gives it at most 30 s), so
+# QUIT gets this much longer; 20 + 25 + 5 stays under the 60 s a systemd unit commonly gives a stop
+ENGINE_DISK_STOP_WAIT_S = 25
 
 
 def rttime_limit_note() -> str:
@@ -842,6 +845,17 @@ class ConvCacheLog:
             if m:
                 self.state["parked"] = int(m.group(1))
         return dict(self.state)
+
+
+def conversation_disk_dir(engine) -> str | None:
+    """--conversation-cache-disk DIR from the engine's arguments, or None."""
+    spawn = getattr(engine, "spawn", None)
+    args = spawn[1] if spawn and len(spawn) > 2 and isinstance(spawn[1], (list, tuple)) else []
+    if "--conversation-cache-disk" in args[:-1]:
+        folder = str(args[args.index("--conversation-cache-disk") + 1])
+        cwd = spawn[2] if isinstance(spawn[2], str) else None   # (the engine's working folder: a relative path is from there)
+        return folder if os.path.isabs(folder) or not cwd else os.path.join(cwd, folder)
+    return None
 
 
 def conversation_slots(engine) -> int | None:
@@ -2639,7 +2653,7 @@ class StrataEngine:
                     self.proc.stdin.write("STOP\nQUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
+                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S + (ENGINE_DISK_STOP_WAIT_S if conversation_disk_dir(self) else 0))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=ENGINE_TERM_WAIT_S)
