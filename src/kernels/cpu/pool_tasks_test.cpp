@@ -81,7 +81,18 @@ int main(int argc, char** argv) {
         cpu::native_quant_act(f, x.data(), act[t].data());
         cpu::act_quant_any(x.data(), cpu::H, qact[t]);
     }
-    int checks = 0, split_checks = 0, mixed_checks = 0;
+    {   // STRATA_POOL_ONE_PHASE: "1" turns it on, anything else (or unset) leaves the two phases
+        bool ok = true;
+        for (const char* v : {"1", "0", "yes"}) {
+            put_env("STRATA_POOL_ONE_PHASE", v);
+            cpu::ExpertPool pool(1, false, true);
+            ok = ok && pool.one_phase() == (std::strcmp(v, "1") == 0);
+        }
+        unset_env("STRATA_POOL_ONE_PHASE");
+        { cpu::ExpertPool pool(1, false, true); ok = ok && !pool.one_phase(); }
+        if (!ok) { std::fprintf(stderr, "STRATA_POOL_ONE_PHASE was not read as on for 1 only\n"); return 1; }
+    }
+    int checks = 0, split_checks = 0, mixed_checks = 0, one_checks = 0;
     for (int n : {1, 7, cpu::ExpertPool::kMaxSplitMulti + 1}) {
         std::vector<cpu::ExpertJobMulti> jobs(n);
         std::vector<float> out((size_t) n * cpu::MAXT * cpu::H);
@@ -100,22 +111,31 @@ int main(int argc, char** argv) {
         }
         const auto ref = out;
         for (float v : ref) if (!std::isfinite(v)) return 1;
-        for (bool host : {false, true}) for (int workers : {1, 3})
-            for (int tasks : {0, 1, 41, 128, 192, 256, cpu::ExpertPool::kMaxTasks}) {
-                cpu::ExpertPool pool(workers, false, host, cpu::PoolAffinity::All, tasks);
-                for (int repeat = 0; repeat < 2; ++repeat) {
-                    std::fill(out.begin(), out.end(), 0.0f);
-                    for (const auto& job : jobs) for (int t = 0; t < job.nt; ++t)
-                        std::fill(job.out[t], job.out[t] + cpu::H, std::numeric_limits<float>::quiet_NaN());
-                    pool.run_split_multi_native(f, jobs.data(), n);
-                    if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) {
-                        std::fprintf(stderr, "mismatch n=%d workers=%d host=%d tasks=%d repeat=%d\n",
-                                     n, workers, host, tasks, repeat);
-                        return 1;
+        // STRATA_POOL_ONE_PHASE: the one-batch form against the two-phase reference, bit for bit; spin 0 sends every
+        // worker to sleep between batches, so a down task also meets workers that wake late
+        for (const char* spin : {"", "0"}) {
+            if (*spin != '\0') put_env("STRATA_POOL_SPIN_US", spin);
+            for (bool one : {false, true}) for (bool host : {false, true}) for (int workers : {1, 3, 5})
+                for (int tasks : {0, 1, 41, 128, 192, 256, cpu::ExpertPool::kMaxTasks}) {
+                    if (*spin != '\0' && !one) continue;
+                    cpu::ExpertPool pool(workers, false, host, cpu::PoolAffinity::All, tasks);
+                    pool.set_one_phase(one);
+                    for (int repeat = 0; repeat < 2; ++repeat) {
+                        std::fill(out.begin(), out.end(), 0.0f);
+                        for (const auto& job : jobs) for (int t = 0; t < job.nt; ++t)
+                            std::fill(job.out[t], job.out[t] + cpu::H, std::numeric_limits<float>::quiet_NaN());
+                        pool.run_split_multi_native(f, jobs.data(), n);
+                        if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) {
+                            std::fprintf(stderr, "mismatch n=%d workers=%d host=%d tasks=%d one_phase=%d spin=%s repeat=%d\n",
+                                         n, workers, host, tasks, one, spin, repeat);
+                            return 1;
+                        }
+                        ++checks;
+                        if (one) ++one_checks;
                     }
-                    ++checks;
                 }
-            }
+            unset_env("STRATA_POOL_SPIN_US");
+        }
         // STRATA_NUMA_SPLIT=test: two slices without a real second node (thread j -> slice j % 2), every worker
         // sleeping between batches (spin 0) so the late-wake path of issue #29 runs constantly
         put_env("STRATA_NUMA_SPLIT", "test");
@@ -367,7 +387,7 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    std::printf("pool tasks: %d bitwise comparisons passed, %d of them in NUMA-split mode (%d with modes 0-4 "
-                "interleaved)\n", checks + split_checks + mixed_checks, split_checks + mixed_checks, mixed_checks);
+    std::printf("pool tasks: %d bitwise comparisons passed, %d of them in one phase, %d in NUMA-split mode (%d with modes "
+                "0-4 interleaved)\n", checks + split_checks + mixed_checks, one_checks, split_checks + mixed_checks, mixed_checks);
     return 0;
 }
