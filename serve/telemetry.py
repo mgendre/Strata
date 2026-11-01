@@ -13,7 +13,9 @@ Anything that cannot be read is None; nothing here can stop the server.
 from __future__ import annotations
 
 import collections
+import contextlib
 import ctypes
+import json
 import os
 import platform
 import re
@@ -528,8 +530,79 @@ class _CpuRamFallback:
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
+class DiskWrites:
+    """The bytes the PC wrote to its disks (all programs) over the last KEEP_S (8 hours), for the Monitor's Disk write
+    card: one reading a minute of the counter of bytes written since boot, kept across a restart of the server in
+    `path` (the config's name + .disk-writes.json).  A counter that went down (the PC restarted) counts from zero
+    again."""
+    EVERY_S, KEEP_S, SAVE_S = 60, 8 * 3600, 600
+
+    def __init__(self, path=None):
+        self.path, self.rows, self.saved_at = path, collections.deque(), 0.0
+        if path:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    rows = json.load(f)
+                self.rows.extend([int(r[0]), int(r[1])] for r in rows if isinstance(r, list) and len(r) == 2
+                                 and all(isinstance(v, (int, float)) for v in r))
+            except (OSError, ValueError, TypeError):
+                pass
+
+    def add(self, t: float, written: int):
+        """A reading of the counter at time `t`: kept once a minute, the oldest past KEEP_S dropped, saved every 10 min."""
+        if self.rows and t - self.rows[-1][0] < self.EVERY_S:
+            return
+        self.rows.append([round(t), int(written)])
+        while len(self.rows) > 1 and self.rows[1][0] <= t - self.KEEP_S:
+            self.rows.popleft()                         # (the reading KEEP_S back stays: it is the period's start)
+        if self.path and t - self.saved_at >= self.SAVE_S:
+            self.saved_at = t
+            tmp = f"{self.path}.tmp-{os.getpid()}"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(list(self.rows), f, separators=(",", ":"))
+                os.replace(tmp, self.path)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp)
+
+    def total(self) -> tuple:
+        """(bytes written since the first reading kept, the time of that reading): the last KEEP_S once the server
+        has read the counter that long, less before; (None, None) before two readings."""
+        if len(self.rows) < 2:
+            return None, None
+        out, prev = 0, self.rows[0][1]
+        for _, b in list(self.rows)[1:]:
+            out += b - prev if b >= prev else b
+            prev = b
+        return out, self.rows[0][0]
+
+
+# the Monitor's GPU widgets (one per card): what one direction of a PCIe link carries per lane after its line code
+# (8b/10b up to Gen2, 128b/130b from Gen3, FLIT from Gen6), in bytes a second
+PCIE_LANE_BYTES = {1: 250e6, 2: 500e6, 3: 8e9 * 128 / 130 / 8, 4: 16e9 * 128 / 130 / 8, 5: 32e9 * 128 / 130 / 8,
+                   6: 64e9 * 242 / 256 / 8}
+GPU_CARD_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max",
+                 "pcie_width", "pcie_rx_mb", "pcie_tx_mb")
+GPU_CARD_SERIES = ("util", "pcie_rx_mb", "pcie_tx_mb")   # each widget's small graphs (history gpu<N>_<key>)
+
+
+def pcie_link_mb(gen, width) -> float | None:
+    """The most one direction of a PCIe link carries, in the unit of the pcie_*_mb readings (NVML's KB/s / 1024), or
+    None when the generation or the width is unknown."""
+    lane = PCIE_LANE_BYTES.get(gen) if isinstance(gen, int) else None
+    return lane * width / 2**20 if lane and isinstance(width, int) and width > 0 else None
+
+
+def gpu_card(index, name, r: dict) -> dict:
+    """One card's own readings for its widget, and what its link carries at most at its top generation (an idle link
+    drops to Gen1 to save power, so the current one would make an idle card's few bytes look like a full link)."""
+    return {"index": index, "name": name, **{k: r.get(k) for k in GPU_CARD_KEYS},
+            "pcie_link_mb": pcie_link_mb(r.get("pcie_gen_max") or r.get("pcie_gen"), r.get("pcie_width"))}
+
+
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, writes_path=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
@@ -538,11 +611,13 @@ class Telemetry:
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
+        self.writes = DiskWrites(writes_path)          # the Disk write card's last 8 hours
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
+        self.card_names = [g.name() if g.ok() else None for _, g in self.gpus]   # the GPU widgets' titles
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -594,6 +669,7 @@ class Telemetry:
         if c is None:   # psutil found no disk (a gVisor container, Windows with its disk counters off)
             return None, None
         t = time.time()
+        self.writes.add(t, c.write_bytes)
         prev, self._disk_prev = self._disk_prev, (t, c.read_bytes, c.write_bytes)
         if prev is None or t <= prev[0]:
             return None, None
@@ -619,6 +695,8 @@ class Telemetry:
                               "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
+            # the Monitor's GPU widgets: each card's own readings (the cards above keep their totals)
+            s["gpu_cards"] = [gpu_card(i, name, r) for (i, r), name in zip(reads, self.card_names)]
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)
@@ -630,6 +708,9 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        # (the key keeps its first name, "day"; the period is disk_written_period_s)
+        s["disk_written_day"], s["disk_written_since"] = self.writes.total()
+        s["disk_written_period_s"] = DiskWrites.KEEP_S
         if self.extra:
             try:
                 s.update(self.extra())
@@ -662,9 +743,13 @@ class Telemetry:
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                          "disk_read_mb", "disk_write_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+                for c in s.get("gpu_cards") or []:           # each GPU widget's small graphs
+                    for k in GPU_CARD_SERIES:
+                        v = c.get(k)
+                        self.hist[f"gpu{c['index']}_{k}"].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)
 
     def snapshot(self):

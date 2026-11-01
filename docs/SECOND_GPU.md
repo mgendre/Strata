@@ -81,6 +81,14 @@ NVLink or another peer-to-peer path. It is an alternative to the helper caches a
 | `--peer-adapt-swaps N` | -1 | Swaps per adaptive round on the peer; -1 uses the primary's `--adapt-swaps`. |
 | `--peer-prefill-rows N` | -1 | Share of each prompt chunk's rows the peer computes; -1 is half of chunk x top-k, 0 keeps prompt rows on the primary. |
 
+With a peer, the server log has one more line after each request's hit rate. It says where the routed experts of the decode
+were computed (the main GPU's cache, the peer GPU, over PCIe, on the CPU), how long the CPU pool waited for the peer GPU after
+its own share was done, and how many experts were swapped into the peer:
+
+```text
+strata serve: peer GPU: of N routed experts, A% on the main GPU's cache, B% on the peer GPU, C% over PCIe, D% on the CPU; the CPU pool waited W ms for the peer GPU (w ms per decode window), S experts swapped into it
+```
+
 Whether the two cards can really exchange data is tested once at start with a copy each way. If the copy arrives wrong, the log
 says so and the prompt path uses the host route (activations and rows through mapped host memory). `STRATA_PEER_NO_P2P=1` asks
 for that route by hand.
