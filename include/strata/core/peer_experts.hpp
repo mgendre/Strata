@@ -50,6 +50,11 @@ public:
 
     /// Whether the peer holds (layer, expert) right now.
     bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }
+    /// Whether (layer, expert) is on its way into the peer: an adaptive round copied it, `apply_pending` has not taken
+    /// it yet.  The primary's own adaptive round skips these: taking one too would leave both cards holding it.
+    bool incoming(int64_t layer, int64_t expert) const {
+        return !incoming_.empty() && incoming_[(size_t) (layer * n_expert_ + expert)] != 0;
+    }
 
     /// The device address of (layer, expert)'s blob on the peer, or null when it is not resident.
     const uint8_t* slot_ptr(int64_t layer, int64_t expert) {
@@ -90,6 +95,7 @@ private:
     ExpertSource* src_ = nullptr;
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
+    std::vector<uint8_t> incoming_;                      ///< [n_layers * n_expert] -> 1 while in pending_
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;

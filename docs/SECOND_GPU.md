@@ -72,6 +72,8 @@ quantization. It does nothing without a helper cache, and a plain layer split ru
 `--peer-device N` puts a second adaptive expert cache on CUDA device N. It takes the ranked pairs CUDA0's cache does not hold, as
 many as fit. The peer computes the rows of its own experts for decode windows and for prompt chunks. Activations and results cross
 NVLink or another peer-to-peer path. It is an alternative to the helper caches above, not a third tier beside them.
+Both caches adapt to the routing as it goes; an expert is never held by both cards: CUDA0's cache does not take an expert while
+it is being copied into the peer.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |

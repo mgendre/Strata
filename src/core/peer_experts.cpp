@@ -138,6 +138,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     n_expert_ = n_expert;
     src_ = &src;
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
+    incoming_.assign((size_t) (n_layers * n_expert), 0);
     {   // direct access both ways (NVLink or another P2P path): the prompt path copies activations and results over it
         int a = 0, b = 0;
         cudaDeviceCanAccessPeer(&a, primary_device(), device);
@@ -373,6 +374,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
             return false;
         res_[out] = kNotResident;              // evicted now: the CPU computes it meanwhile
         pending_.emplace_back((int32_t) in, slot);
+        incoming_[in] = 1;
         ++swaps_;
     }
     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
@@ -385,7 +387,10 @@ void PeerExperts::apply_pending(bool wait) {
         if (wait) cudaEventSynchronize(refill_ev_);
         else if (cudaEventQuery(refill_ev_) != cudaSuccess) return;
     }
-    for (const auto& [i, slot] : pending_) res_[(size_t) i] = slot;
+    for (const auto& [i, slot] : pending_) {
+        res_[(size_t) i] = slot;
+        incoming_[(size_t) i] = 0;
+    }
     pending_.clear();
 }
 
