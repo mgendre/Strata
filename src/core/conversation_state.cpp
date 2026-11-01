@@ -642,6 +642,40 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     return true;
 }
 
+size_t conversation_kv_layers(const SessionState& ss, const QsaState* draft) { return owned_qsa(ss) + (draft ? 1 : 0); }
+
+bool conversation_kv_layer_sizes(const SessionState& ss, const ModelGeometry& g, const QsaState* draft, size_t layer,
+                                 int64_t upto, std::array<uint64_t, 5>& sizes, std::string& error) {
+    const size_t layers = owned_qsa(ss);
+    if (layer < layers) return conversation_kv_layout_sizes(owned(ss, layer), g, upto, true, sizes, error);
+    if (layer == layers && draft) return conversation_kv_layout_sizes(*draft, g, upto, false, sizes, error);
+    return fail(error, "no such K/V layer");
+}
+
+bool conversation_kv_sources(std::vector<SessionKvSource>& sources, const SessionState& ss, const ModelGeometry& g,
+                             const QsaState* draft, int64_t upto, std::string& error) {
+    if (!sync(error)) return false;
+    const size_t layers = owned_qsa(ss);
+    std::vector<SessionKvSource> out(layers + (draft ? 1 : 0));
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
+    if (draft && !conversation_kv_source(out.back(), *draft, g, upto, false, error)) return false;
+    sources = std::move(out);
+    return true;
+}
+
+bool conversation_kv_sinks(std::vector<SessionKvSink>& sinks, const SessionState& ss, const ModelGeometry& g,
+                           const QsaState* draft, int64_t upto, std::string& error) {
+    if (!sync(error)) return false;
+    const size_t layers = owned_qsa(ss);
+    std::vector<SessionKvSink> out(layers + (draft ? 1 : 0));
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_sink(out[j], owned(ss, j), g, upto, true, error)) return false;
+    if (draft && !conversation_kv_sink(out.back(), *draft, g, upto, false, error)) return false;
+    sinks = std::move(out);
+    return true;
+}
+
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error) {
