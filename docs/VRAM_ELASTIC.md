@@ -124,6 +124,11 @@ and starts the encoder with the model, as before) the GPU encoder is not started
 - An unload of the model stops the encoder too. The log lines start with `[strata] images:` **(code; the unit tests in
   `serve/test_vision_elastic.py` pin each case)**.
 
+An encoder on the CPU (a `"vision"` section without `"gpu": true`) needs no VRAM, so `"elastic": true` works for it without
+`"vram_elastic"`, also beside `--peer-device` (which keeps `--vram-elastic` off): it starts with the first picture, stops
+after `"elastic_idle_s"` without one, and asks nothing of the expert cache. Between pictures its RAM is free (about 1 GB with
+Qwen3.8-Flash-Next's image encoder on the PC it was measured on).
+
 `--vram-elastic` turns `--kv-grow` off (the engine says so at start): with both asked, the whole K/V is in VRAM.
 
 ## What to build on
