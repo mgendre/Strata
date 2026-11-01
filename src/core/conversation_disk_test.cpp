@@ -177,8 +177,7 @@ int main(int argc, char** argv) {
     check(t.holds(11) && t.finished == 2, "every K/V byte comes back, every layer refreshed");
     check(state.ids == a.ids && state.gdn == a.state.gdn && state.block_pos == a.state.block_pos && cvec,
           "the running state, ids and steering come back");
-    check(st.read > 0 && std::abs(st.score - 1.0) < 1e-6 && disk.since_start().restores == 1 &&
-          disk.since_start().tokens == 100, "the return is counted: score 1");
+    check(st.read > 0 && st.tokens == 100 && std::abs(st.score - 1.0) < 1e-6, "the return is counted: score 1");
 
     // the same conversation, 40 tokens on (its next save): only the blocks past the full ones on disk are written
     Conv a2 = longer(a, 11, 40);
@@ -206,7 +205,9 @@ int main(int argc, char** argv) {
         check(d2.save(write_of(hot, 3.0), st, error) && !d2.best(extend(c.ids, 3), {}, true) &&
               d2.best(extend(hot.ids, 3), {}, true) && d2.best(extend(a2.ids, 3), {}, true),
               "a copy with a score pushes out the one without");
-        check(d2.since_start().deleted >= 2, "the deletions are counted");
+        size_t manifests = 0;   // the copies that left took their files with them
+        for (const auto& f : fs::directory_iterator(root / "conv")) manifests += f.path().extension() == ".man";
+        check(manifests == d2.usage().entries, "the copies that left have no files left");
         Target t2(100);
         ConversationCheckpoint s2;
         bool cv = false;

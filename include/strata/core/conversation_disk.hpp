@@ -141,11 +141,6 @@ public:
 
     struct Usage { size_t entries = 0; uint64_t bytes = 0, budget = 0; };
     Usage usage() const;
-    struct Counters {
-        uint64_t written = 0, read = 0, reused = 0;        ///< bytes
-        uint64_t saves = 0, skipped = 0, restores = 0, tokens = 0, deleted = 0;
-    };
-    const Counters& since_start() const { return start_; }
     uint64_t written_all_time() const { return total_written_; }
     uint64_t written_today() const { return day_written_; }
 
@@ -159,9 +154,9 @@ private:
         std::vector<Hash> blocks;
         std::vector<uint64_t> block_bytes;
         Hash state_hash;
-        uint64_t state_bytes = 0, written = 0, served_tokens = 0, returns = 0;
+        uint64_t state_bytes = 0;
         double score = 0;
-        int64_t score_at = 0, created = 0, last_used = 0;
+        int64_t score_at = 0, last_used = 0;
         uint64_t bytes() const;
     };
     struct Block { uint64_t bytes = 0; size_t refs = 0; };
@@ -197,8 +192,7 @@ private:
     std::unordered_map<Hash, Block, HashFn> blocks_;
     std::vector<uint8_t> buffer_;                          ///< one 16 MiB piece at a time
     uint64_t next_id_ = 1;
-    Counters start_;
-    uint64_t total_written_ = 0, total_read_ = 0, day_written_ = 0;
+    uint64_t total_written_ = 0, day_written_ = 0;
     int64_t day_ = 0;                                      ///< yyyymmdd (local time) of day_written_
 };
 

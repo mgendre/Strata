@@ -1,12 +1,12 @@
-// --conversation-cache-disk: the conversation cache's long-term level on disk (conversation_disk.hpp).
+// --conversation-cache-disk: the conversation cache's level on disk (conversation_disk.hpp).
 //
 // Files (little-endian, like the session files):
 //   blocks/<32 hex>.kvb   one K/V block: "SCDB", version, layer count, each layer's five part sizes, then the bytes of
 //                         every layer's parts for that token range; named by its 128-bit hash (header and bytes)
-//   conv/<16 hex>.man     a copy's manifest: identity, level, length, block list, running-state hash, usage
+//   conv/<16 hex>.man     a copy's manifest: identity, length, block list, running-state hash, score and last use
 //   conv/<16 hex>.ids     its token ids and pictures
 //   conv/<16 hex>.state   its running state (gdn, ple, tails, dead, block_pos)
-//   counters.bin          bytes written and read, all time and today (kept across starts)
+//   counters.bin          bytes written, all time and today (kept across starts: the daily guide counts a whole day)
 // Every file is written under a hidden temporary name and renamed into place.
 #include "strata/core/conversation_disk.hpp"
 
@@ -27,7 +27,7 @@ namespace strata::core {
 namespace fs = std::filesystem;
 
 namespace {
-constexpr uint32_t kVersion = 2;   // 2: one level (1 had swap and big)
+constexpr uint32_t kVersion = 3;   // the files' layout: raise it with any layout change (older files are dropped at open)
 constexpr uint64_t kSeedA = 0x5c0d15c0a11ull, kSeedB = 0xd15cb10cc0ffeeull, kSeedFile = 0xc0de5ca1eull;
 constexpr size_t kPiece = 16u << 20;
 
@@ -434,9 +434,7 @@ bool ConversationDisk::write_manifest(const Entry& e, std::string& error) {
     for (size_t k = 0; k < e.blocks.size(); ++k) {
         out.put<uint64_t>(e.blocks[k].a); out.put<uint64_t>(e.blocks[k].b); out.put<uint64_t>(e.block_bytes[k]);
     }
-    out.put<double>(e.score); out.put<int64_t>(e.score_at);
-    out.put<int64_t>(e.created); out.put<int64_t>(e.last_used);
-    out.put<uint64_t>(e.returns); out.put<uint64_t>(e.served_tokens); out.put<uint64_t>(e.written);
+    out.put<double>(e.score); out.put<int64_t>(e.score_at); out.put<int64_t>(e.last_used);
     uint64_t n = 0;
     return write_small(path("conv", entry_name(e.id, ".man")), out, n, error);
 }
@@ -461,9 +459,7 @@ bool ConversationDisk::read_manifest(const std::string& file, Entry& e, Conversa
     for (size_t k = 0; k < nb; ++k) {
         e.blocks[k].a = in.get<uint64_t>(); e.blocks[k].b = in.get<uint64_t>(); e.block_bytes[k] = in.get<uint64_t>();
     }
-    e.score = in.get<double>(); e.score_at = in.get<int64_t>();
-    e.created = in.get<int64_t>(); e.last_used = in.get<int64_t>();
-    e.returns = in.get<uint64_t>(); e.served_tokens = in.get<uint64_t>(); e.written = in.get<uint64_t>();
+    e.score = in.get<double>(); e.score_at = in.get<int64_t>(); e.last_used = in.get<int64_t>();
     if (!in.ok || in.at != b.size()) { error = "conversation disk: bad manifest"; return false; }
     e.meta.ids.assign((size_t) std::min<uint64_t>(tokens, 1ull << 31), 0);   // sized here, read from the ids file
     return true;
@@ -496,7 +492,6 @@ void ConversationDisk::remove(size_t index) {
     std::error_code ec;
     for (const char* ext : {".man", ".ids", ".state"}) fs::remove(path("conv", entry_name(e.id, ext)), ec);
     unref(e);
-    ++start_.deleted;
 }
 
 void ConversationDisk::fit(uint64_t keep_id) {
@@ -523,7 +518,6 @@ void ConversationDisk::count_written(uint64_t bytes, ConversationDiskStats& stat
     const uint64_t before = day_written_;
     day_written_ += bytes;
     total_written_ += bytes;
-    start_.written += bytes;
     if (opt_.day_guide_bytes > 0 && before < opt_.day_guide_bytes && day_written_ >= opt_.day_guide_bytes)
         stats.guide_crossed = true;
 }
@@ -532,7 +526,7 @@ void ConversationDisk::save_counters() const {
     Out out;
     out.bytes("SCDC", 4);
     out.put<uint32_t>(kVersion);
-    out.put<uint64_t>(total_written_); out.put<uint64_t>(total_read_);
+    out.put<uint64_t>(total_written_);
     out.put<int64_t>(day_); out.put<uint64_t>(day_written_);
     uint64_t n = 0;
     std::string error;
@@ -547,11 +541,11 @@ void ConversationDisk::load_counters() {
     char magic[4];
     in.bytes(magic, 4);
     const uint32_t version = in.get<uint32_t>();
-    const uint64_t w = in.get<uint64_t>(), r = in.get<uint64_t>();
+    const uint64_t w = in.get<uint64_t>();
     const int64_t day = in.get<int64_t>();
     const uint64_t dw = in.get<uint64_t>();
     if (!in.ok || std::memcmp(magic, "SCDC", 4) != 0 || version != kVersion) return;
-    total_written_ = w; total_read_ = r;
+    total_written_ = w;
     day_ = day; day_written_ = day == local_day(now()) ? dw : 0;
 }
 
@@ -659,7 +653,6 @@ bool ConversationDisk::save(const Write& w, ConversationDiskStats& stats, std::s
         stats.skipped = true;
         stats.why = why;
         stats.score = e.score;
-        ++start_.skipped;
         if (!write_manifest(e, error)) return false;
         count_written(0, stats);
         fit(e.id);
@@ -676,9 +669,6 @@ bool ConversationDisk::save(const Write& w, ConversationDiskStats& stats, std::s
     ne.cvec = w.cvec;
     ne.meta.ids = w.ids;
     ne.meta.imgs = w.imgs;
-    ne.created = b ? b->created : t;
-    ne.returns = b ? b->returns : 0;
-    ne.served_tokens = b ? b->served_tokens : 0;
     ne.score = std::max(b ? conversation_score_at(b->score, b->score_at, t, opt_.half_life_s) : 0.0, w.score);
     ne.score_at = t;
     ne.last_used = t;
@@ -709,7 +699,6 @@ bool ConversationDisk::save(const Write& w, ConversationDiskStats& stats, std::s
     }
     if (!write_state(ne, w.state, ne.state_hash, ne.state_bytes, error) || !write_ids(ne, error)) { abandon(); return false; }
     written += ne.state_bytes + ne.meta.ids.size() * sizeof(int32_t);
-    ne.written = (b ? b->written : 0) + written;
     if (!write_manifest(ne, error)) { abandon(); return false; }
     ref(ne);
     if (b) {
@@ -732,8 +721,6 @@ bool ConversationDisk::save(const Write& w, ConversationDiskStats& stats, std::s
             if (entries_[i].id == gone) { remove(i); break; }
     stats.written = written;
     count_written(written, stats);
-    ++start_.saves;
-    start_.reused += stats.reused;
     fit(id);
     for (const Entry& e : entries_)
         if (e.id == id) stats.score = e.score;
@@ -815,18 +802,12 @@ bool ConversationDisk::load(const ConversationDiskMatch& m, ConversationCheckpoi
     state = std::move(s);
     cvec = e.cvec;
     const int64_t t = now();
-    ++e.returns;
-    e.served_tokens += (uint64_t) m.tokens;
     e.score = conversation_score_at(e.score, e.score_at, t, opt_.half_life_s) + 1.0;
     e.score_at = t;
     e.last_used = t;
-    ++start_.restores;
-    start_.tokens += (uint64_t) m.tokens;
     stats.read = read;
     stats.tokens = tokens;
     stats.score = e.score;
-    start_.read += read;
-    total_read_ += read;
     const uint64_t id = e.id;
     std::string merr;
     if (write_manifest(e, merr)) count_written(0, stats);
