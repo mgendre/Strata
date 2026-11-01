@@ -863,6 +863,12 @@ struct Options {
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
     int64_t conversation_cache_park_gain = 0;
+    /// --serve: a parked conversation keeps only its N deepest checkpoints, its root (the shortest: the end of the system
+    /// prompt a new subagent starts from) and any pinned shared prefix.  Each checkpoint is a running state (~118 MB on
+    /// Qwen3.8-Flash-Next), so with --prompt-cache 12 a parked 60K-token conversation is ~1 GB of K/V and ~1.4 GB of
+    /// checkpoints; most returns continue from its end or its last turns.  The live conversation's chain is untouched.
+    /// 0 = every checkpoint, as before.
+    int64_t conversation_cache_park_checkpoints = 0;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1027,6 +1033,9 @@ void usage() {
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
+                 "  --conversation-cache-park-checkpoints N  --serve: a parked conversation keeps only its N deepest\n"
+                 "                       checkpoints, its root and a pinned prefix, so more conversations fit in the cache\n"
+                 "                       (default 0 = every checkpoint)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -3231,13 +3240,13 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
-                 a == "--conversation-cache-park-gain" ||
+                 a == "--conversation-cache-park-gain" || a == "--conversation-cache-park-checkpoints" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
-                                   a == "--conversation-cache-park-gain")
+                                   a == "--conversation-cache-park-gain" || a == "--conversation-cache-park-checkpoints")
                                       ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
@@ -3247,6 +3256,7 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
+            else if (a == "--conversation-cache-park-checkpoints") o.conversation_cache_park_checkpoints = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
@@ -10599,6 +10609,36 @@ int main(int argc, char** argv) {
             const strata::core::QsaState* draft0 = src.draft0;   // no --mtp: no draft K/V (snapshots accept null)
             auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return k + 1 == n_st ? src.draft_last : nullptr; };
             std::vector<ConvCheckpoint>& checks = src.checks;
+            // --conversation-cache-park-checkpoints N: the parked copy keeps the N deepest checkpoints, the root (the
+            // shortest) and any pinned shared prefix.  The others are set aside for the capture (moved, not copied) and
+            // put back in their places however the park ends (after MergeBack below has put a split's parts back), so
+            // the live chain is untouched.
+            struct HoldBack {
+                std::vector<ConvCheckpoint>& checks;
+                std::vector<std::pair<size_t, ConvCheckpoint>> out;   // (place in the chain, checkpoint), in chain order
+                ~HoldBack() {
+                    for (auto& [i, c] : out)
+                        checks.insert(checks.begin() + (std::ptrdiff_t) std::min(i, checks.size()), std::move(c));
+                }
+            } hold_back{checks, {}};
+            if (o.conversation_cache_park_checkpoints > 0 && (int64_t) checks.size() > o.conversation_cache_park_checkpoints) {
+                std::vector<int64_t> lens(checks.size());
+                std::vector<uint8_t> pins(checks.size()), keep(checks.size());
+                for (size_t i = 0; i < checks.size(); ++i) {
+                    lens[i] = (int64_t) checks[i].ids.size();
+                    pins[i] = checks[i].pinned ? 1 : 0;
+                }
+                strata::program::conv_cache::park_keep(lens.data(), pins.data(), checks.size(),
+                                                       o.conversation_cache_park_checkpoints, keep.data());
+                std::vector<ConvCheckpoint> kept;
+                kept.reserve(checks.size());
+                hold_back.out.reserve(checks.size());
+                for (size_t i = 0; i < checks.size(); ++i) {
+                    if (keep[i]) kept.push_back(std::move(checks[i]));
+                    else hold_back.out.emplace_back(i, std::move(checks[i]));
+                }
+                checks = std::move(kept);
+            }
             strata::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
             struct MergeBack {
