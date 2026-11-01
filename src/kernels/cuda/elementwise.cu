@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -268,6 +269,25 @@ __global__ void scatter_rows_kernel(const float4* __restrict__ src, float4* dst,
     for (int64_t i = threadIdx.x; i < w4; i += blockDim.x) d[i] = s[i];
 }
 }  // namespace
+namespace {
+__global__ void copy_jobs_kernel(const CopyJob* jobs, int n) {
+    __shared__ CopyJob jb;
+    for (int j = 0; j < n; ++j) {
+        if (threadIdx.x == 0) jb = jobs[j];
+        __syncthreads();
+        const int4* s = (const int4*) jb.src;
+        int4* d = (int4*) jb.dst;
+        const size_t words = (size_t) (jb.bytes / 16);
+        for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < words; i += (size_t) gridDim.x * blockDim.x)
+            d[i] = s[i];
+        __syncthreads();
+    }
+}
+}  // namespace
+void copy_jobs_sm(const CopyJob* jobs, int n, int blocks, void* stream) {
+    if (n <= 0) return;
+    copy_jobs_kernel<<<(unsigned) std::max(1, blocks), 256, 0, (cudaStream_t) stream>>>(jobs, n);
+}
 void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {

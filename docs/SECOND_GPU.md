@@ -79,11 +79,21 @@ NVLink or another peer-to-peer path. It is an alternative to the helper caches a
 | `--peer-reserve-mib M` | 600 | VRAM left free on the peer card. Keep a few hundred MiB free on both cards beyond this, because the prompt path loads its kernels and cuBLAS on first use. |
 | `--peer-slots N` | 0 | Cap the tier at N experts; 0 means as many as fit. |
 | `--peer-adapt-swaps N` | -1 | Swaps per adaptive round on the peer; -1 uses the primary's `--adapt-swaps`. |
+| `--peer-refill-compute-units N` | 0 | The peer's adaptive copies done by N of its compute units (NVIDIA's SMs) instead of its copy engine; 0 keeps the copy engine. |
 | `--peer-prefill-rows N` | -1 | Share of each prompt chunk's rows the peer computes; -1 is half of chunk x top-k, 0 keeps prompt rows on the primary. |
 
 Whether the two cards can really exchange data is tested once at start with a copy each way. If the copy arrives wrong, the log
 says so and the prompt path uses the host route (activations and rows through mapped host memory). `STRATA_PEER_NO_P2P=1` asks
 for that route by hand.
+
+`--peer-refill-compute-units N` is for a peer on a narrow link (an x4 slot, a slot behind the chipset). The peer's adaptive
+copies normally go through its copy engine, and every layer's peer work starts with two small copies on the same engine: during
+a round of swaps, those wait until the whole round has landed. With N > 0 the experts are copied by N of the card's compute
+units instead, reading the host copy where it is (the bytes are the same), and the copy engine stays free for each layer's
+work. It needs a card that reads registered host memory by its address; otherwise the log says so and the copy engine is kept.
+One copy is checked byte for byte at start. On an RTX 3060 behind a PCIe 4.0 x4 chipset link (with an RTX 3080 Ti as CUDA0):
+1 unit was too slow (fewer swaps landed), 2 to 4 were best, 8 took units from the peer's experts. A wider link may need more;
+that is not measured.
 
 Through the server, list both cards in the config's `"gpu"` (for example `[0, 1]`, numbered as `nvidia-smi` numbers them) and add
 `--peer-device 1` to `"args"`. The number is the card's position in that list (with `"gpu": [2, 0]`, `--peer-device 1` is

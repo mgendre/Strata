@@ -692,6 +692,7 @@ struct Options {
     int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
+    int peer_refill_units = 0;   ///< --peer-refill-compute-units: the peer's SMs doing its adaptive copies (0 = the copy engine)
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
@@ -1136,6 +1137,9 @@ void usage() {
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
+                 "  --peer-refill-compute-units N  the peer cache's adaptive copies done by N of that card's compute\n"
+                 "                       units (SMs) instead of its copy engine, which otherwise holds back every layer's\n"
+                 "                       launch on that card until the round has landed (default 0: the copy engine)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
@@ -3331,6 +3335,7 @@ int main(int argc, char** argv) {
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
+        else if (a == "--peer-refill-compute-units") o.peer_refill_units = std::max(0, std::atoi(next("--peer-refill-compute-units")));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
@@ -7696,6 +7701,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         const auto tp0 = Clock::now();
+        peer.set_refill_sm(o.peer_refill_units);
         if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
                        err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -7705,6 +7711,10 @@ int main(int argc, char** argv) {
                              "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
                      std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+        if (peer.refill_sm() > 0)
+            std::fprintf(stderr, "strata generate: peer GPU %d: its adaptive copies done by %d of its compute units, leaving "
+                                 "the copy engine to each layer's launch (--peer-refill-compute-units)\n",
+                         o.peer_device, peer.refill_sm());
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }

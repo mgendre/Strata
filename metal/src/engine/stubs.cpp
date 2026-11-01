@@ -145,6 +145,7 @@ namespace strata::kernels { void copy_from_mapped_multi(const MappedCopy * p0, i
 namespace strata::kernels { void copy_i32_from_mapped(int32_t * p0, const int32_t * p1, int64_t p2, void * p3) { strata::metal_engine::missing("strata::kernels::copy_i32_from_mapped"); } }
 namespace strata::kernels { void copy_i32_from_mapped_unless(int32_t * p0, const int32_t * p1, long long p2, const uint32_t * p3, uint32_t p4, void * p5) { strata::metal_engine::missing("strata::kernels::copy_i32_from_mapped_unless"); } }
 namespace strata::kernels { void copy_indexed(float * p0, const float * p1, int64_t p2, const int32_t * p3, int64_t p4, void * p5) { strata::metal_engine::missing("strata::kernels::copy_indexed"); } }
+namespace strata::kernels { void copy_jobs_sm(const CopyJob * p0, int p1, int p2, void * p3) { strata::metal_engine::missing("strata::kernels::copy_jobs_sm"); } }
 namespace strata::kernels { void copy_or_zero_from_mapped(float * p0, const float * p1, long long p2, const uint32_t * p3, uint32_t p4, void * p5) { strata::metal_engine::missing("strata::kernels::copy_or_zero_from_mapped"); } }
 namespace strata::kernels { void copy_row_to_first(const int32_t * p0, float * p1, int64_t p2, float * p3, int64_t p4, float * p5, int64_t p6, void * p7) { strata::metal_engine::missing("strata::kernels::copy_row_to_first"); } }
 namespace strata::kernels { void copy_rows_from_mapped(float * p0, const float * p1, int64_t p2, int64_t p3, const int32_t * p4, const int32_t * p5, void * p6) { strata::metal_engine::missing("strata::kernels::copy_rows_from_mapped"); } }
