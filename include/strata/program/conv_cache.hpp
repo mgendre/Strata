@@ -118,4 +118,17 @@ inline size_t spread_victim(const int64_t* lens, const uint64_t* stamps, size_t 
     return eviction_victim(stamps, n, cap, tail, pinned);
 }
 
+/// --prelude-cache: where the prelude of a conversation ends - its first turn boundary after token 0, the end of the
+/// system prompt and tools - when that is at least `min_tokens` (--prompt-cache-root) and some tokens follow it; -1
+/// for none.  The root checkpoint's rule (generate.cpp), so a prelude is always a point the chain kept as its root.
+/// With `role_token` (--system-role-token, the id of "system"), the first turn must be a system turn
+/// (<|im_start|>system): a chat without a system prompt has no prelude, its first user message is not one.
+inline int64_t prelude_end(const int32_t* ids, size_t n, int64_t turn_token, int64_t min_tokens, int64_t role_token = -1) {
+    if (turn_token < 0 || min_tokens <= 0) return -1;
+    if (role_token >= 0 && (n < 2 || ids[0] != turn_token || ids[1] != role_token)) return -1;
+    for (size_t i = 1; i + 1 < n; ++i)
+        if (ids[i] == turn_token) return (int64_t) i >= min_tokens ? (int64_t) i : -1;
+    return -1;
+}
+
 }  // namespace strata::program::conv_cache
