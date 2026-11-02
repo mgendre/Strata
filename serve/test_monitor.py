@@ -226,6 +226,30 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
             self.assertEqual(c.poll(None, None)["parked"], 0)
 
+    def test_the_conversations_that_leave_ram(self):
+        from serve.server import ConvCacheLog, conversation_cache_view
+        import tempfile
+        park = ("strata serve: conversation cache: parked 5000 tokens in 12.0 ms; parked=1 bytes=1 evictions={} "
+                "snapshot_bytes=1 reused_kv_bytes=0\n")
+        saved = ("strata serve: conversation cache: disk saved 76463 tokens ({}) in 919.8 ms: wrote 1106 MiB (17 of 19 "
+                 "blocks new), 119 MiB already on disk; disk=42 (33964 MiB) written_today=2311 MiB\n")
+        lines = [park.format(0), saved.format("budget full"), saved.format("RAM low"), saved.format("slots full"),
+                 "strata serve: conversation cache: disk kept its copy of 90000 tokens (budget full; same blocks); disk=42\n",
+                 "strata serve: conversation cache: disk: not written for 30000 tokens: a newer copy holds 29000 of them\n",
+                 saved.format("clean stop"),       # not an eviction: not counted
+                 saved.format("no room in RAM"),   # never parked in RAM: not counted either
+                 park.format(8)]
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text("".join(lines), encoding="utf-8")
+            st = ConvCacheLog().poll(str(log), 0)
+            self.assertEqual((st["evictions"], st["to_disk"], st["in_newer_copy"], st["dropped"]), (8, 4, 1, 3))
+            log.write_text(park.format(2), encoding="utf-8")   # no disk tier: every eviction is a drop
+            st = ConvCacheLog().poll(str(log), 0)
+            self.assertEqual((st["evictions"], st["to_disk"], st["dropped"]), (2, 0, 2))
+            view = conversation_cache_view({"conversation_cache_mib": 8192}, [], {}, st)
+            self.assertEqual((view["to_disk"], view["dropped"]), (0, 2))
+
     def test_metrics(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)
