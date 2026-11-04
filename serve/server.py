@@ -108,6 +108,9 @@ def popen(what: str, args: list, role: str = "engine", **kw):
 
 # How long close() gives the engine at each step of ending it (seconds). Module values so that a test can shorten them.
 ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 5, 20
+# --conversation-cache-disk: a clean stop writes the conversations only RAM holds (the engine gives it at most 30 s), so
+# QUIT gets this much longer; 20 + 25 + 5 stays under the 60 s a systemd unit commonly gives a stop
+ENGINE_DISK_STOP_WAIT_S = 25
 
 
 def rttime_limit_note() -> str:
@@ -964,6 +967,17 @@ def gpu_card_roles(cfg: dict, order: list[int], main: int | None, cards: list[in
         if 0 <= n < len(order):
             roles[str(order[n])] = "peer experts"
     return roles
+
+
+def conversation_disk_dir(engine) -> str | None:
+    """--conversation-cache-disk DIR from the engine's arguments, or None."""
+    spawn = getattr(engine, "spawn", None)
+    args = spawn[1] if spawn and len(spawn) > 2 and isinstance(spawn[1], (list, tuple)) else []
+    if "--conversation-cache-disk" in args[:-1]:
+        folder = str(args[args.index("--conversation-cache-disk") + 1])
+        cwd = spawn[2] if isinstance(spawn[2], str) else None   # (the engine's working folder: a relative path is from there)
+        return folder if os.path.isabs(folder) or not cwd else os.path.join(cwd, folder)
+    return None
 
 
 def conversation_slots(engine) -> int | None:
@@ -2771,7 +2785,7 @@ class StrataEngine:
                     self.proc.stdin.write("STOP\nQUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
+                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S + (ENGINE_DISK_STOP_WAIT_S if conversation_disk_dir(self) else 0))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=ENGINE_TERM_WAIT_S)
@@ -3307,6 +3321,31 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
           "changing it keeps the cached conversation", flush=True)
     return ["--tail-role-token", str(role[0])]
+
+
+def system_role_args(cfg: dict, exe: str, tok) -> list[str]:
+    """--prelude-cache: the id of "system" as --system-role-token, so the engine keeps a prelude only for a chat that
+    opens with a system turn (a chat without one would store its first user message); [] without the prelude cache,
+    with an engine too old for the flag, or a tokenizer that splits "system"."""
+    args = cfg.get("args") or []
+    if "--prelude-cache" not in args or "--system-role-token" in args:
+        return []
+    try:
+        with open(engine_binary(exe, cfg), "rb") as f:
+            known = b"--system-role-token" in f.read()
+    except OSError:
+        known = False
+    role = tok.encode("system", parse_special=True)
+    return ["--system-role-token", str(role[0])] if known and len(role) == 1 else []
+
+
+def engine_extra_args(cfg: dict, exe: str, tok) -> tuple[list[str], bool]:
+    """The engine arguments the server adds (#458's --tail-role-token, the prelude cache's --system-role-token) and
+    whether a non-default effort goes in a trailing turn.  Only #458's own arguments turn that on: the prelude cache's
+    must not (every agent turn would then read its previous reply again, as the effort turn before it left the
+    history).  ValueError for a bad "effort_position"."""
+    effort = effort_end_args(cfg, exe, tok)
+    return (effort or []) + system_role_args(cfg, exe, tok), bool(effort)
 
 
 def engine_silence_s(cfg: dict) -> float:
@@ -8857,7 +8896,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
-def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool,
+def start_replicas(cfg: dict, groups: list[list[int]], exe: str, extra_args: list[str], lazy: bool,
                    *, offline: bool = False):
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
@@ -8878,7 +8917,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         if arena:
             rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
         try:
-            engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+            engines[i] = StrataEngine(exe, engine_args(rc) + extra_args, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None)
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
@@ -8915,7 +8954,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         if arena:       # a shared arena that could not be made (no room in /dev/shm, a file of another pack): as before
             print(f"[strata] replica {i} did not start with the shared expert arena ({e}); starting every replica with "
                   "its own copy of the experts instead", flush=True)
-            return start_replicas({**cfg, "replica_shared_arena": False}, groups, exe, effort_end, lazy, offline=offline)
+            return start_replicas({**cfg, "replica_shared_arena": False}, groups, exe, extra_args, lazy, offline=offline)
         raise SystemExit(f"[strata] replica {i} did not start: {e}")
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
     eng = rp.ReplicaEngine(engines, load_tokens=load)
@@ -8926,7 +8965,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     return eng
 
 
-def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bool, *, offline: bool = False):
+def start_split(cfg: dict, spec: dict, exe: str, extra_args: list[str], lazy: bool, *, offline: bool = False):
     """Opt-in split serving (serve/split.py): a prefill engine and a decode engine, one card each, the same model and the
     same session settings.  Started one after the other, so a shared expert arena is filled once; the SplitEngine in
     front hands a long prompt from the first to the second."""
@@ -8945,7 +8984,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
                 rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
             if role == "prefill":
                 warn_budget_over_ram(engine_args(rc) if "args" in rc else [])
-            engines[role] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+            engines[role] = StrataEngine(exe, engine_args(rc) + extra_args, cwd=rc.get("cwd"), log=rc.get("log"),
                                          env=child_env(rc, offline=offline), lazy=lazy)
     except BaseException:
         for e in engines.values():
@@ -9427,7 +9466,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:
-            effort_end = effort_end_args(cfg, exe, tok)  # #458
+            extra_args, effort_end = engine_extra_args(cfg, exe, tok)   # #458, --prelude-cache
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         from serve import replicas as rp
@@ -9443,11 +9482,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         except split_mod.SplitConfigError as e:
             raise SystemExit(f"[strata] config {e}")
         if groups:
-            engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
+            engine = start_replicas(cfg, groups, exe, extra_args, lazy, offline=a.offline)
         elif split:
-            engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
+            engine = start_split(cfg, split, exe, extra_args, lazy, offline=a.offline)
         else:
-            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+            engine = StrataEngine(exe, engine_args(cfg) + extra_args, cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
@@ -9456,7 +9495,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if note:                                        # #560 #516: before --open starts a browser on that card
             print(note, flush=True)
     else:
-        effort_end = None
+        effort_end = False
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."],
             cycle=getattr(a, "script_cycle", False),
@@ -9600,7 +9639,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
-    svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    svc.effort_end = effort_end                         # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True
         try:
