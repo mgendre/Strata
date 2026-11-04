@@ -685,7 +685,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
+    src/core/peer_host_q8.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -1335,6 +1336,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(native_grouped_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(native_grouped_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME native_grouped_parity COMMAND native_grouped_parity)
+  # --peer-slow-link-optimizations: the peer's input quantized on the host, byte for byte against the device's
+  # quantize_q8_1_rows (GPU, synthetic, no model; skipped where the host path is not built or the CPU lacks AVX2 + F16C)
+  add_executable(peer_host_q8_parity src/core/peer_host_q8_parity.cpp src/core/peer_host_q8.cpp)
+  target_include_directories(peer_host_q8_parity PRIVATE include ${_strata_gpu_include_directories})
+  target_link_libraries(peer_host_q8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME peer_host_q8_parity COMMAND peer_host_q8_parity)
+  set_tests_properties(peer_host_q8_parity PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(mmvf_rows_parity src/kernels/mmvf_rows_parity.cpp)
   target_include_directories(mmvf_rows_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(mmvf_rows_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
