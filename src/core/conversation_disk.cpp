@@ -1,4 +1,5 @@
-// --conversation-cache-disk: the conversation cache's level on disk (conversation_disk.hpp).
+// --conversation-cache-disk and --prelude-cache: a store on disk of conversations and conversation starts
+// (conversation_disk.hpp).
 //
 // Files (little-endian, like the session files):
 //   blocks/<32 hex>.kvb   one K/V block: "SCDB", version, layer count, each layer's five part sizes, then the bytes of
@@ -644,7 +645,8 @@ bool ConversationDisk::save(const Write& w, ConversationDiskStats& stats, std::s
         const Entry& e = entries_[i];
         if (e.cvec != w.cvec || !prefix_of(e.meta.ids, e.meta.imgs, w.ids, w.imgs)) continue;
         if (e.meta.ids.size() == w.ids.size()) holds = i;
-        else if (base == entries_.size() || e.meta.ids.size() > entries_[base].meta.ids.size()) base = i;
+        else if (!opt_.keep_shorter &&
+                 (base == entries_.size() || e.meta.ids.size() > entries_[base].meta.ids.size())) base = i;
     }
     auto touch = [&](Entry& e, const char* why) {
         e.score = std::max(conversation_score_at(e.score, e.score_at, t, opt_.half_life_s), w.score);
@@ -710,9 +712,10 @@ bool ConversationDisk::save(const Write& w, ConversationDiskStats& stats, std::s
     }
     const uint64_t id = b ? entries_[base].id : entries_.back().id;
     // older copies of this conversation that this one holds (a turn back, another branch's shorter start) go
+    // (keep_shorter: they stay, the starts other copies share)
     std::vector<uint64_t> superseded;
     for (const Entry& cur : entries_)
-        if (cur.id == id)
+        if (cur.id == id && !opt_.keep_shorter)
             for (const Entry& e : entries_)
                 if (e.id != id && e.cvec == cur.cvec && prefix_of(e.meta.ids, e.meta.imgs, cur.meta.ids, cur.meta.imgs))
                     superseded.push_back(e.id);
