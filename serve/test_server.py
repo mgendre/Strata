@@ -5246,6 +5246,30 @@ class TelemetryNoDisks(unittest.TestCase):
                 t.close()
 
 
+class DiskWritesDay(unittest.TestCase):
+    """The Disk write card's last 8 hours: one reading a minute of the bytes written since boot, the total over 8 hours
+    (or since the first reading), a restart of the PC counted from zero, kept across a restart of the server."""
+
+    def test_the_last_8_hours_are_summed_and_kept(self):
+        from serve.telemetry import DiskWrites
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cfg.disk-writes.json")
+            w = DiskWrites(path)
+            self.assertEqual(w.total(), (None, None))           # one reading is not a period yet
+            w.add(1000, 5 * 2**30)
+            w.add(1030, 6 * 2**30)                              # within the minute: not kept
+            w.add(1060, 7 * 2**30)
+            w.add(1120, 1 * 2**30)                              # the PC restarted: counted from zero
+            self.assertEqual(w.total(), (3 * 2**30, 1000))
+            self.assertEqual(DiskWrites.KEEP_S, 8 * 3600)
+            w.add(1000 + 8 * 3600 + 60, 2 * 2**30)              # 8 hours later: the readings before the period go
+            self.assertEqual(w.total(), (2 * 2**30, 1060))       # (1060 is the period's start: 1 GiB after the restart + 1)
+            again = DiskWrites(path)                            # saved every 10 minutes, read back at a restart
+            self.assertEqual((list(again.rows), again.total()), (list(w.rows), (2 * 2**30, 1060)))
+            Path(path).write_text("[[1, 2", encoding="utf-8")   # damaged: ignored
+            self.assertEqual(DiskWrites(path).total(), (None, None))
+
+
 class SilentEngine(unittest.TestCase):
     """#481: an engine that prints nothing for engine_silence_s during a request (or never acknowledges a STOP) has
     lost step with the server: it is ended and the request fails with EngineDied, instead of waiting forever."""

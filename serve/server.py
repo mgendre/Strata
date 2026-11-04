@@ -804,23 +804,52 @@ class ConvCacheLog:
     TO_DISK = re.compile(r"conversation cache: disk (?:saved|kept its copy of) \d+ tokens "
                          r"\((?:slots full|budget full|RAM low)[;)]")
     IN_NEWER = re.compile(r"conversation cache: disk: not written for \d+ tokens: a newer copy holds")
+    # the Monitor's tables of the latest restores, one per cache: from RAM, from --conversation-cache-disk and from
+    # --prelude-cache, each with how long it took (and the MiB read from disk); the request's prompt line then gives
+    # the tokens read after the restored ones
+    RAM_MS = re.compile(r"conversation cache: restored \d+ tokens(?: \(\w+\))? in ([\d.]+) ms")
+    DISK = re.compile(r"conversation cache: disk: restored (\d+) tokens in ([\d.]+) ms, read (\d+) MiB")
+    PRELUDE = re.compile(r"prelude cache: restored a prelude of (\d+) tokens in ([\d.]+) ms, read (\d+) MiB")
+    PROMPT = re.compile(r"serve: prompt (\d+) tokens = (\d+) reused \+ (\d+) read in (\d+) ms")
+    RECENT = 15                                         # rows kept per table
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
         self.key, self.pos = None, 0
+        self.lock = threading.Lock()                    # the Monitor and the cache sampler both read on
         self.reset()
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "to_disk": 0, "in_newer_copy": 0, "dropped": 0,
                       "parks": 0, "restores": 0, "last_event": None, "last_tokens": None, "last_at": None}
+        self.rows = {k: collections.deque(maxlen=self.RECENT) for k in ("ram", "disk", "prelude")}   # this run's only
+        self.pending = None                             # (source, row): a restore whose prompt line has not come yet
+
+    def _restored(self, source: str, row: dict):
+        """A restore seen: the one before it is done even if no prompt line followed it (a cancelled request)."""
+        self._done()
+        self.pending = (source, row)
+
+    def _done(self):
+        if self.pending is not None:
+            source, row = self.pending
+            self.pending = None
+            self.rows[source].append(row)
 
     def _view(self) -> dict:
+        """The state, with the tables' rows and the restore in progress (copies: the caller may keep them)."""
         out = dict(self.state)
         out["dropped"] = max(0, out["evictions"] - out["to_disk"] - out["in_newer_copy"])
+        out["rows"] = {k: [dict(r) for r in v] for k, v in self.rows.items()}
+        out["pending"] = {**self.pending[1], "source": self.pending[0]} if self.pending else None
         return out
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
+        with self.lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
         if not path or start is None:
             return self._view()
         if self.key != (path, start):                   # another start of the engine: its cache starts empty
@@ -841,7 +870,21 @@ class ConvCacheLog:
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
+            if "serve: prompt " in line:
+                m = self.PROMPT.search(line)
+                if m and self.pending is not None:
+                    self.pending[1].update(prompt=int(m.group(1)), read=int(m.group(3)), read_ms=int(m.group(4)))
+                    self._done()
+                continue
+            m = self.PRELUDE.search(line) if "prelude cache:" in line else None
+            if m:
+                self._restored("prelude", restore_row(now, int(m.group(1)), m.group(2), m.group(3)))
+                continue
             if "conversation cache:" not in line:
+                continue
+            m = self.DISK.search(line)
+            if m:
+                self._restored("disk", restore_row(now, int(m.group(1)), m.group(2), m.group(3)))
                 continue
             if self.TO_DISK.search(line):
                 self.state["to_disk"] += 1
@@ -858,11 +901,72 @@ class ConvCacheLog:
                 if m.group(1) != "skipped":
                     st["parks" if m.group(1) == "parked" else "restores"] += 1
                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
+                if m.group(1) == "restored":
+                    d = self.RAM_MS.search(line)
+                    self._restored("ram", restore_row(now, int(m.group(2)), d.group(1) if d else None))
                 continue
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
         return self._view()
+
+
+def restore_row(t: float, tokens: int, ms=None, mib=None) -> dict:
+    """A row of the Monitor's restore tables: when the log reader saw the restore, the tokens it gave back, how long it
+    took (ms) and the MiB read (from disk only); the request's prompt, the tokens read after the restored ones and how
+    long that took come with its prompt line (None until then)."""
+    return {"t": round(t, 1), "tokens": tokens, "ms": float(ms) if ms is not None else None,
+            "mib": int(mib) if mib is not None else None, "prompt": None, "read": None, "read_ms": None}
+
+
+def restore_rows(rows: list | None, pending: dict | None, source: str) -> list[dict]:
+    """A restore table's rows, the newest first: the restore whose prompt is still being read (when it is this
+    table's, marked "pending") over the done ones, ConvCacheLog.RECENT at most."""
+    out = [dict(r) for r in reversed(rows or [])]
+    if pending and pending.get("source") == source:
+        out.insert(0, {k: v for k, v in pending.items() if k != "source"} | {"pending": True})
+    return out[:ConvCacheLog.RECENT]
+
+
+LONG_READ = 8192
+
+
+def long_read_speed(hist: list) -> float | None:
+    """Prompt tokens read per second over the requests that read LONG_READ tokens or more (the time a restore saved:
+    its tokens read again at this speed); None before the first."""
+    tokens = ms = 0.0
+    for r in hist:
+        n, t = r.get("prompt_read") or 0, r.get("prompt_ms") or 0.0
+        if n >= LONG_READ and t > 0:
+            tokens += n
+            ms += t
+    return tokens / (ms / 1000) if ms > 0 else None
+
+
+def engine_arg(engine, flag: str) -> str | None:
+    """The value the engine was started with for `flag` (from its spawn arguments), or None."""
+    spawn = getattr(engine, "spawn", None)
+    args = [str(a) for a in (spawn[1] if spawn and len(spawn) > 1 and isinstance(spawn[1], (list, tuple)) else [])]
+    return args[args.index(flag) + 1] if flag in args[:-1] else None
+
+
+def gpu_card_roles(cfg: dict, order: list[int], main: int | None, cards: list[int]) -> dict[str, str]:
+    """The Monitor's GPU widgets: what each card does, keyed by its number as nvidia-smi numbers it - every card of a
+    layer split ("layer split"), else the engine's own card (`main`: "model") and --peer-device N's card (the engine's
+    Nth, which `order` - visible_device_order - maps to nvidia-smi's number: "peer experts").  A card none of these
+    name has no label."""
+    if layer_split_of(cfg):
+        return {str(i): "layer split" for i in cards}
+    roles = {str(main): "model"} if main is not None else {}
+    args = [str(a) for a in (cfg.get("args") or [])]
+    if "--peer-device" in args[:-1]:
+        try:
+            n = int(args[args.index("--peer-device") + 1])
+        except ValueError:
+            n = -1
+        if 0 <= n < len(order):
+            roles[str(order[n])] = "peer experts"
+    return roles
 
 
 def conversation_disk_dir(engine) -> str | None:
@@ -889,13 +993,23 @@ def conversation_slots(engine) -> int | None:
     return slots if isinstance(slots, int) else None
 
 
-def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
+def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict, disk: bool = False,
+                            prelude: bool = False) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
-    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
+    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back; the
+    table of its latest restores from RAM ("recoveries"), and with --conversation-cache-disk (`disk`) and
+    --prelude-cache (`prelude`) theirs, with the speed of a long prompt read for the time each restore saved."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
+    parked = dict(parked)
+    rows, pending = parked.pop("rows", None) or {}, parked.pop("pending", None)
+    tables = {"recoveries": restore_rows(rows.get("ram"), pending, "ram"), "prompt_tok_s": long_read_speed(hist)}
+    if disk:
+        tables["disk_recoveries"] = restore_rows(rows.get("disk"), pending, "disk")
+    if prelude:
+        tables["prelude_recoveries"] = restore_rows(rows.get("prelude"), pending, "prelude")
     return {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
-            "slots": info.get("conversation_cache_slots"), **parked,
+            "slots": info.get("conversation_cache_slots"), **parked, **tables,
             "requests": len(hist), "requests_reused": sum(1 for r in hist if (r.get("reused") or 0) > 0),
             "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
             "last_reused": last.get("reused") if last else None,
@@ -4657,6 +4771,25 @@ class Service:
         finally:
             self.fifo.release()
 
+    CACHE_SAMPLE_S = 5
+
+    def start_cache_sampler(self):
+        """The Monitor's restore tables: with a conversation cache (--conversation-cache-mib, --conversation-cache-disk,
+        --prelude-cache), the engine's log is read every CACHE_SAMPLE_S, whether the Monitor is open or not, so each
+        restore gets its time (within that)."""
+        if not any(engine_arg(self.engine, f) is not None
+                   for f in ("--conversation-cache-mib", "--conversation-cache-disk", "--prelude-cache")):
+            return
+
+        def loop():
+            while True:
+                try:
+                    self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+                except Exception as e:                 # tried again at the next sample; the thread keeps running
+                    print(f"[strata] conversation cache: log sample: {e}", flush=True)
+                time.sleep(self.CACHE_SAMPLE_S)
+        threading.Thread(target=loop, daemon=True).start()
+
     def start_vision_idle(self):
         v = self.vision
         if not getattr(v, "elastic", False):
@@ -4951,7 +5084,10 @@ class Service:
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
-                                       amd=getattr(self, "backend", None) == "hip")
+                                       amd=getattr(self, "backend", None) == "hip",
+                                       # the Disk write card's last 8 hours, kept beside the config across restarts
+                                       writes_path=(str(Path(self.config_path).with_suffix("")) + ".disk-writes.json"
+                                                    if getattr(self, "config_path", None) else None))
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)
@@ -5075,9 +5211,12 @@ class Service:
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
+        tel["static"]["gpu_roles"] = getattr(self, "gpu_card_roles", None) or {}   # the GPU widgets' labels
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "conversation_cache": conversation_cache_view(
+                    engine, hist, totals, parked, disk=engine_arg(self.engine, "--conversation-cache-disk") is not None,
+                    prelude=engine_arg(self.engine, "--prelude-cache") is not None),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -9528,6 +9667,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         svc.gpu_indices = [split["prefill_gpu"], split["decode_gpu"]]
         svc.gpu_index = split["decode_gpu"]
     svc.terminal_visibility_order = visible_device_order(env, cfg.get("backend")) if a.engine == "strata" else []
+    # the Monitor's GPU widgets: what each card does (no replicas or split serving: those cards stay unlabelled)
+    if a.engine == "strata" and not groups and not split:
+        svc.gpu_card_roles = gpu_card_roles(cfg, svc.terminal_visibility_order, svc.gpu_index, svc.gpu_indices)
     svc.terminal_topology_mode = ("replicas (configured)" if a.engine == "strata" and groups
                                   else "split serve (configured)" if a.engine == "strata" and split
                                   else "layer split (configured)" if a.engine == "strata" and layer_split_of(cfg)
@@ -9559,6 +9701,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
     svc.start_idle_unload()
     svc.start_vision_idle()
+    svc.start_cache_sampler()
     here = "[::1]" if a.host == "::" else "127.0.0.1" if a.host in ("0.0.0.0", "") else f"[{a.host}]" if ":" in a.host else a.host
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
