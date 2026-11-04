@@ -1,5 +1,6 @@
 // src/core/peer_experts.cpp - see include/strata/core/peer_experts.hpp.
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/peer_host_q8.hpp"
 
 #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -9,6 +10,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/window_limits.hpp"
+
 
 #include <algorithm>
 #include <chrono>
@@ -29,7 +31,7 @@ namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
 constexpr int64_t CAP = strata::kernels::kWindowMaxT * 10;   // entries per layer: a window's rows x top-10
 
-struct Meta {                           // one block, uploaded with one copy per layer
+struct Meta {                           // one block, uploaded with one copy per layer (with the input behind it: below)
     unsigned long long ptr[CAP];
     int32_t start[CAP + 1];
     int32_t dst[CAP];
@@ -37,6 +39,11 @@ struct Meta {                           // one block, uploaded with one copy per
     int32_t count[4];                   // [0] groups, [1] entries
     int32_t out_row[CAP];               // multi-GPU: compact row -> entry row in the host `out`
 };
+
+// --peer-slow-link-optimizations: the plan's blocks also hold the input as q8_1 blocks behind it (one copy per layer)
+constexpr size_t kMetaBytes = (sizeof(Meta) + 255) & ~(size_t) 255;
+constexpr size_t kQ8Block = strata::core::kQ8_1Block;
+
 
 /// Switches the calling thread to `dev` and back.  The engine's own thread lives on device 0.
 struct On {
@@ -171,16 +178,18 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
     const size_t scratch = std::max<size_t>((size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, ff),
                                             strata::kernels::native_expert_scratch_bytes(CAP, ff));
+    // --peer-slow-link-optimizations: the plan's blocks hold the input as q8_1 behind it
+    const size_t meta_bytes = slow_link_ ? kMetaBytes + (size_t) CAP * (H / 32) * kQ8Block : sizeof(Meta);
     const bool alloc_ok =
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&
         ck(cudaEventCreateWithFlags(&refill_ev_, cudaEventDisableTiming), "event", err) &&
         ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
         ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
-        ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
+        ck(cudaHostAlloc(&h_meta_, meta_bytes, cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
         ck(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err) &&
         ck(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err) &&
-        ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
+        ck(cudaMalloc(&d_meta_, meta_bytes), "plan", err) &&
         ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
@@ -242,6 +251,8 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     return true;
 }
 
+bool PeerExperts::host_q8_available() { return strata::core::host_q8_available(); }
+
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
                          const int32_t* kind, std::string& err, float* out) {
     static const bool direct_env = [] { const char* v = std::getenv("STRATA_PEER_DIRECT"); return v == nullptr || std::atoi(v) != 0; }();
@@ -281,23 +292,47 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     m.count[1] = rows;
     entries_ += rows;
     launched_rows_ = rows;
-    // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
-    if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    // --peer-slow-link-optimizations: the input quantized on the host (not for APR's Hadamard-folded gate/up: the device
+    // rotates the floats first), and the down rows straight into the host `out` where the down kernel keeps its sums
+    const auto* fmt = lay.native ? &lay.fmt[(size_t) layer] : nullptr;
+    const bool host_q8 = slow_link_ && fmt != nullptr && !fmt->had_gu && host_q8_available();
+    const bool down_host = slow_link_ && fmt != nullptr && direct &&
+                           strata::kernels::native_expert_down_host_ok(fmt->d_type, fmt->n_ff);
     On on(device_);
     const cudaStream_t s = stream_;
-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
-        !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
-        return false;
+    const void* xq = d_q8_;
+    if (host_q8) {   // the input as q8_1 behind the plan: one copy for both
+        strata::core::quantize_q8_1_host(x, n_tok, H, (uint8_t*) h_meta_ + kMetaBytes);
+        if (!ck(cudaMemcpyAsync(d_meta_, h_meta_, kMetaBytes + (size_t) n_tok * (H / 32) * kQ8Block, cudaMemcpyHostToDevice, s),
+                "plan and input", err))
+            return false;
+        xq = (const uint8_t*) d_meta_ + kMetaBytes;
+    } else {
+        // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
+        if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
+        if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
+            !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
+            return false;
+    }
     Meta* dm = (Meta*) d_meta_;
-    const auto& lay = strata::kernels::cpu::expert_layout();
     if (lay.native) {
         const auto& f = lay.fmt[(size_t) layer];
-        // APR: Hadamard-folded gate/up take H (s * x); d_x_ is this device's private copy, rotated in place
-        if (f.had_gu) strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, H, f.had_block, d_sx_, s);
-        strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
+        if (!host_q8) {
+            // APR: Hadamard-folded gate/up take H (s * x); d_x_ is this device's private copy, rotated in place
+            if (f.had_gu) strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, H, f.had_block, d_sx_, s);
+            strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
+        }
         auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
         if (f.had_d) { L.had_block = f.had_block; L.d_signs = d_sh_; }
-        strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
+        if (down_host) {   // each entry's rows into the host `out` as whole lines while the other blocks compute
+            L.out_host = true;
+            strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->out_row, dm->tok, groups, rows, xq,
+                                                   d_scratch_, out, s);
+            launched_direct_ = true;
+            return true;
+        }
+        strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, xq,
                                                d_scratch_, d_out_, s);
     } else {
         err = "peer experts: only native packs are supported";

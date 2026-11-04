@@ -1,4 +1,4 @@
-"""The elastic image encoder (the vision section's "elastic": true with "vram_elastic"): the first picture makes the
+"""The elastic image encoder (the vision section's "elastic": true, with "vram_elastic" on a GPU): the first picture makes the
 expert cache keep the encoder's VRAM free and then starts it, later pictures use it as it is, an idle encoder stops and
 the cache takes its VRAM back, a POST /v1/vram reserve stacks on the encoder's share, and the engine's load never starts
 it on its own."""
@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, Service, Vision
+from serve.server import ByteTokenizer, EngineDied, Service, Vision, vision_elastic_off
 from serve.test_vram import VramEngine
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,10 +133,33 @@ class Elastic(unittest.TestCase):
         self.assertFalse(self.svc.vision_held)
         self.assertFalse(self.vision.up)
 
+    def test_a_cpu_encoder_starts_and_stops_without_the_cache(self):
+        self.vision.on_gpu = False                          # "gpu": false: the CPU reader
+        self.picture()
+        self.assertEqual(self.vision.starts, 1)
+        self.assertEqual(self.engine.calls, [])             # no VRAM asked of the expert cache
+        self.assertFalse(self.svc.vision_held)
+        self.svc.last_image_at = time.time() - 61
+        self.assertEqual(self.svc._vision_idle_down(), "down")
+        self.assertFalse(self.vision.up)
+        self.assertEqual(self.engine.calls, [])             # nor given back
+        self.picture()
+        self.assertEqual(self.vision.starts, 2)
+
+    def test_elastic_needs_vram_elastic_only_on_the_gpu(self):
+        gpu, cpu = {"elastic": True, "gpu": True}, {"elastic": True, "gpu": False}
+        self.assertIn('needs "vram_elastic"', vision_elastic_off({}, gpu))
+        self.assertIsNone(vision_elastic_off({"vram_elastic": True}, gpu))
+        self.assertIsNone(vision_elastic_off({}, cpu))      # --peer-device keeps --vram-elastic off: a CPU encoder still is elastic
+        self.assertIsNone(vision_elastic_off({}, {"elastic": True}))   # no "gpu": the CPU reader
+        self.assertIsNone(vision_elastic_off({}, {"gpu": True}))
+
     def test_the_config_keys(self):
         v = Vision({"exe": "e", "mmproj": "m", "model": "t", "elastic": True, "elastic_mib": 3000,
                     "elastic_idle_s": 30}, lazy=False)          # elastic: nothing starts with the server
         self.assertTrue(v.elastic and v.elastic_mib == 3000 and v.elastic_idle_s == 30 and not v.alive())
+        self.assertFalse(v.on_gpu)
+        self.assertTrue(Vision({"exe": "e", "mmproj": "m", "model": "t", "gpu": True, "elastic": True}).on_gpu)
         v = Vision({"exe": "e", "mmproj": "m", "model": "t"}, lazy=True)
         self.assertFalse(v.elastic)
         self.assertEqual((v.elastic_mib, v.elastic_idle_s), (2048, 120.0))
