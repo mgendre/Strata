@@ -378,6 +378,15 @@ function since(t) {
   const s = Math.max(0, Date.now() / 1000 - t);
   return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
 }
+// what became of the conversations evicted from RAM: written to disk (or already there), kept by a newer copy of the
+// same conversation, or dropped (too short for the disk, no disk, a failed write); an older server sends only
+// `evictions`
+function leftRam(c) {
+  if (!c.evictions) return "";
+  if (c.to_disk === undefined) return ` · ${fmt(c.evictions)} evicted`;
+  return [[c.to_disk, "to disk"], [c.in_newer_copy, "in a newer copy"], [c.dropped, "dropped"]]
+    .filter(([n]) => n > 0).map(([n, what]) => ` · ${fmt(n)} ${what}`).join("");
+}
 function renderConvCache(c) {
   $("cc-card").hidden = !c;
   if (!c) return;                                  // an older server
@@ -396,7 +405,7 @@ function renderConvCache(c) {
   facts($("cc-facts"), [
     ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
     ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
-    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
+    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${leftRam(c)}` : null],
     ["Last switch", c.enabled ? event : null],
   ]);
   $("cc-note").textContent = c.enabled

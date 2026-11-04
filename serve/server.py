@@ -794,6 +794,13 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # what became of the conversations evicted from RAM (`evictions`): with --conversation-cache-disk one that leaves
+    # RAM (slots or budget full, RAM low) is written to disk, or the disk already holds it ("to_disk"); one a newer copy
+    # holds is not written ("in_newer_copy"); the rest (below --conversation-cache-disk-min-tokens, no disk, a failed
+    # write) is gone: dropped = evictions - to_disk - in_newer_copy
+    TO_DISK = re.compile(r"conversation cache: disk (?:saved|kept its copy of) \d+ tokens "
+                         r"\((?:slots full|budget full|RAM low)[;)]")
+    IN_NEWER = re.compile(r"conversation cache: disk: not written for \d+ tokens: a newer copy holds")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -801,13 +808,18 @@ class ConvCacheLog:
         self.reset()
 
     def reset(self):
-        self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+        self.state = {"parked": 0, "bytes": 0, "evictions": 0, "to_disk": 0, "in_newer_copy": 0, "dropped": 0,
+                      "parks": 0, "restores": 0, "last_event": None, "last_tokens": None, "last_at": None}
+
+    def _view(self) -> dict:
+        out = dict(self.state)
+        out["dropped"] = max(0, out["evictions"] - out["to_disk"] - out["in_newer_copy"])
+        return out
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
         if not path or start is None:
-            return dict(self.state)
+            return self._view()
         if self.key != (path, start):                   # another start of the engine: its cache starts empty
             self.key, self.pos = (path, start), start
             self.reset()
@@ -821,12 +833,18 @@ class ConvCacheLog:
                 f.seek(self.pos)
                 data = f.read(size - self.pos)
         except OSError:
-            return dict(self.state)
+            return self._view()
         end = data.rfind(b"\n") + 1                     # whole lines only: the rest is read next time
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
             if "conversation cache:" not in line:
+                continue
+            if self.TO_DISK.search(line):
+                self.state["to_disk"] += 1
+                continue
+            if self.IN_NEWER.search(line):
+                self.state["in_newer_copy"] += 1
                 continue
             m = self.EVENT.search(line)
             if m:
@@ -841,7 +859,7 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
-        return dict(self.state)
+        return self._view()
 
 
 def conversation_slots(engine) -> int | None:
