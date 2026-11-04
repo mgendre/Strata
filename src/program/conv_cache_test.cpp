@@ -151,6 +151,27 @@ int main() {
                   restore_fits(full, none, 2, 0),
               "no sample, no cards, no need: do not refuse");
     }
+    {   // --conversation-cache-park-checkpoints: a parked copy keeps its N deepest checkpoints, the root and a pinned one
+        using strata::program::conv_cache::park_keep;
+        const std::vector<int64_t> lens = {7295, 9000, 12000, 15000, 18000, 21000, 24000, 27000, 30000};
+        std::vector<uint8_t> pins(lens.size(), 0), keep(lens.size(), 9);
+        auto kept = [&](int64_t n) {
+            park_keep(lens.data(), pins.data(), lens.size(), n, keep.data());
+            std::vector<int64_t> out;
+            for (size_t i = 0; i < lens.size(); ++i) if (keep[i]) out.push_back(lens[i]);
+            return out;
+        };
+        check(kept(3) == std::vector<int64_t>({7295, 24000, 27000, 30000}), "N = 3: the three deepest and the root");
+        check(kept(1) == std::vector<int64_t>({7295, 30000}), "N = 1: the deepest and the root");
+        check(kept(0) == lens && kept(9) == lens && kept(20) == lens, "N = 0, or no more checkpoints than N: all");
+        pins[3] = 1;   // a pinned shared prefix at 15,000
+        check(kept(2) == std::vector<int64_t>({7295, 15000, 27000, 30000}), "a pinned checkpoint stays");
+        pins.assign(lens.size(), 0);
+        const std::vector<int64_t> two = {5000, 9000};
+        std::vector<uint8_t> p2(2, 0), k2(2, 9);
+        park_keep(two.data(), p2.data(), two.size(), 1, k2.data());
+        check(k2[0] == 1 && k2[1] == 1, "two checkpoints, N = 1: the deepest and the root are both kept");
+    }
     {   // --prelude-cache: the prelude ends at the first turn boundary after token 0, as the root checkpoint does
         using strata::program::conv_cache::prelude_end;
         constexpr int32_t T = 248045;   // <|im_start|>

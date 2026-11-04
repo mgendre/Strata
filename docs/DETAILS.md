@@ -700,6 +700,7 @@ system prompt with a billing header that changes on every request; the server pi
 | `--conversation-cache-mib N`, `--conversation-cache-slots N` | Park conversations in a bounded host-RAM cache so alternating requests (controller and worker histories, sub-agents) reuse their prompts. Without `--conversation-cache-mib` the budget is 40% of the RAM left above `--conversation-cache-min-free-mib` once the model is loaded, at most 8192 MiB in steps of 256, off when under 1024; the engine log says which. `0` turns it off. It preserves histories; it does not run requests at once. |
 | `--conversation-cache-min-tokens N` | Park only conversations of at least N tokens, so short side requests do not evict a long conversation. Default `0` (park all). |
 | `--conversation-cache-park-gain N` (opt-in) | Park a conversation again only after it advanced N tokens past the copy it would replace. |
+| `--conversation-cache-park-checkpoints N` (opt-in) | A parked conversation keeps only its N deepest checkpoints, its root (the end of the system prompt) and a pinned prefix. Each checkpoint is a running state, about 118 MB on Qwen3.8-Flash-Next, so more conversations fit in the same budget. A return that resumes further back than the kept checkpoints resumes from the root. The live conversation keeps all of its checkpoints. Default `0` (all). |
 | `--conversation-cache-min-free-mib N` | RAM floor, default 2560. Parking and session files are skipped when less than the snapshot plus the floor is available. |
 | `--prelude-cache DIR` (opt-in) | Each agent's prelude (its system prompt and tools: the prompt up to its first turn boundary, `--prompt-cache-root` tokens or more) is saved once in DIR after the reply of the request that read it. A new chat that starts with a stored prelude, and that neither the live session nor the RAM cache resumes at least 1,024 tokens further, comes back from it: the K/V and the root checkpoint are read from disk and only the rest of the prompt is read. Kept across restarts; emptied, like the session files, when the engine version, the model or a setting that changes the saved bytes changes. With the server, only a chat that opens with a system turn has a prelude (the server passes `--system-role-token`). Needs the RAM cache and the root checkpoint (`--prompt-cache`, `--turn-token`, `--prompt-cache-root`); off on a layer split. |
 | `--prelude-cache-mib N` | Its space on disk, default 5120. A prelude is its K/V plus one running state: a 10,691-token prelude wrote 268 MiB on Qwen3.8-Flash-Next with `--kv int8` and an MTP head. |
@@ -1070,6 +1071,20 @@ measured. "Exact" means the 10-prompt and 4K/20K identity gate with the switch o
 
 `STRATA_DEQUANT_WIDE` (wide dequantization of Q4_K, Q5_K, Q6_K and IQ4_XS for the prompt's dense weights) is on by default on
 sm_86 and sm_61, bit-exact. `STRATA_DEQUANT_WIDE=0` turns it off.
+
+`STRATA_PREFILL_ROUTED_STREAM=1` (opt-in; the streamed prompt walk of a chunk of 1,024 tokens or more, one GPU, the
+issuer thread): the issuer keeps at most `STRATA_PREFILL_ROUTED_STREAM_DEPTH` copies (default 16) queued ahead of the
+PCIe link, each layer's routing is handed to it as soon as the layer's router has run, and an expert not yet copied that
+no token of the chunk routes to is not copied at all. The routed experts go into the same ring slots as without the
+switch, so the prompt's results are the same bits, and the slots the prompt borrowed are refilled from RAM as before.
+With `STRATA_TRACE=1` each chunk prints how many ring entries it copied and how many it dropped. With
+`STRATA_PREFILL_COPY_EVENT_EVERY` above 1 or `STRATA_PREFILL_COPY_WAIT_DEDUPE=1` the switch stays off: those keep the
+default issuer, whose copy records the routed walk does not write. When the switch is set but a streamed chunk keeps the
+default walk (these two, `STRATA_PREFILL_ISSUER=0` or the peer prompt ring), the engine prints the reason once. On an
+RTX 3090 (PCIe 3.0 x16, 250 W) with the Swift IQ3_XXS pack at the v0.2.6 release defaults, 23% fewer experts were
+streamed for a 2K prompt and 4% fewer at 32K (8,192-token chunks); a 1,790-token follow-up read on an 18.8K-token
+conversation took 18% less time and fresh 2K, 4K and 32K reads ran 20%, 8% and 5% faster (4 pairs), with byte-identical
+replies in a deterministic lane at 1K to 32K.
 
 ### RTX 20 (Turing, sm_75) kernels (opt-in)
 

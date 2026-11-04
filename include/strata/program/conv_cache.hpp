@@ -118,6 +118,19 @@ inline size_t spread_victim(const int64_t* lens, const uint64_t* stamps, size_t 
     return eviction_victim(stamps, n, cap, tail, pinned);
 }
 
+/// --conversation-cache-park-checkpoints N: the checkpoints a parked copy keeps - the `keep_n` deepest (the longest:
+/// the ends of its last turns), the root (the shortest: the end of the system prompt a new subagent starts from) and
+/// every pinned one.  `lens[i]` / `pinned[i]`: checkpoint i's length and pin; sets keep[i] (1 = kept).  keep_n <= 0, or
+/// no more than keep_n checkpoints: all of them.  Equal lengths rank in chain order, the earlier one deeper.
+inline void park_keep(const int64_t* lens, const uint8_t* pinned, size_t n, int64_t keep_n, uint8_t* keep) {
+    for (size_t i = 0; i < n; ++i) {
+        size_t rank = 0;   // checkpoints deeper than i
+        for (size_t j = 0; j < n; ++j)
+            if (lens[j] > lens[i] || (lens[j] == lens[i] && j < i)) ++rank;
+        keep[i] = keep_n <= 0 || (int64_t) n <= keep_n || (int64_t) rank < keep_n || rank + 1 == n || pinned[i] ? 1 : 0;
+    }
+}
+
 /// --prelude-cache: where the prelude of a conversation ends - its first turn boundary after token 0, the end of the
 /// system prompt and tools - when that is at least `min_tokens` (--prompt-cache-root) and some tokens follow it; -1
 /// for none.  The root checkpoint's rule (generate.cpp), so a prelude is always a point the chain kept as its root.
