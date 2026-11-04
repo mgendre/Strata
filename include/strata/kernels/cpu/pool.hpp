@@ -250,6 +250,12 @@ public:
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
     static constexpr int kMaxSplitMulti = 96;
+    /// STRATA_POOL_ONE_PHASE=1 (off by default): `run_split_multi_native` as one batch per layer instead of two - an
+    /// expert's down rows start once its own gate/up rows are done (the worker that ends them quantizes them), not
+    /// after every expert's gate/up rows and the host's quantization.  The same row ranges, so bitwise the same
+    /// outputs.  Not under the NUMA split, which keeps the two phases.
+    void set_one_phase(bool on) { one_phase_ = on; }
+    bool one_phase() const { return one_phase_; }
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -369,6 +375,14 @@ private:
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
     std::vector<SplitBufMulti> split_multi_;
+    // STRATA_POOL_ONE_PHASE (mode 7): tasks [0, gu_tasks_) are gate/up row ranges over gu_rows_, the rest down row ranges
+    // over d_rows_; gu_left_[e] counts expert e's unfinished gate/up tasks, ready_[e] is set once its rows are quantized
+    bool one_phase_ = false;
+    int gu_tasks_ = 0, d_tasks_ = 0;
+    int64_t gu_rows_ = 0, d_rows_ = 0;
+    std::unique_ptr<std::atomic<int>[]> gu_left_, ready_;
+    void native_rows(int mode, int64_t g0, int64_t g1, int h, int row0);   // mode 5: gate/up rows, 6: down rows
+    void native_quant(int e);                                              // expert e's gate/up output for its down rows
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own
