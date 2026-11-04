@@ -22,17 +22,20 @@ struct Layout {
     size_t data, scales, pooled, value_data, value_scales;
 };
 
-bool valid_extent(const QsaState& st, int64_t upto, std::string& error) {
+// `any_extent`: the sizes of `upto` tokens whatever the state holds now (the elastic K/V may be shorter than a parked
+// conversation): for the disk copies' block sizes only, never for a copy into the state
+bool valid_extent(const QsaState& st, int64_t upto, std::string& error, bool any_extent = false) {
     const int64_t page = strata::kernels::qsa_real_shapes().page_size;
-    if (upto < 0 || upto > st.max_cells || upto > std::numeric_limits<int64_t>::max() - (page - 1)) {
+    if (upto < 0 || (!any_extent && upto > st.max_cells) || upto > std::numeric_limits<int64_t>::max() - (page - 1)) {
         error = "conversation snapshot: invalid K/V extent";
         return false;
     }
     return true;
 }
 
-bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, Layout& l, std::string& error) {
-    if (!valid_extent(st, upto, error)) return false;
+bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, Layout& l, std::string& error,
+            bool any_extent = false) {
+    if (!valid_extent(st, upto, error, any_extent)) return false;
     if (st.kv_hybrid && (st.kv_mode == 2 || st.kv_q4 || st.kv_int8)) {   // a streamed one reads its host copy
         error = "conversation snapshot: hybrid K8V4 cannot be a ring and needs distinct format flags";
         return false;
@@ -511,6 +514,36 @@ bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int6
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    return true;
+}
+
+bool conversation_kv_layout_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                  std::array<uint64_t, 5>& sizes, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error, true)) return false;
+    sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    return true;
+}
+
+bool conversation_kv_sink(SessionKvSink& out, const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                          std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    SessionKvSink s;
+    s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const auto dst = pools(st);
+    const auto sizes = s.sizes;
+    auto why = std::make_shared<std::string>();
+    s.write = [dst, sizes, why](size_t part, size_t offset, const void* src, size_t n) {
+        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset || (n && !dst[part])) {
+            *why = "K/V write out of range";
+            return false;
+        }
+        return transfer(static_cast<uint8_t*>(dst[part]) + offset, src, n, *why);
+    };
+    s.finish = [&st, &g, upto, why] { return refresh_residency(st, g, upto, *why); };
+    s.error = [why] { return *why; };
+    out = std::move(s);
     return true;
 }
 

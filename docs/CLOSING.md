@@ -26,6 +26,10 @@ next step), waits 20 s, terminates, waits 5 s, kills. The engine and the image e
 (a new process group on Windows) so that a terminal's Ctrl+C / hangup reaches the server only, and the server stops the engine
 in that order instead of the engine dying under a request.
 
+With `--conversation-cache-disk`, the engine writes the conversations only RAM holds to the disk level after `QUIT` (at most
+30 s), and the server waits 45 s instead of 20 before it terminates it. A systemd unit that runs the server should set
+`KillMode=mixed`: with the default (`control-group`) the stop signal reaches the engine too, and it ends before that write.
+
 | Event | Windows | Linux | macOS |
 |---|---|---|---|
 | Ctrl+C in the terminal | server handles it, clean stop | same (SIGINT) | same |
