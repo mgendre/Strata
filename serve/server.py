@@ -794,6 +794,13 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # what became of the conversations evicted from RAM (`evictions`): with --conversation-cache-disk one that leaves
+    # RAM (slots or budget full, RAM low) is written to disk, or the disk already holds it ("to_disk"); one a newer copy
+    # holds is not written ("in_newer_copy"); the rest (below --conversation-cache-disk-min-tokens, no disk, a failed
+    # write) is gone: dropped = evictions - to_disk - in_newer_copy
+    TO_DISK = re.compile(r"conversation cache: disk (?:saved|kept its copy of) \d+ tokens "
+                         r"\((?:slots full|budget full|RAM low)[;)]")
+    IN_NEWER = re.compile(r"conversation cache: disk: not written for \d+ tokens: a newer copy holds")
     # the Monitor's tables of the latest restores, one per cache: from RAM, from --conversation-cache-disk and from
     # --prelude-cache, each with how long it took (and the MiB read from disk); the request's prompt line then gives
     # the tokens read after the restored ones
@@ -810,8 +817,8 @@ class ConvCacheLog:
         self.reset()
 
     def reset(self):
-        self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+        self.state = {"parked": 0, "bytes": 0, "evictions": 0, "to_disk": 0, "in_newer_copy": 0, "dropped": 0,
+                      "parks": 0, "restores": 0, "last_event": None, "last_tokens": None, "last_at": None}
         self.rows = {k: collections.deque(maxlen=self.RECENT) for k in ("ram", "disk", "prelude")}   # this run's only
         self.pending = None                             # (source, row): a restore whose prompt line has not come yet
 
@@ -829,6 +836,7 @@ class ConvCacheLog:
     def _view(self) -> dict:
         """The state, with the tables' rows and the restore in progress (copies: the caller may keep them)."""
         out = dict(self.state)
+        out["dropped"] = max(0, out["evictions"] - out["to_disk"] - out["in_newer_copy"])
         out["rows"] = {k: [dict(r) for r in v] for k, v in self.rows.items()}
         out["pending"] = {**self.pending[1], "source": self.pending[0]} if self.pending else None
         return out
@@ -874,6 +882,12 @@ class ConvCacheLog:
             m = self.DISK.search(line)
             if m:
                 self._restored("disk", restore_row(now, int(m.group(1)), m.group(2), m.group(3)))
+                continue
+            if self.TO_DISK.search(line):
+                self.state["to_disk"] += 1
+                continue
+            if self.IN_NEWER.search(line):
+                self.state["in_newer_copy"] += 1
                 continue
             m = self.EVENT.search(line)
             if m:
@@ -2860,6 +2874,16 @@ def vision_start_error(line: str, log=None, code: int | None = None, waited: flo
     return msg
 
 
+def vision_elastic_off(cfg: dict, vcfg: dict) -> str | None:
+    """Why the vision section's "elastic" cannot apply, or None.  An encoder on a GPU takes its VRAM from the expert
+    cache, which needs "vram_elastic"; one on the CPU (no "gpu": true) needs no VRAM and starts and stops all the same,
+    also beside --peer-device, which keeps --vram-elastic off."""
+    if vcfg.get("elastic") is True and vcfg.get("gpu") and cfg.get("vram_elastic") is not True:
+        return ('the vision section\'s "elastic" needs "vram_elastic": true for an encoder on the GPU (the expert cache '
+                "gives it its VRAM): the encoder starts with the model instead")
+    return None
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -2902,6 +2926,9 @@ class Vision:
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
         self.max_tokens = self.token_limit(cfg)
         self.elastic = cfg.get("elastic") is True
+        # the reader runs on a GPU (reader_args' --gpu): an elastic one takes its VRAM from the expert cache.  A CPU
+        # reader needs none, so it starts and stops with the pictures whatever the engine's VRAM can do
+        self.on_gpu = bool(cfg.get("gpu"))
         self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         if not lazy and not self.elastic:
@@ -4659,7 +4686,7 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
-        if hasattr(self.engine, "vram") and self.loaded():
+        if getattr(v, "on_gpu", True) and hasattr(self.engine, "vram") and self.loaded():
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
@@ -4728,8 +4755,10 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False):
             return
+        held = (f"while it runs the expert cache keeps {v.elastic_mib} MiB free for it" if getattr(v, "on_gpu", True)
+                else "it runs on the CPU, so it takes RAM only while it runs and no VRAM")
         print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
-              f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
+              f"without one; {held}", flush=True)
 
         def loop():
             while True:
@@ -9353,11 +9382,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
             if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
                 vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
+            why = vision_elastic_off(cfg, vcfg)
+            if why:
+                print(f"[strata] {why}", flush=True)
                 vcfg["elastic"] = False
-            elif vcfg.get("elastic") is True and layer_split_of(cfg):
+            elif vcfg.get("elastic") is True and vcfg.get("gpu") and layer_split_of(cfg):
                 # the engine turns --vram-elastic off on a layer split (a cache per GPU): the encoder still starts
                 # with the first picture and stops when idle, but its VRAM has to be free already
                 print('[strata] images: on a layer split the expert cache cannot make room for the image encoder (the '

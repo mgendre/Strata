@@ -2211,6 +2211,24 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     }
 }
 
+// L.out_host (the second GPU's rows, `out` in mapped host memory): a block keeps its rows' sums in shared memory and
+// writes each entry's rows as one store (32 rows: 128 bytes) instead of the 16-byte pieces the lanes would write, so
+// the link carries whole lines while the other blocks still compute.  down_put keeps a sum (or writes it, as before);
+// down_flush writes the kept ones after a barrier every thread of the block reaches.  The sums are the same values.
+__device__ __forceinline__ void down_put(const NativeExpertLayout& L, float* __restrict__ out, float (*s_out)[32],
+                                         const int32_t* __restrict__ ent_dst, int e, int c, int r, int rl, float v) {
+    if (L.out_host) s_out[c][rl] = v;
+    else out[(size_t) ent_dst[e + c] * L.n_embd + r] = v;
+}
+__device__ __forceinline__ void down_flush(const NativeExpertLayout& L, float* __restrict__ out, const float (*s_out)[32],
+                                           const int32_t* __restrict__ ent_dst, int e, int n, int rows) {
+    __syncthreads();
+    for (int i = threadIdx.x; i < n * rows; i += blockDim.x) {
+        const int c = i / rows, rl = i % rows, r = (int) blockIdx.x * rows + rl;
+        if (r < L.n_embd) out[(size_t) ent_dst[e + c] * L.n_embd + r] = s_out[c][rl];
+    }
+}
+
 // the 8-lane down rows: IQ4_NL's K = 40, NVFP4's K = 20
 template<int TD, int NC, bool EXACT_N = false, bool STAGE_GRID = false>
 __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n, int t,
@@ -2232,6 +2250,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TD, STAGE_TQ>::value);   // the trellis codebook on a cc 6.0 card, else 4 unused words
     const uint32_t* s_grid = stage_iq_grid<TD, STAGE_TQ>(s_grid_buf, threadIdx.x, 256);
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
+    __shared__ float s_out[GRP_NC][32];   // L.out_host: the block's sums, written as whole rows (down_flush)
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
     if constexpr (SUB_DOWN && kTqType<TD> && STAGE_TQ) {
         // cc 6.0 trellis down rows (K = 40 dots at n_ff 640, the IQ4_NL row shape): 8 lanes a row, 32 rows a chunk, and a
@@ -2305,24 +2324,25 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                             const int off1[1] = { 0 };
                             float s1[1];
                             row_dot_sub8<TD, 1, true, STAGE_TQ>(wr, s_hq, off1, 1, t, s1, s_grid);
-                            if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                            if (t == 0) down_put(L, out, s_out, ent_dst, e, 0, r, threadIdx.x >> 3, s1[0] * sd);
                         } else if (n == 2) {
                             const int off2[2] = { 0, 20 };
                             float s2[2];
                             row_dot_sub8<TD, 2, true, STAGE_TQ>(wr, s_hq, off2, 2, t, s2, s_grid);
-                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
+                            if (t < 2) down_put(L, out, s_out, ent_dst, e, t, r, threadIdx.x >> 3, s2[t] * sd);
                         } else if (n == 3) {
                             const int off3[3] = { 0, 20, 40 };
                             float s3[3];
                             row_dot_sub8<TD, 3, true, STAGE_TQ>(wr, s_hq, off3, 3, t, s3, s_grid);
-                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
+                            if (t < 3) down_put(L, out, s_out, ent_dst, e, t, r, threadIdx.x >> 3, s3[t] * sd);
                         } else {
                             const int off4[4] = { 0, 20, 40, 60 };
                             float s4[4];
                             row_dot_sub8<TD, 4, true, STAGE_TQ>(wr, s_hq, off4, 4, t, s4, s_grid);
-                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
+                            if (t < 4) down_put(L, out, s_out, ent_dst, e, t, r, threadIdx.x >> 3, s4[t] * sd);
                         }
                     }
+                    if (L.out_host) down_flush(L, out, s_out, ent_dst, e, n, 32);
                 }
             }
             return;
@@ -2350,24 +2370,25 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                             const int off1[1] = { 0 };
                             float s1[1];
                             row_dot_20_sub16<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
-                            if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                            if (t == 0) down_put(L, out, s_out, ent_dst, e, 0, r, threadIdx.x >> 4, s1[0] * sd);
                         } else if (n == 2) {
                             const int off2[2] = { 0, 20 };
                             float s2[2];
                             row_dot_20_sub16<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
-                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
+                            if (t < 2) down_put(L, out, s_out, ent_dst, e, t, r, threadIdx.x >> 4, s2[t] * sd);
                         } else if (n == 3) {
                             const int off3[3] = { 0, 20, 40 };
                             float s3[3];
                             row_dot_20_sub16<TD, 3, true>(wr, s_hq, off3, 3, t, s3);
-                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
+                            if (t < 3) down_put(L, out, s_out, ent_dst, e, t, r, threadIdx.x >> 4, s3[t] * sd);
                         } else {
                             const int off4[4] = { 0, 20, 40, 60 };
                             float s4[4];
                             row_dot_20_sub16<TD, 4, true>(wr, s_hq, off4, 4, t, s4);
-                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
+                            if (t < 4) down_put(L, out, s_out, ent_dst, e, t, r, threadIdx.x >> 4, s4[t] * sd);
                         }
                     }
+                    if (L.out_host) down_flush(L, out, s_out, ent_dst, e, n, 16);
                 }
             }
             return;
@@ -6489,6 +6510,15 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
+}
+
+bool native_expert_down_host_ok(int d_type, int64_t n_ff) noexcept {
+    // the branches of native_down_multi_kernel<TD, true> that keep their sums for down_flush: IQ4_NL (20) and type 42
+    // at n_ff 640, in the default mode (exp_mode 0: launch_down, no old kernels, no split switched off, sub-16 rows)
+    if (n_ff != 640 || g_old_kernels || g_no_sub16_gu || exp_mode() != 0) return false;
+    if (d_type == 20) return !split_off<20>();
+    if (d_type == 42) return !split_off<42>();
+    return false;
 }
 
 }  // namespace strata::kernels

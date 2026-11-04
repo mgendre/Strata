@@ -79,6 +79,7 @@ NVLink or another peer-to-peer path. It is an alternative to the helper caches a
 | `--peer-reserve-mib M` | 600 | VRAM left free on the peer card. Keep a few hundred MiB free on both cards beyond this, because the prompt path loads its kernels and cuBLAS on first use. |
 | `--peer-slots N` | 0 | Cap the tier at N experts; 0 means as many as fit. |
 | `--peer-adapt-swaps N` | -1 | Swaps per adaptive round on the peer; -1 uses the primary's `--adapt-swaps`. |
+| `--peer-slow-link-optimizations` | off | For a peer on a slow link: its input is quantized by the CPU and its result rows go straight to RAM while it computes. The same results. |
 | `--peer-prefill-rows N` | -1 | Share of each prompt chunk's rows the peer computes; -1 is half of chunk x top-k, 0 keeps prompt rows on the primary. |
 
 With a peer, the server log has one more line after each request's hit rate. It says where the routed experts of the decode
@@ -92,6 +93,18 @@ strata serve: peer GPU: of N routed experts, A% on the main GPU's cache, B% on t
 Whether the two cards can really exchange data is tested once at start with a copy each way. If the copy arrives wrong, the log
 says so and the prompt path uses the host route (activations and rows through mapped host memory). `STRATA_PEER_NO_P2P=1` asks
 for that route by hand.
+
+`--peer-slow-link-optimizations` is for a peer on a narrow link (an x4 slot, a slot behind the chipset), where the bytes each
+layer's peer work sends and gets back are on the critical path. Two things change, with the same bits as without the switch:
+
+- The CPU quantizes the input rows to q8_1 the way the GPU does it, and sends them behind the plan in one copy: 3.5 times fewer
+  bytes, and no quantization kernel on the peer. This needs an x86 CPU with AVX2 and F16C and a GCC or Clang build; elsewhere,
+  and for a pack whose gate and up weights take a Hadamard rotation first, the GPU still quantizes.
+- The peer's down kernel writes each expert's rows straight into the host rows as whole 128-byte lines while its other blocks
+  still compute, instead of a scatter after all of them. This is for the IQ4_NL and Q2_0 down rows at the expert width of 640
+  (Qwen3.8-Flash-Next); other down types keep the scatter.
+
+The start-up log says where the input is quantized.
 
 Through the server, list both cards in the config's `"gpu"` (for example `[0, 1]`, numbered as `nvidia-smi` numbers them) and add
 `--peer-device 1` to `"args"`. The number is the card's position in that list (with `"gpu": [2, 0]`, `--peer-device 1` is
