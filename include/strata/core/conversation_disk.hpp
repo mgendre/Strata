@@ -1,17 +1,20 @@
-// A store on disk of conversation starts, for --prelude-cache DIR: each agent's prelude (its system prompt and tools),
-// written once and read back into the K/V by the next chats that start with it, also after a restart.
+// --conversation-cache-disk DIR: the conversation cache's level on disk, under the RAM cache.  The same store also
+// holds --prelude-cache DIR: each agent's prelude (its system prompt and tools), written once and read back into the
+// K/V by the next chats that start with it, also after a restart (`keep_shorter`, `common_start`).
 //
-// When the folder is over its budget the copy with the lowest keep value leaves first: its usage score (every return)
-// plus one point for its last use, both halving every `half_life_s` (conversation_disk_keep) - the oldest copy with the
-// worst score goes, and a copy just saved, which had no time to come back, is not the first one.  The copies are kept
-// across restarts and rebuilds of the same engine version and disk format, with the same model and the settings that
-// change what the saved bytes mean.
+// The engine writes a conversation here when RAM lets it go (the slots or the budget are full, RAM is low) or cannot
+// take it, and on a clean stop - never while it is in RAM; on its return the copy streams back to the GPU and only the
+// rest of the prompt is read.  When the folder is over its budget the copy with the lowest keep value leaves first: its
+// usage score (every return, from RAM or disk) plus one point for its last use, both halving every `half_life_s`
+// (conversation_disk_keep) - the oldest copy with the worst score goes, and a copy just saved, which had no time to come
+// back, is not the first one.  The copies are kept across restarts and rebuilds of the same engine version and disk
+// format, with the same model and the settings that change what the saved bytes mean.
 //
-// A copy is the token ids, ONE running state (the checkpoint at its end) and the K/V up to that point, in blocks of
-// `block_tokens` tokens named by a hash of their bytes.  A block already on disk is never written again: copies that
-// share a start share its blocks (`keep_shorter`: a copy that extends a stored one is stored beside it).  Nothing is
-// flushed for durability (a cache: a file a crash cut short fails its hash and is dropped); written pages leave the
-// page cache so they do not take RAM.
+// A copy is the conversation's token ids, ONE running state (the deepest checkpoint near its end, else the live state:
+// conversation_disk_state) and the K/V up to that point, in blocks of `block_tokens` tokens named by a hash of their
+// bytes.  A block already on disk is never written again: the next save of a conversation writes only its new blocks and
+// its running state, and conversations that share a start share its blocks.  Nothing is flushed for durability (a cache:
+// a file a crash cut short fails its hash and is dropped); written pages leave the page cache so they do not take RAM.
 //
 // Pure host code (no CUDA): the K/V comes in through SessionKvSource readers and goes back out through SessionKvSink
 // writers, one per K/V layer (the session's QSA layers, then the draft layer), which the engine provides.
@@ -158,11 +161,6 @@ public:
 
     struct Usage { size_t entries = 0; uint64_t bytes = 0, budget = 0; };
     Usage usage() const;
-    struct Counters {
-        uint64_t written = 0, read = 0, reused = 0;        ///< bytes
-        uint64_t saves = 0, skipped = 0, restores = 0, tokens = 0, deleted = 0;
-    };
-    const Counters& since_start() const { return start_; }
     uint64_t written_all_time() const { return total_written_; }
     uint64_t written_today() const { return day_written_; }
 
@@ -176,9 +174,9 @@ private:
         std::vector<Hash> blocks;
         std::vector<uint64_t> block_bytes;
         Hash state_hash;
-        uint64_t state_bytes = 0, written = 0, served_tokens = 0, returns = 0;
+        uint64_t state_bytes = 0;
         double score = 0;
-        int64_t score_at = 0, created = 0, last_used = 0;
+        int64_t score_at = 0, last_used = 0;
         uint64_t bytes() const;
     };
     struct Block { uint64_t bytes = 0; size_t refs = 0; };
@@ -214,8 +212,7 @@ private:
     std::unordered_map<Hash, Block, HashFn> blocks_;
     std::vector<uint8_t> buffer_;                          ///< one 16 MiB piece at a time
     uint64_t next_id_ = 1;
-    Counters start_;
-    uint64_t total_written_ = 0, total_read_ = 0, day_written_ = 0;
+    uint64_t total_written_ = 0, day_written_ = 0;
     int64_t day_ = 0;                                      ///< yyyymmdd (local time) of day_written_
 };
 
